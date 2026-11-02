@@ -1,5 +1,5 @@
 use ed25519_dalek::{Signer, SigningKey};
-use near_sdk::borsh::{self, BorshSerialize};
+use near_sdk::borsh::BorshSerialize;
 use near_sdk::json_types::U128;
 use near_sdk::PublicKey;
 use near_workspaces::types::NearToken;
@@ -58,7 +58,7 @@ fn sign_terms_hash(
 }
 
 #[tokio::test]
-async fn test_workspaces_full_lifecycle() -> anyhow::Result<()> {
+async fn test_workspaces_full_lifecycle() -> Result<(), Box<dyn std::error::Error>> {
     // 1. Start NEAR Sandbox
     let worker = near_workspaces::sandbox().await?;
 
@@ -164,6 +164,57 @@ async fn test_workspaces_full_lifecycle() -> anyhow::Result<()> {
         .json()?;
     assert_eq!(deal_view["status"], "Funded");
 
-    println!("near-workspaces: Deal #{} successfully funded on real sandbox chain!", deal_id);
+    // 9. Activate Deal on-chain via TEE SignedPayload
+    let activate_payload = serde_json::json!({
+        "domain": "conpi:v1",
+        "contract_id": contract.id().to_string(),
+        "chain_id": "testnet",
+        "deal_id": deal_id,
+        "terms_hash": terms_hash,
+        "kind": "Activate",
+        "stage": 0,
+        "metered_value": "0",
+        "reason": null,
+        "nonce": 1,
+        "issued_at": 1000
+    });
+
+    // Canonical Borsh payload for signature
+    let signed_payload_struct = SignedPayload {
+        domain: "conpi:v1".to_string(),
+        contract_id: contract.id().to_string().parse().unwrap(),
+        chain_id: "testnet".to_string(),
+        deal_id,
+        terms_hash,
+        kind: PayloadKind::Activate,
+        stage: 0,
+        metered_value: U128(0),
+        reason: None,
+        nonce: 1,
+        issued_at: 1000,
+    };
+    let payload_bytes = borsh::to_vec(&signed_payload_struct)?;
+    let act_sig = tee_sk.sign(&payload_bytes).to_bytes().to_vec();
+
+    let act_res = contract
+        .call("activate")
+        .args_json(serde_json::json!({
+            "deal_id": deal_id,
+            "payload": activate_payload,
+            "sig": act_sig
+        }))
+        .transact()
+        .await?;
+    assert!(act_res.is_success());
+
+    // Verify Deal state is now ACTIVE on-chain
+    let active_deal: serde_json::Value = contract
+        .view("get_deal")
+        .args_json(serde_json::json!({ "deal_id": deal_id }))
+        .await?
+        .json()?;
+    assert_eq!(active_deal["status"], "Active");
+
+    println!("near-workspaces: Deal #{} successfully activated on real blockchain sandbox!", deal_id);
     Ok(())
 }
