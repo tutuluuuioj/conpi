@@ -50,8 +50,9 @@ fn sign_terms_hash(
     terms_hash: &[u8; 32],
 ) -> Vec<u8> {
     let mut msg_bytes = Vec::new();
-    msg_bytes.extend_from_slice(b"conpi:v1:terms:");
+    msg_bytes.extend_from_slice(b"conpi:v1:terms:testnet:");
     msg_bytes.extend_from_slice(contract_id.as_bytes());
+    msg_bytes.extend_from_slice(b":");
     msg_bytes.extend_from_slice(&deal_id.to_le_bytes());
     msg_bytes.extend_from_slice(terms_hash);
     signing_key.sign(&msg_bytes).to_bytes().to_vec()
@@ -118,6 +119,7 @@ async fn test_workspaces_full_lifecycle() -> Result<(), Box<dyn std::error::Erro
                 "slash_bps_revoke": 8000
             }
         }))
+        .deposit(NearToken::from_millinear(50))
         .transact()
         .await?;
     assert!(create_res.is_success());

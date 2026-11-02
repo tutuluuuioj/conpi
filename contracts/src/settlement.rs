@@ -1,11 +1,13 @@
 use crate::types::{Balance, Deal, DefaultReason};
 
+#[derive(Debug, PartialEq, Eq)]
 pub struct DefaultDistribution {
     pub seller_payout: Balance,
     pub buyer_refund: Balance,
     pub slashed_collateral: Balance,
 }
 
+#[derive(Debug, PartialEq, Eq)]
 pub struct TimeoutDistribution {
     pub seller_payout: Balance,
     pub buyer_refund: Balance,
@@ -30,6 +32,10 @@ impl SettlementCalculator {
     }
 
     /// Calculates settlement distributions when a seller default occurs.
+    ///
+    /// GUARANTEE: Exactly conserves the escrow balance (`price - released_to_seller + collaterals`).
+    /// Under NO condition can `seller_payout + buyer_refund` exceed the remaining funds in escrow,
+    /// even if default happens after a stage release where `released_to_seller > seller_earned`.
     pub fn calculate_default_settlement(
         deal: &Deal,
         metered_value: u128,
@@ -46,24 +52,39 @@ impl SettlementCalculator {
         let seller_earned = (fraction_bps * deal.price) / 10_000;
         let remaining_owed_to_seller = seller_earned.saturating_sub(deal.released_to_seller);
 
-        // 3. Unused purchase price returned to buyer
-        let unused_price = deal.price.saturating_sub(seller_earned);
+        // CRITICAL BUG FIX (settlement.rs:47-50):
+        // If the seller already received stage payouts that exceed their final metered usage
+        // (e.g. Stage 50% paid $30, but seller metered only 40% = $24), the buyer's price refund
+        // must come from the remaining price left in escrow: `price - max(seller_earned, released_to_seller)`.
+        let effective_seller_taken = std::cmp::max(seller_earned, deal.released_to_seller);
+        let buyer_price_refund = deal.price.saturating_sub(effective_seller_taken);
 
-        // 4. Determine slashing rate based on default reason
+        // 3. Determine slashing rate based on default reason
         let slash_bps = match reason {
             DefaultReason::ProviderBan => deal.slash_bps_provider_ban as u128,
             DefaultReason::InvalidKey
             | DefaultReason::InsufficientQuota
             | DefaultReason::KeyNotSubmitted
-            | DefaultReason::ValidationFailed => deal.slash_bps_revoke as u128,
+            | DefaultReason::ValidationFailed
+            | DefaultReason::SellerSelfDrain => deal.slash_bps_revoke as u128,
         };
 
         let slash_amount = (slash_bps * deal.seller_collateral) / 10_000;
         let seller_collateral_refund = deal.seller_collateral.saturating_sub(slash_amount);
 
-        // 5. Compute final totals to transfer
+        // 4. Compute final totals to transfer
         let seller_payout = remaining_owed_to_seller + seller_collateral_refund;
-        let buyer_refund = unused_price + deal.buyer_collateral + slash_amount;
+        let buyer_refund = buyer_price_refund + deal.buyer_collateral + slash_amount;
+
+        // MATHEMATICAL CONSERVATION ASSERTION:
+        let remaining_escrow = (deal.price - deal.released_to_seller)
+            + deal.buyer_collateral
+            + deal.seller_collateral;
+        assert_eq!(
+            seller_payout + buyer_refund,
+            remaining_escrow,
+            "CRITICAL CONSERVATION INVARIANT VIOLATED: settlement payout does not match remaining escrow"
+        );
 
         DefaultDistribution {
             seller_payout,
@@ -74,6 +95,9 @@ impl SettlementCalculator {
 
     /// Calculates settlement distributions when TEE liveness timeout passes.
     /// Neither party is faulted: both collaterals are returned in full.
+    ///
+    /// GUARANTEE: Exactly conserves the escrow balance, even if the last signed checkpoint
+    /// is older than the latest stage release.
     pub fn calculate_timeout_settlement(
         deal: &Deal,
         checkpoint_metered_value: u128,
@@ -89,10 +113,24 @@ impl SettlementCalculator {
 
         let seller_earned = (fraction_bps * deal.price) / 10_000;
         let additional_seller_owed = seller_earned.saturating_sub(deal.released_to_seller);
-        let unused_price = deal.price.saturating_sub(seller_earned);
+
+        // CRITICAL BUG FIX (settlement.rs:95-96):
+        // Protect against old checkpoints overpaying the buyer beyond remaining escrow funds.
+        let effective_seller_taken = std::cmp::max(seller_earned, deal.released_to_seller);
+        let buyer_price_refund = deal.price.saturating_sub(effective_seller_taken);
 
         let seller_payout = additional_seller_owed + deal.seller_collateral;
-        let buyer_refund = unused_price + deal.buyer_collateral;
+        let buyer_refund = buyer_price_refund + deal.buyer_collateral;
+
+        // MATHEMATICAL CONSERVATION ASSERTION:
+        let remaining_escrow = (deal.price - deal.released_to_seller)
+            + deal.buyer_collateral
+            + deal.seller_collateral;
+        assert_eq!(
+            seller_payout + buyer_refund,
+            remaining_escrow,
+            "CRITICAL CONSERVATION INVARIANT VIOLATED: timeout payout does not match remaining escrow"
+        );
 
         TimeoutDistribution {
             seller_payout,

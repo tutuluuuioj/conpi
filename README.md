@@ -2,7 +2,8 @@
 
 > **Platform:** NEAR Protocol Escrow Contract + Intel TDX Confidential VM (TEE)  
 > **Environment:** NEAR Testnet + Phala Network Intel TDX CVM  
-> **Deployed Testnet Contract:** [`dev-20261102164111-65638942576917.testnet`](https://testnet.nearblocks.io/address/dev-20261102164111-65638942576917.testnet)  
+> **Deployed Testnet Contract:** [`dev-20261102170658-24098999364164.testnet`](https://testnet.nearblocks.io/address/dev-20261102170658-24098999364164.testnet)  
+> **Registered TEE Signer Pubkey:** `ed25519:7pv8g7e2cJqyBEXiDYQ9GwHgEK5hj7etb9h4zMmvToFi`  
 > **Documentation:** [System Design Document v1.1]
 
 ---

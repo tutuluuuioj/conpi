@@ -28,6 +28,7 @@ pub enum DefaultReason {
     KeyNotSubmitted,
     ValidationFailed,
     ProviderBan,
+    SellerSelfDrain,
 }
 
 #[derive(BorshSerialize, BorshDeserialize, Serialize, Deserialize, Clone, Copy, Debug, PartialEq, Eq)]
@@ -81,23 +82,29 @@ pub struct TeeSigner {
 #[serde(crate = "near_sdk::serde")]
 #[borsh(crate = "borsh")]
 pub struct Config {
+    pub chain_id: String,
     pub min_deposit_duration: Duration,
     pub max_deposit_duration: Duration,
     pub min_tee_liveness_timeout: Duration,
     pub default_usage_duration: Duration,
-    pub max_slash_bps: u16,
+    pub notice_period_duration: Duration,
     pub min_slash_bps: u16,
+    pub max_slash_bps: u16,
+    pub storage_deposit_fee: Balance,
 }
 
 impl Default for Config {
     fn default() -> Self {
         Self {
+            chain_id: "testnet".to_string(),
             min_deposit_duration: 300_000_000_000,          // 5 minutes
             max_deposit_duration: 7 * 86_400_000_000_000,    // 7 days
             min_tee_liveness_timeout: 3_600_000_000_000,     // 1 hour
             default_usage_duration: 30 * 86_400_000_000_000, // 30 days
-            max_slash_bps: 10_000,                          // 100%
+            notice_period_duration: 86_400_000_000_000,      // 24 hours notice for auto_release
             min_slash_bps: 1_000,                           // 10%
+            max_slash_bps: 10_000,                          // 100%
+            storage_deposit_fee: 50_000_000_000_000_000_000_000, // 0.05 NEAR
         }
     }
 }
@@ -109,7 +116,6 @@ pub struct Deal {
     pub id: DealId,
     pub buyer: AccountId,
     pub seller: AccountId,
-    /// None = Native NEAR; Some(account_id) = NEP-141 token
     pub token: Option<AccountId>,
     pub price: Balance,
     pub credit_amount: Balance,
@@ -120,6 +126,7 @@ pub struct Deal {
     pub deposit_deadline: Timestamp,
     pub key_deadline: Timestamp,
     pub usage_deadline: Timestamp,
+    pub notice_deadline: Option<Timestamp>,
     pub tee_liveness_timeout: Duration,
     pub slash_bps_provider_ban: u16,
     pub slash_bps_revoke: u16,
@@ -131,6 +138,7 @@ pub struct Deal {
     pub last_nonce: u64,
     pub last_tee_seen: Timestamp,
     pub status: DealStatus,
+    pub counterparty_accepted: bool,
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug)]

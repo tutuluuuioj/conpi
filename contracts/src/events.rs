@@ -15,6 +15,11 @@ pub enum ConpiEvent<'a> {
         price: U128,
         token: &'a Option<AccountId>,
     },
+    #[serde(rename = "deal_accepted")]
+    DealAccepted {
+        deal_id: u64,
+        account: &'a AccountId,
+    },
     #[serde(rename = "terms_registered")]
     TermsRegistered {
         deal_id: u64,
@@ -49,6 +54,11 @@ pub enum ConpiEvent<'a> {
         metered_value: U128,
         nonce: u64,
     },
+    #[serde(rename = "auto_release_notice")]
+    AutoReleaseNotice {
+        deal_id: u64,
+        notice_deadline: u64,
+    },
     #[serde(rename = "deal_defaulted")]
     DealDefaulted {
         deal_id: u64,
@@ -72,6 +82,12 @@ pub enum ConpiEvent<'a> {
         deal_id: u64,
         seller_payout: U128,
         buyer_refund: U128,
+    },
+    #[serde(rename = "pending_payout_claimed")]
+    PendingPayoutClaimed {
+        account: &'a AccountId,
+        token: &'a Option<AccountId>,
+        amount: U128,
     },
 }
 
