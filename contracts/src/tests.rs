@@ -512,23 +512,84 @@ mod tests {
         let terms_sig = sign_terms_hash(&tee_sk, &"conpi.testnet".parse().unwrap(), deal_id, &terms_hash);
         contract.register_terms_hash(deal_id, terms_hash, terms_sig);
 
-        // Buyer transfers NEP-141 token (called by token contract, sender = buyer)
+        // Buyer transfers NEP-141 token with 5 USDC excess using JSON message format
+        let excess_sent = 5_000_000u128; // 5 USDC excess
+        let json_msg = format!("{{\"deal_id\": {}}}", deal_id);
         testing_env!(context
             .predecessor_account_id(usdc_token.clone())
             .attached_deposit(NearToken::from_yoctonear(0))
             .build());
-        let _ = contract.ft_on_transfer(buyer.clone(), U128(price + buyer_col), deal_id.to_string());
+        let refund = contract.ft_on_transfer(
+            buyer.clone(),
+            U128(price + buyer_col + excess_sent),
+            json_msg,
+        );
+
+        // Verify excess is automatically refunded back to sender
+        match refund {
+            near_sdk::PromiseOrValue::Value(val) => {
+                assert_eq!(val.0, excess_sent, "Excess deposit must be refunded");
+            }
+            _ => panic!("Expected Value refund"),
+        }
 
         let deal = contract.get_deal(deal_id).unwrap();
         assert_eq!(deal.buyer_deposited, price + buyer_col);
         assert_eq!(deal.status, DealStatus::Created);
 
-        // Seller transfers NEP-141 token
-        let _ = contract.ft_on_transfer(seller.clone(), U128(seller_col), deal_id.to_string());
+        // Seller transfers exact NEP-141 token
+        let seller_refund = contract.ft_on_transfer(seller.clone(), U128(seller_col), deal_id.to_string());
+        match seller_refund {
+            near_sdk::PromiseOrValue::Value(val) => {
+                assert_eq!(val.0, 0, "No refund when exact deposit is provided");
+            }
+            _ => panic!("Expected Value refund"),
+        }
 
         let deal = contract.get_deal(deal_id).unwrap();
         assert_eq!(deal.seller_deposited, seller_col);
         assert_eq!(deal.status, DealStatus::Funded); // Funded with NEP-141!
+
+        // Activate Deal
+        let activate_payload = SignedPayload {
+            domain: "conpi:v1".to_string(),
+            contract_id: "conpi.testnet".parse().unwrap(),
+            chain_id: "testnet".to_string(),
+            deal_id,
+            terms_hash,
+            kind: PayloadKind::Activate,
+            stage: 0,
+            metered_value: U128(0),
+            reason: None,
+            nonce: 1,
+            issued_at: 1000,
+        };
+        let act_sig = sign_payload(&tee_sk, &activate_payload);
+        contract.activate(deal_id, activate_payload, act_sig);
+
+        let active_deal = contract.get_deal(deal_id).unwrap();
+        assert_eq!(active_deal.status, DealStatus::Active);
+
+        // Stage 25% payout in USDC
+        let stage_25_payload = SignedPayload {
+            domain: "conpi:v1".to_string(),
+            contract_id: "conpi.testnet".parse().unwrap(),
+            chain_id: "testnet".to_string(),
+            deal_id,
+            terms_hash,
+            kind: PayloadKind::Stage,
+            stage: 25,
+            metered_value: U128(17_500_000), // 25% of 70 USDC
+            reason: None,
+            nonce: 2,
+            issued_at: 2000,
+        };
+        let stg_sig = sign_payload(&tee_sk, &stage_25_payload);
+        contract.release_stage(deal_id, 25, stage_25_payload, stg_sig);
+
+        let stage_deal = contract.get_deal(deal_id).unwrap();
+        assert_eq!(stage_deal.stage_reached, 25);
+        assert_eq!(stage_deal.released_to_seller, 12_500_000); // 25% of 50 USDC = 12.5 USDC!
     }
 
     #[test]

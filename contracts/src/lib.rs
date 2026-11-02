@@ -20,7 +20,7 @@ use types::{
     SignedPayload, SignedState, TeeSigner,
 };
 
-const GAS_FOR_FT_TRANSFER: Gas = Gas::from_tgas(20);
+const GAS_FOR_FT_TRANSFER: Gas = Gas::from_tgas(30);
 const ONE_YOCTO: Balance = 1;
 
 #[near(contract_state)]
@@ -259,7 +259,9 @@ impl ConpiEscrow {
         self.deals.insert(&deal_id, &deal);
     }
 
-    /// NEP-141 token receiver callback
+    /// Production-grade NEP-141 token receiver callback.
+    /// Handles both raw string deal_ids and JSON `{ "deal_id": 123 }`.
+    /// Automatically refunds excess tokens or invalid transfers back to the sender.
     pub fn ft_on_transfer(
         &mut self,
         sender_id: AccountId,
@@ -267,59 +269,96 @@ impl ConpiEscrow {
         msg: String,
     ) -> PromiseOrValue<U128> {
         let token_account = env::predecessor_account_id();
-        let deal_id: u64 = msg
-            .parse::<u64>()
-            .expect("ft_on_transfer msg must contain valid numeric deal_id");
 
-        let mut deal = self.get_deal_or_panic(deal_id);
-        require!(
-            deal.token == Some(token_account),
-            "Token does not match deal asset"
-        );
-        require!(
-            deal.status == DealStatus::Created,
-            "Deal is not accepting deposits"
-        );
-        require!(
-            env::block_timestamp() <= deal.deposit_deadline,
-            "Deposit deadline has passed"
-        );
+        // 1. Robust message parsing: support JSON object {"deal_id": 123}, JSON number 123, or raw string "123"
+        let deal_id: u64 = if let Ok(val) = near_sdk::serde_json::from_str::<serde_json::Value>(&msg) {
+            if let Some(obj) = val.as_object() {
+                if let Some(id) = obj.get("deal_id") {
+                    if let Some(num) = id.as_u64() {
+                        num
+                    } else if let Some(str_val) = id.as_str() {
+                        str_val.parse::<u64>().unwrap_or(0)
+                    } else {
+                        0
+                    }
+                } else {
+                    0
+                }
+            } else if let Some(num) = val.as_u64() {
+                num
+            } else if let Some(str_val) = val.as_str() {
+                str_val.parse::<u64>().unwrap_or(0)
+            } else {
+                0
+            }
+        } else {
+            msg.trim().parse::<u64>().unwrap_or(0)
+        };
+
+        if deal_id == 0 {
+            env::log_str("ft_on_transfer: Invalid deal_id in msg, refunding full amount");
+            return PromiseOrValue::Value(amount);
+        }
+
+        let mut deal = match self.deals.get(&deal_id) {
+            Some(d) => d,
+            None => {
+                env::log_str("ft_on_transfer: Deal not found, refunding full amount");
+                return PromiseOrValue::Value(amount);
+            }
+        };
+
+        // 2. Validate token matches deal asset
+        if deal.token != Some(token_account.clone()) {
+            env::log_str("ft_on_transfer: Token contract mismatch, refunding full amount");
+            return PromiseOrValue::Value(amount);
+        }
+
+        // 3. Validate deal status and deposit deadline
+        if deal.status != DealStatus::Created || env::block_timestamp() > deal.deposit_deadline {
+            env::log_str("ft_on_transfer: Deal not accepting deposits, refunding full amount");
+            return PromiseOrValue::Value(amount);
+        }
 
         let amt = amount.0;
+        let refund_amount: u128;
+
         if sender_id == deal.buyer {
-            let required = deal.price + deal.buyer_collateral;
-            require!(
-                deal.buyer_deposited + amt <= required,
-                "Exceeds required buyer deposit"
-            );
-            deal.buyer_deposited += amt;
+            let required_total = deal.price + deal.buyer_collateral;
+            let needed = required_total.saturating_sub(deal.buyer_deposited);
+            let accepted = std::cmp::min(amt, needed);
+            refund_amount = amt.saturating_sub(accepted);
+
+            deal.buyer_deposited += accepted;
             emit_event(ConpiEvent::DepositReceived {
                 deal_id,
                 account: &sender_id,
-                amount,
+                amount: U128(accepted),
                 is_buyer: true,
             });
         } else if sender_id == deal.seller {
-            let required = deal.seller_collateral;
-            require!(
-                deal.seller_deposited + amt <= required,
-                "Exceeds required seller deposit"
-            );
-            deal.seller_deposited += amt;
+            let required_total = deal.seller_collateral;
+            let needed = required_total.saturating_sub(deal.seller_deposited);
+            let accepted = std::cmp::min(amt, needed);
+            refund_amount = amt.saturating_sub(accepted);
+
+            deal.seller_deposited += accepted;
             emit_event(ConpiEvent::DepositReceived {
                 deal_id,
                 account: &sender_id,
-                amount,
+                amount: U128(accepted),
                 is_buyer: false,
             });
         } else {
-            env::panic_str("Sender is neither buyer nor seller for this deal");
+            env::log_str("ft_on_transfer: Sender is neither buyer nor seller, refunding full amount");
+            return PromiseOrValue::Value(amount);
         }
 
         self.check_and_transition_funded(&mut deal);
         self.deals.insert(&deal_id, &deal);
 
-        PromiseOrValue::Value(U128(0))
+        // Refund any excess tokens immediately back to sender via NEP-141 standard return
+        PromiseOrValue::Value(U128(refund_amount))
     }
 
     /* -------------------------------------------------------------------------
