@@ -700,11 +700,16 @@ export default function Home() {
               <div className="flex items-center justify-between">
                 <div>
                   <h2 className="text-lg font-bold text-white">NEAR Escrow Smart Contract</h2>
-                  <p className="text-xs text-slate-400 mt-1">Rust SDK v5.30 • Target: wasm32-unknown-unknown • Size: 426 KB</p>
+                  <p className="text-xs text-slate-400 mt-1 font-mono">Address: dev-20261102163358-67880766628127.testnet</p>
                 </div>
-                <span className="px-3 py-1 rounded-full text-xs font-semibold bg-emerald-500/10 text-emerald-400 border border-emerald-500/20">
-                  Ready for Testnet Deploy
-                </span>
+                <a
+                  href="https://testnet.nearblocks.io/address/dev-20261102163358-67880766628127.testnet"
+                  target="_blank"
+                  rel="noreferrer"
+                  className="px-3 py-1 rounded-full text-xs font-semibold bg-emerald-500/10 text-emerald-400 border border-emerald-500/20 hover:bg-emerald-500/20 flex items-center gap-1 transition"
+                >
+                  View on NEARBlocks <ExternalLink className="w-3 h-3" />
+                </a>
               </div>
 
               <div className="grid grid-cols-1 md:grid-cols-2 gap-4 text-xs font-mono">
