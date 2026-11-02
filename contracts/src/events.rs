@@ -1,6 +1,6 @@
 use near_sdk::json_types::U128;
 use near_sdk::serde::Serialize;
-use near_sdk::{env, AccountId};
+use near_sdk::{env, AccountId, Timestamp};
 
 #[derive(Serialize, Debug)]
 #[serde(crate = "near_sdk::serde")]
@@ -89,6 +89,23 @@ pub enum ConpiEvent<'a> {
         token: &'a Option<AccountId>,
         amount: U128,
     },
+    #[serde(rename = "transfer_failed_credited")]
+    TransferFailedCredited {
+        account: &'a AccountId,
+        token: &'a Option<AccountId>,
+        amount: U128,
+    },
+    #[serde(rename = "upgrade_staged")]
+    UpgradeStaged {
+        code_hash: &'a str,
+        ready_at: Timestamp,
+    },
+    #[serde(rename = "upgrade_applied")]
+    UpgradeApplied {
+        code_hash: &'a str,
+    },
+    #[serde(rename = "upgrade_cancelled")]
+    UpgradeCancelled,
 }
 
 pub fn emit_event(event: ConpiEvent) {

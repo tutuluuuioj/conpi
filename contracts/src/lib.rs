@@ -1,8 +1,8 @@
 use near_sdk::collections::{LookupMap, UnorderedMap};
 use near_sdk::json_types::U128;
 use near_sdk::{
-    env, near, require, AccountId, Gas, NearToken, PanicOnDefault, Promise, PromiseOrValue,
-    PublicKey,
+    env, near, require, AccountId, Duration, Gas, NearToken, PanicOnDefault, Promise,
+    PromiseOrValue, PublicKey, Timestamp,
 };
 
 pub mod crypto;
@@ -21,13 +21,15 @@ use types::{
     SignedPayload, SignedState, TeeSigner,
 };
 
-const GAS_FOR_FT_TRANSFER: Gas = Gas::from_tgas(30);
+const GAS_FOR_FT_TRANSFER: Gas = Gas::from_tgas(20);
+const GAS_FOR_RESOLVE_TRANSFER: Gas = Gas::from_tgas(10);
 const ONE_YOCTO: Balance = 1;
 
 #[near(contract_state)]
 #[derive(PanicOnDefault)]
 pub struct ConpiEscrow {
     pub owner: AccountId,
+    pub chain_id: String,
     pub paused: bool,
     pub tee_signers: UnorderedMap<PublicKey, TeeSigner>,
     pub deals: LookupMap<DealId, Deal>,
@@ -35,15 +37,19 @@ pub struct ConpiEscrow {
     pub pending_payouts: LookupMap<(AccountId, Option<AccountId>), Balance>,
     pub next_deal_id: u64,
     pub config: Config,
+    pub staged_upgrade_hash: Option<[u8; 32]>,
+    pub staged_upgrade_timestamp: Option<Timestamp>,
+    pub timelock_duration: Duration,
 }
 
 #[near]
 impl ConpiEscrow {
     #[init]
-    pub fn new(owner: AccountId, config: Option<Config>) -> Self {
+    pub fn new(owner: AccountId, chain_id: Option<String>, config: Option<Config>) -> Self {
         require!(!env::state_exists(), "Already initialized");
         Self {
             owner,
+            chain_id: chain_id.unwrap_or_else(|| "testnet".to_string()),
             paused: false,
             tee_signers: UnorderedMap::new(b"t"),
             deals: LookupMap::new(b"d"),
@@ -51,11 +57,14 @@ impl ConpiEscrow {
             pending_payouts: LookupMap::new(b"p"),
             next_deal_id: 1,
             config: config.unwrap_or_default(),
+            staged_upgrade_hash: None,
+            staged_upgrade_timestamp: None,
+            timelock_duration: 172_800_000_000_000, // 48-hour default timelock
         }
     }
 
     /* -------------------------------------------------------------------------
-       ADMIN METHODS
+       GOVERNANCE & ADMIN METHODS
     ------------------------------------------------------------------------- */
 
     pub fn transfer_ownership(&mut self, new_owner: AccountId) {
@@ -93,18 +102,94 @@ impl ConpiEscrow {
     pub fn update_config(&mut self, config: Config) {
         self.assert_owner();
         require!(
+            config.storage_deposit_fee >= 10_000_000_000_000_000_000_000,
+            "storage_deposit_fee must be at least 0.01 NEAR"
+        );
+        require!(
+            config.min_slash_bps >= 500 && config.max_slash_bps <= 10_000,
+            "min_slash_bps must be >= 500 (5%) and max_slash_bps <= 10,000 (100%)"
+        );
+        require!(
+            config.min_slash_bps <= config.max_slash_bps,
+            "min_slash_bps must be <= max_slash_bps"
+        );
+        require!(
+            config.min_deposit_duration >= 60_000_000_000,
+            "min_deposit_duration must be at least 60 seconds"
+        );
+        require!(
             config.min_deposit_duration <= config.max_deposit_duration,
             "min_deposit_duration must be <= max_deposit_duration"
         );
         require!(
-            config.min_slash_bps <= config.max_slash_bps && config.max_slash_bps <= 10_000,
-            "Invalid slash bounds"
+            config.min_tee_liveness_timeout >= 60_000_000_000,
+            "min_tee_liveness_timeout must be at least 60 seconds"
         );
+        require!(
+            config.default_usage_duration >= 86_400_000_000_000,
+            "default_usage_duration must be at least 1 day"
+        );
+        require!(
+            config.notice_period_duration >= 3_600_000_000_000,
+            "notice_period_duration must be at least 1 hour"
+        );
+
         self.config = config;
     }
 
     /* -------------------------------------------------------------------------
-       DEAL CREATION & TERMS REGISTRATION
+       TIMELOCKED CONTRACT UPGRADES
+    ------------------------------------------------------------------------- */
+
+    pub fn stage_upgrade(&mut self, code_hash: [u8; 32]) {
+        self.assert_owner();
+        let ready_at = env::block_timestamp() + self.timelock_duration;
+        self.staged_upgrade_hash = Some(code_hash);
+        self.staged_upgrade_timestamp = Some(ready_at);
+
+        emit_event(ConpiEvent::UpgradeStaged {
+            code_hash: &hex::encode(code_hash),
+            ready_at,
+        });
+    }
+
+    pub fn apply_upgrade(&mut self, code: Vec<u8>) -> Promise {
+        self.assert_owner();
+        let ready_at = self
+            .staged_upgrade_timestamp
+            .expect("No upgrade currently staged");
+        require!(
+            env::block_timestamp() >= ready_at,
+            "Upgrade timelock delay has not elapsed yet"
+        );
+        let expected_hash = self
+            .staged_upgrade_hash
+            .expect("No staged code hash found");
+        let actual_hash = env::sha256_array(&code);
+        require!(
+            actual_hash == expected_hash,
+            "Code hash mismatch with staged upgrade"
+        );
+
+        self.staged_upgrade_hash = None;
+        self.staged_upgrade_timestamp = None;
+
+        emit_event(ConpiEvent::UpgradeApplied {
+            code_hash: &hex::encode(expected_hash),
+        });
+
+        Promise::new(env::current_account_id()).deploy_contract(code)
+    }
+
+    pub fn cancel_upgrade(&mut self) {
+        self.assert_owner();
+        self.staged_upgrade_hash = None;
+        self.staged_upgrade_timestamp = None;
+        emit_event(ConpiEvent::UpgradeCancelled);
+    }
+
+    /* -------------------------------------------------------------------------
+       DEAL CREATION & TERMS VERIFICATION
     ------------------------------------------------------------------------- */
 
     #[payable]
@@ -117,12 +202,16 @@ impl ConpiEscrow {
         );
         require!(params.buyer != params.seller, "Buyer and seller must differ");
 
-        // Anti-spam storage deposit check
+        // Anti-spam storage deposit check & immediate refund of excess
         let attached = env::attached_deposit().as_yoctonear();
         require!(
             attached >= self.config.storage_deposit_fee,
             "Must attach required storage deposit fee"
         );
+        let excess = attached - self.config.storage_deposit_fee;
+        if excess > 0 {
+            let _ = Promise::new(caller.clone()).transfer(NearToken::from_yoctonear(excess));
+        }
 
         // Verify specified TEE signer is registered and active
         self.assert_active_tee_signer(&params.tee_pubkey);
@@ -167,6 +256,24 @@ impl ConpiEscrow {
         let deal_id = self.next_deal_id;
         self.next_deal_id += 1;
 
+        // Compute canonical terms_hash on-chain directly from parameters
+        let terms_hash = CryptoHelper::compute_terms_hash(
+            deal_id,
+            &params.buyer,
+            &params.seller,
+            &params.token,
+            params.price.0,
+            params.credit_amount.0,
+            params.buyer_collateral.0,
+            params.seller_collateral.0,
+            &params.tee_pubkey,
+            deposit_duration,
+            key_duration,
+            liveness_timeout,
+            params.slash_bps_provider_ban,
+            params.slash_bps_revoke,
+        );
+
         let deal = Deal {
             id: deal_id,
             buyer: params.buyer.clone(),
@@ -176,7 +283,7 @@ impl ConpiEscrow {
             credit_amount: params.credit_amount.0,
             buyer_collateral: params.buyer_collateral.0,
             seller_collateral: params.seller_collateral.0,
-            terms_hash: None,
+            terms_hash: Some(terms_hash),
             tee_pubkey: params.tee_pubkey,
             deposit_deadline: now + deposit_duration,
             key_deadline: now + deposit_duration + key_duration,
@@ -210,8 +317,8 @@ impl ConpiEscrow {
         deal_id
     }
 
-    /// Counterparty explicitly accepts the deal terms before funding.
-    pub fn accept_deal(&mut self, deal_id: u64) {
+    /// Counterparty explicitly verifies and accepts the on-chain terms_hash before funding.
+    pub fn accept_deal(&mut self, deal_id: u64, expected_hash: [u8; 32]) {
         self.assert_not_paused();
         let mut deal = self.get_deal_or_panic(deal_id);
         require!(
@@ -230,6 +337,13 @@ impl ConpiEscrow {
             &caller == counterparty,
             "Only counterparty can accept this deal"
         );
+
+        let computed_hash = deal.terms_hash.expect("Deal terms_hash missing");
+        require!(
+            computed_hash == expected_hash,
+            "expected_hash does not match on-chain terms_hash"
+        );
+
         deal.counterparty_accepted = true;
 
         self.check_and_transition_funded(&mut deal);
@@ -241,7 +355,7 @@ impl ConpiEscrow {
         });
     }
 
-    /// Registers the canonical terms_hash verified and signed by the TEE.
+    /// Allows the TEE to submit a signed attestation for the on-chain terms_hash.
     pub fn register_terms_hash(&mut self, deal_id: u64, terms_hash: [u8; 32], sig: Vec<u8>) {
         self.assert_not_paused();
         let mut deal = self.get_deal_or_panic(deal_id);
@@ -249,14 +363,16 @@ impl ConpiEscrow {
             deal.status == DealStatus::Created,
             "Deal must be in Created status"
         );
-        require!(deal.terms_hash.is_none(), "terms_hash already registered");
+        let expected = deal.terms_hash.expect("Deal terms_hash missing");
+        require!(
+            terms_hash == expected,
+            "Submitted terms_hash does not match on-chain deal terms"
+        );
 
-        // Verify TEE signer is still active
         self.assert_active_tee_signer(&deal.tee_pubkey);
 
-        // Build canonical terms message: "conpi:v1:terms:" + chain_id + contract_id + deal_id + terms_hash
         let msg_bytes = CryptoHelper::build_terms_message(
-            &self.config.chain_id,
+            &self.chain_id,
             &env::current_account_id(),
             deal_id,
             &terms_hash,
@@ -266,7 +382,6 @@ impl ConpiEscrow {
             CryptoHelper::verify_signature_raw(&msg_bytes, &sig, &deal.tee_pubkey);
         require!(is_valid, "Invalid TEE signature on terms_hash");
 
-        deal.terms_hash = Some(terms_hash);
         deal.last_tee_seen = env::block_timestamp();
 
         self.check_and_transition_funded(&mut deal);
@@ -332,12 +447,6 @@ impl ConpiEscrow {
             env::panic_str("Caller is neither buyer nor seller for this deal");
         }
 
-        // Depositing signals counterparty agreement
-        let creator = self.deal_creators.get(&deal_id).unwrap_or(deal.buyer.clone());
-        if caller != creator {
-            deal.counterparty_accepted = true;
-        }
-
         self.check_and_transition_funded(&mut deal);
         self.deals.insert(&deal_id, &deal);
     }
@@ -349,9 +458,13 @@ impl ConpiEscrow {
         amount: U128,
         msg: String,
     ) -> PromiseOrValue<U128> {
+        if self.paused {
+            env::log_str("ft_on_transfer: Contract paused, refunding tokens");
+            return PromiseOrValue::Value(amount);
+        }
+
         let token_account = env::predecessor_account_id();
 
-        // 1. Robust message parsing: support JSON {"deal_id": 123}, number 123, or string "123"
         let deal_id: u64 = if let Ok(val) = near_sdk::serde_json::from_str::<serde_json::Value>(&msg) {
             if let Some(obj) = val.as_object() {
                 if let Some(id) = obj.get("deal_id") {
@@ -429,11 +542,6 @@ impl ConpiEscrow {
             return PromiseOrValue::Value(amount);
         }
 
-        let creator = self.deal_creators.get(&deal_id).unwrap_or(deal.buyer.clone());
-        if sender_id != creator {
-            deal.counterparty_accepted = true;
-        }
-
         self.check_and_transition_funded(&mut deal);
         self.deals.insert(&deal_id, &deal);
 
@@ -456,7 +564,6 @@ impl ConpiEscrow {
             "Key submission deadline has passed"
         );
 
-        // Verify TEE signer is active
         self.assert_active_tee_signer(&deal.tee_pubkey);
 
         CryptoHelper::verify_signed_payload(
@@ -465,7 +572,7 @@ impl ConpiEscrow {
             &deal.tee_pubkey,
             &deal,
             &env::current_account_id(),
-            &self.config.chain_id,
+            &self.chain_id,
             PayloadKind::Activate,
         );
 
@@ -490,7 +597,6 @@ impl ConpiEscrow {
         payload: SignedPayload,
         sig: Vec<u8>,
     ) {
-        self.assert_not_paused();
         let mut deal = self.get_deal_or_panic(deal_id);
         require!(
             deal.status == DealStatus::Active,
@@ -505,7 +611,6 @@ impl ConpiEscrow {
             "Payload stage must match parameter"
         );
 
-        // Enforce that metered_value is at least the fraction for this stage
         let required_metered = (stage as u128 * deal.credit_amount) / 100;
         require!(
             payload.metered_value.0 >= required_metered,
@@ -520,7 +625,7 @@ impl ConpiEscrow {
             &deal.tee_pubkey,
             &deal,
             &env::current_account_id(),
-            &self.config.chain_id,
+            &self.chain_id,
             PayloadKind::Stage,
         );
 
@@ -536,13 +641,16 @@ impl ConpiEscrow {
         });
         deal.last_tee_seen = env::block_timestamp();
 
+        // Fresh usage pushes usage_deadline forward and clears any pending auto-release notice
+        deal.usage_deadline = env::block_timestamp() + self.config.default_usage_duration;
+        deal.notice_deadline = None;
+
         if stage == 100 {
             deal.status = DealStatus::Completed;
             let total_to_seller = incremental_payout + deal.seller_collateral;
-            self.payout(&deal.seller, total_to_seller, &deal.token);
-            self.payout(&deal.buyer, deal.buyer_collateral, &deal.token);
+            let _ = self.payout(&deal.seller, total_to_seller, &deal.token);
+            let _ = self.payout(&deal.buyer, deal.buyer_collateral, &deal.token);
 
-            // Refund storage deposit fee to creator
             self.refund_storage_deposit(deal_id);
 
             emit_event(ConpiEvent::DealCompleted {
@@ -550,7 +658,7 @@ impl ConpiEscrow {
                 seller_total: U128(deal.released_to_seller + deal.seller_collateral),
             });
         } else {
-            self.payout(&deal.seller, incremental_payout, &deal.token);
+            let _ = self.payout(&deal.seller, incremental_payout, &deal.token);
         }
 
         self.deals.insert(&deal_id, &deal);
@@ -564,7 +672,6 @@ impl ConpiEscrow {
     }
 
     pub fn checkpoint(&mut self, deal_id: u64, payload: SignedPayload, sig: Vec<u8>) {
-        self.assert_not_paused();
         let mut deal = self.get_deal_or_panic(deal_id);
         require!(
             deal.status == DealStatus::Active,
@@ -579,7 +686,7 @@ impl ConpiEscrow {
             &deal.tee_pubkey,
             &deal,
             &env::current_account_id(),
-            &self.config.chain_id,
+            &self.chain_id,
             PayloadKind::Checkpoint,
         );
 
@@ -593,6 +700,10 @@ impl ConpiEscrow {
         });
         deal.last_tee_seen = now;
 
+        // Fresh usage checkpoint pushes usage_deadline forward and clears any auto-release notice
+        deal.usage_deadline = now + self.config.default_usage_duration;
+        deal.notice_deadline = None;
+
         self.deals.insert(&deal_id, &deal);
 
         emit_event(ConpiEvent::CheckpointRecorded {
@@ -602,8 +713,8 @@ impl ConpiEscrow {
         });
     }
 
+    /// Settle default is NEVER blocked by contract pause so parties can always settle infractions.
     pub fn settle_default(&mut self, deal_id: u64, payload: SignedPayload, sig: Vec<u8>) {
-        self.assert_not_paused();
         let mut deal = self.get_deal_or_panic(deal_id);
         require!(
             deal.status == DealStatus::Active || deal.status == DealStatus::Funded,
@@ -618,7 +729,7 @@ impl ConpiEscrow {
             &deal.tee_pubkey,
             &deal,
             &env::current_account_id(),
-            &self.config.chain_id,
+            &self.chain_id,
             PayloadKind::Default,
         );
 
@@ -637,10 +748,10 @@ impl ConpiEscrow {
         deal.last_tee_seen = env::block_timestamp();
 
         if distribution.seller_payout > 0 {
-            self.payout(&deal.seller, distribution.seller_payout, &deal.token);
+            let _ = self.payout(&deal.seller, distribution.seller_payout, &deal.token);
         }
         if distribution.buyer_refund > 0 {
-            self.payout(&deal.buyer, distribution.buyer_refund, &deal.token);
+            let _ = self.payout(&deal.buyer, distribution.buyer_refund, &deal.token);
         }
 
         self.refund_storage_deposit(deal_id);
@@ -655,6 +766,7 @@ impl ConpiEscrow {
                 DefaultReason::ValidationFailed => "VALIDATION_FAILED",
                 DefaultReason::ProviderBan => "PROVIDER_BAN",
                 DefaultReason::SellerSelfDrain => "SELLER_SELF_DRAIN",
+                DefaultReason::BuyerBreach => "BUYER_BREACH",
             },
             seller_payout: U128(distribution.seller_payout),
             buyer_refund: U128(distribution.buyer_refund),
@@ -663,15 +775,10 @@ impl ConpiEscrow {
     }
 
     /* -------------------------------------------------------------------------
-       TIMEOUTS & SAFE FALLBACKS
+       TIMEOUTS & SAFE FALLBACKS (NEVER BLOCKED BY PAUSE)
     ------------------------------------------------------------------------- */
 
-    /// Handles timeouts across Created, Funded, and Active deals:
-    /// 1. Created: Deposit deadline passed -> Refund both parties, cancel deal.
-    /// 2. Funded: Key deadline passed (seller failed to submit key) -> Refund both parties without TEE signature.
-    /// 3. Active: TEE went offline beyond liveness timeout -> Settle from last checkpoint.
     pub fn timeout_refund(&mut self, deal_id: u64) {
-        self.assert_not_paused();
         let mut deal = self.get_deal_or_panic(deal_id);
         let now = env::block_timestamp();
 
@@ -684,10 +791,10 @@ impl ConpiEscrow {
                 deal.status = DealStatus::Cancelled;
 
                 if deal.buyer_deposited > 0 {
-                    self.payout(&deal.buyer, deal.buyer_deposited, &deal.token);
+                    let _ = self.payout(&deal.buyer, deal.buyer_deposited, &deal.token);
                 }
                 if deal.seller_deposited > 0 {
-                    self.payout(&deal.seller, deal.seller_deposited, &deal.token);
+                    let _ = self.payout(&deal.seller, deal.seller_deposited, &deal.token);
                 }
 
                 self.refund_storage_deposit(deal_id);
@@ -698,7 +805,6 @@ impl ConpiEscrow {
                 });
             }
             DealStatus::Funded => {
-                // Key deadline passed without seller submitting key
                 require!(
                     now > deal.key_deadline,
                     "Key submission deadline has not passed yet"
@@ -706,10 +812,10 @@ impl ConpiEscrow {
                 deal.status = DealStatus::Cancelled;
 
                 if deal.buyer_deposited > 0 {
-                    self.payout(&deal.buyer, deal.buyer_deposited, &deal.token);
+                    let _ = self.payout(&deal.buyer, deal.buyer_deposited, &deal.token);
                 }
                 if deal.seller_deposited > 0 {
-                    self.payout(&deal.seller, deal.seller_deposited, &deal.token);
+                    let _ = self.payout(&deal.seller, deal.seller_deposited, &deal.token);
                 }
 
                 self.refund_storage_deposit(deal_id);
@@ -738,10 +844,10 @@ impl ConpiEscrow {
                 );
 
                 if dist.seller_payout > 0 {
-                    self.payout(&deal.seller, dist.seller_payout, &deal.token);
+                    let _ = self.payout(&deal.seller, dist.seller_payout, &deal.token);
                 }
                 if dist.buyer_refund > 0 {
-                    self.payout(&deal.buyer, dist.buyer_refund, &deal.token);
+                    let _ = self.payout(&deal.buyer, dist.buyer_refund, &deal.token);
                 }
 
                 self.refund_storage_deposit(deal_id);
@@ -756,9 +862,7 @@ impl ConpiEscrow {
         }
     }
 
-    /// Step 1 of auto-release: Emits notice after 30-day usage deadline.
     pub fn request_auto_release(&mut self, deal_id: u64) {
-        self.assert_not_paused();
         let mut deal = self.get_deal_or_panic(deal_id);
         require!(
             deal.status == DealStatus::Active,
@@ -784,9 +888,7 @@ impl ConpiEscrow {
         });
     }
 
-    /// Step 2 of auto-release: Finalizes release after notice period expires.
     pub fn finalize_auto_release(&mut self, deal_id: u64) {
-        self.assert_not_paused();
         let mut deal = self.get_deal_or_panic(deal_id);
         require!(
             deal.status == DealStatus::Active,
@@ -806,10 +908,10 @@ impl ConpiEscrow {
         let total_to_seller = remaining_price + deal.seller_collateral;
 
         if total_to_seller > 0 {
-            self.payout(&deal.seller, total_to_seller, &deal.token);
+            let _ = self.payout(&deal.seller, total_to_seller, &deal.token);
         }
         if deal.buyer_collateral > 0 {
-            self.payout(&deal.buyer, deal.buyer_collateral, &deal.token);
+            let _ = self.payout(&deal.buyer, deal.buyer_collateral, &deal.token);
         }
 
         self.refund_storage_deposit(deal_id);
@@ -822,12 +924,10 @@ impl ConpiEscrow {
     }
 
     /* -------------------------------------------------------------------------
-       CLAIM PENDING PAYOUTS (PULL-PAYMENT SAFEGUARD)
+       CLAIM PENDING PAYOUTS (PULL-PAYMENT SAFEGUARD - NEVER BLOCKED BY PAUSE)
     ------------------------------------------------------------------------- */
 
-    /// Allows any user to claim accumulated pending payouts (e.g. if ft_transfer failed due to storage).
     pub fn claim(&mut self, token: Option<AccountId>) -> PromiseOrValue<U128> {
-        self.assert_not_paused();
         let caller = env::predecessor_account_id();
         let key = (caller.clone(), token.clone());
         let amount = self.pending_payouts.get(&key).unwrap_or(0);
@@ -841,28 +941,44 @@ impl ConpiEscrow {
             amount: U128(amount),
         });
 
-        match token {
-            None => {
-                let _ = Promise::new(caller).transfer(NearToken::from_yoctonear(amount));
-                PromiseOrValue::Value(U128(amount))
-            }
-            Some(token_account) => {
-                let args = near_sdk::serde_json::json!({
-                    "receiver_id": caller,
-                    "amount": U128(amount),
-                    "memo": "Conpi Claim Payout"
-                })
-                .to_string()
-                .into_bytes();
+        PromiseOrValue::Promise(self.payout(&caller, amount, &token))
+    }
 
-                let prom = Promise::new(token_account).function_call(
-                    "ft_transfer".to_string(),
-                    args,
-                    NearToken::from_yoctonear(ONE_YOCTO),
-                    GAS_FOR_FT_TRANSFER,
-                );
-                PromiseOrValue::Promise(prom)
-            }
+    /* -------------------------------------------------------------------------
+       TRANSFER CALLBACK (RECOVERY TO PENDING PAYOUTS ON FAILURE)
+    ------------------------------------------------------------------------- */
+
+    #[private]
+    pub fn on_transfer_resolved(
+        &mut self,
+        recipient: AccountId,
+        amount: U128,
+        token: Option<AccountId>,
+    ) -> bool {
+        let is_success = if env::promise_results_count() > 0 {
+            env::promise_result_checked(0, 1024).is_ok()
+        } else {
+            false
+        };
+
+        if !is_success {
+            env::log_str(&format!(
+                "Transfer of {} to {} failed. Crediting to pending_payouts for pull-claim.",
+                amount.0, recipient
+            ));
+            let key = (recipient.clone(), token.clone());
+            let current = self.pending_payouts.get(&key).unwrap_or(0);
+            let updated = current.checked_add(amount.0).expect("pending_payout overflow");
+            self.pending_payouts.insert(&key, &updated);
+
+            emit_event(ConpiEvent::TransferFailedCredited {
+                account: &recipient,
+                token: &token,
+                amount,
+            });
+            false
+        } else {
+            true
         }
     }
 
@@ -898,6 +1014,17 @@ impl ConpiEscrow {
 
     pub fn is_paused(&self) -> bool {
         self.paused
+    }
+
+    pub fn get_chain_id(&self) -> String {
+        self.chain_id.clone()
+    }
+
+    pub fn get_staged_upgrade(&self) -> Option<(String, Timestamp)> {
+        match (self.staged_upgrade_hash, self.staged_upgrade_timestamp) {
+            (Some(hash), Some(ts)) => Some((hex::encode(hash), ts)),
+            _ => None,
+        }
     }
 
     /* -------------------------------------------------------------------------
@@ -947,15 +1074,18 @@ impl ConpiEscrow {
         }
     }
 
-    fn payout(&self, recipient: &AccountId, amount: Balance, token: &Option<AccountId>) {
+    fn payout(&self, recipient: &AccountId, amount: Balance, token: &Option<AccountId>) -> Promise {
         if amount == 0 {
-            return;
+            return Promise::new(env::current_account_id());
         }
         match token {
-            None => {
-                let _ = Promise::new(recipient.clone())
-                    .transfer(NearToken::from_yoctonear(amount));
-            }
+            None => Promise::new(recipient.clone())
+                .transfer(NearToken::from_yoctonear(amount))
+                .then(
+                    Self::ext(env::current_account_id())
+                        .with_static_gas(GAS_FOR_RESOLVE_TRANSFER)
+                        .on_transfer_resolved(recipient.clone(), U128(amount), None),
+                ),
             Some(token_account) => {
                 let args = near_sdk::serde_json::json!({
                     "receiver_id": recipient,
@@ -965,12 +1095,22 @@ impl ConpiEscrow {
                 .to_string()
                 .into_bytes();
 
-                let _ = Promise::new(token_account.clone()).function_call(
-                    "ft_transfer".to_string(),
-                    args,
-                    NearToken::from_yoctonear(ONE_YOCTO),
-                    GAS_FOR_FT_TRANSFER,
-                );
+                Promise::new(token_account.clone())
+                    .function_call(
+                        "ft_transfer".to_string(),
+                        args,
+                        NearToken::from_yoctonear(ONE_YOCTO),
+                        GAS_FOR_FT_TRANSFER,
+                    )
+                    .then(
+                        Self::ext(env::current_account_id())
+                            .with_static_gas(GAS_FOR_RESOLVE_TRANSFER)
+                            .on_transfer_resolved(
+                                recipient.clone(),
+                                U128(amount),
+                                Some(token_account.clone()),
+                            ),
+                    )
             }
         }
     }

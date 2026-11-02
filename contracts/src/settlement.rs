@@ -31,11 +31,15 @@ impl SettlementCalculator {
         seller_cumulative - deal.released_to_seller
     }
 
-    /// Calculates settlement distributions when a seller default occurs.
+    /// Calculates settlement distributions when a default occurs.
     ///
     /// GUARANTEE: Exactly conserves the escrow balance (`price - released_to_seller + collaterals`).
-    /// Under NO condition can `seller_payout + buyer_refund` exceed the remaining funds in escrow,
-    /// even if default happens after a stage release where `released_to_seller > seller_earned`.
+    /// Under NO condition can `seller_payout + buyer_refund` exceed the remaining funds in escrow.
+    ///
+    /// - If Seller faults (InvalidKey, InsufficientQuota, KeyNotSubmitted, ValidationFailed, ProviderBan, SellerSelfDrain):
+    ///   Seller collateral is slashed and awarded to the buyer.
+    /// - If Buyer faults (BuyerBreach):
+    ///   Buyer collateral is slashed and awarded to the seller.
     pub fn calculate_default_settlement(
         deal: &Deal,
         metered_value: u128,
@@ -52,29 +56,47 @@ impl SettlementCalculator {
         let seller_earned = (fraction_bps * deal.price) / 10_000;
         let remaining_owed_to_seller = seller_earned.saturating_sub(deal.released_to_seller);
 
-        // CRITICAL BUG FIX (settlement.rs:47-50):
-        // If the seller already received stage payouts that exceed their final metered usage
-        // (e.g. Stage 50% paid $30, but seller metered only 40% = $24), the buyer's price refund
-        // must come from the remaining price left in escrow: `price - max(seller_earned, released_to_seller)`.
+        // Buyer refund comes from remaining price left in escrow:
+        // `price - max(seller_earned, released_to_seller)`.
         let effective_seller_taken = std::cmp::max(seller_earned, deal.released_to_seller);
         let buyer_price_refund = deal.price.saturating_sub(effective_seller_taken);
 
-        // 3. Determine slashing rate based on default reason
-        let slash_bps = match reason {
-            DefaultReason::ProviderBan => deal.slash_bps_provider_ban as u128,
+        let (seller_payout, buyer_refund, slash_amount) = match reason {
+            DefaultReason::BuyerBreach => {
+                // Buyer faulted: slash buyer collateral and award to seller
+                let slash_bps = deal.slash_bps_revoke as u128;
+                let slashed = (slash_bps * deal.buyer_collateral) / 10_000;
+                let buyer_collateral_refund = deal.buyer_collateral.saturating_sub(slashed);
+
+                let s_payout = remaining_owed_to_seller + deal.seller_collateral + slashed;
+                let b_refund = buyer_price_refund + buyer_collateral_refund;
+                (s_payout, b_refund, slashed)
+            }
+            DefaultReason::ProviderBan => {
+                // Provider banned: slash seller collateral at provider ban rate
+                let slash_bps = deal.slash_bps_provider_ban as u128;
+                let slashed = (slash_bps * deal.seller_collateral) / 10_000;
+                let seller_collateral_refund = deal.seller_collateral.saturating_sub(slashed);
+
+                let s_payout = remaining_owed_to_seller + seller_collateral_refund;
+                let b_refund = buyer_price_refund + deal.buyer_collateral + slashed;
+                (s_payout, b_refund, slashed)
+            }
             DefaultReason::InvalidKey
             | DefaultReason::InsufficientQuota
             | DefaultReason::KeyNotSubmitted
             | DefaultReason::ValidationFailed
-            | DefaultReason::SellerSelfDrain => deal.slash_bps_revoke as u128,
+            | DefaultReason::SellerSelfDrain => {
+                // Seller fault: slash seller collateral at revoke rate
+                let slash_bps = deal.slash_bps_revoke as u128;
+                let slashed = (slash_bps * deal.seller_collateral) / 10_000;
+                let seller_collateral_refund = deal.seller_collateral.saturating_sub(slashed);
+
+                let s_payout = remaining_owed_to_seller + seller_collateral_refund;
+                let b_refund = buyer_price_refund + deal.buyer_collateral + slashed;
+                (s_payout, b_refund, slashed)
+            }
         };
-
-        let slash_amount = (slash_bps * deal.seller_collateral) / 10_000;
-        let seller_collateral_refund = deal.seller_collateral.saturating_sub(slash_amount);
-
-        // 4. Compute final totals to transfer
-        let seller_payout = remaining_owed_to_seller + seller_collateral_refund;
-        let buyer_refund = buyer_price_refund + deal.buyer_collateral + slash_amount;
 
         // MATHEMATICAL CONSERVATION ASSERTION:
         let remaining_escrow = (deal.price - deal.released_to_seller)
@@ -95,9 +117,6 @@ impl SettlementCalculator {
 
     /// Calculates settlement distributions when TEE liveness timeout passes.
     /// Neither party is faulted: both collaterals are returned in full.
-    ///
-    /// GUARANTEE: Exactly conserves the escrow balance, even if the last signed checkpoint
-    /// is older than the latest stage release.
     pub fn calculate_timeout_settlement(
         deal: &Deal,
         checkpoint_metered_value: u128,
@@ -114,8 +133,6 @@ impl SettlementCalculator {
         let seller_earned = (fraction_bps * deal.price) / 10_000;
         let additional_seller_owed = seller_earned.saturating_sub(deal.released_to_seller);
 
-        // CRITICAL BUG FIX (settlement.rs:95-96):
-        // Protect against old checkpoints overpaying the buyer beyond remaining escrow funds.
         let effective_seller_taken = std::cmp::max(seller_earned, deal.released_to_seller);
         let buyer_price_refund = deal.price.saturating_sub(effective_seller_taken);
 

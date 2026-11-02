@@ -29,6 +29,7 @@ pub enum DefaultReason {
     ValidationFailed,
     ProviderBan,
     SellerSelfDrain,
+    BuyerBreach,
 }
 
 #[derive(BorshSerialize, BorshDeserialize, Serialize, Deserialize, Clone, Copy, Debug, PartialEq, Eq)]
@@ -82,7 +83,6 @@ pub struct TeeSigner {
 #[serde(crate = "near_sdk::serde")]
 #[borsh(crate = "borsh")]
 pub struct Config {
-    pub chain_id: String,
     pub min_deposit_duration: Duration,
     pub max_deposit_duration: Duration,
     pub min_tee_liveness_timeout: Duration,
@@ -96,7 +96,6 @@ pub struct Config {
 impl Default for Config {
     fn default() -> Self {
         Self {
-            chain_id: "testnet".to_string(),
             min_deposit_duration: 300_000_000_000,          // 5 minutes
             max_deposit_duration: 7 * 86_400_000_000_000,    // 7 days
             min_tee_liveness_timeout: 3_600_000_000_000,     // 1 hour

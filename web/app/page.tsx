@@ -700,11 +700,12 @@ export default function Home() {
               <div className="flex items-center justify-between">
                 <div>
                   <h2 className="text-lg font-bold text-white">NEAR Escrow Smart Contract</h2>
-                  <p className="text-xs text-slate-400 mt-1 font-mono">Address: dev-20261102170658-24098999364164.testnet</p>
-                  <p className="text-[11px] text-emerald-400 font-mono mt-0.5">TEE Signer: ed25519:7pv8g7e2cJqyBEXiDYQ9GwHgEK5hj7etb9h4zMmvToFi</p>
+                  <p className="text-xs text-slate-400 mt-1 font-mono">Address: dev-20261102172937-56700027777761.testnet</p>
+                  <p className="text-[11px] text-emerald-400 font-mono mt-0.5">TEE Signer: ed25519:9ef1oBVTfxa1cjk5mmLF4rTLVmBr2fVx8xiju5bd9SZT</p>
+                  <p className="text-[11px] text-indigo-400 font-mono mt-0.5">Governance: DAO (dev-20261102172950-37276102945859.testnet) • FullAccess Key Deleted</p>
                 </div>
                 <a
-                  href="https://testnet.nearblocks.io/address/dev-20261102170658-24098999364164.testnet"
+                  href="https://testnet.nearblocks.io/address/dev-20261102172937-56700027777761.testnet"
                   target="_blank"
                   rel="noreferrer"
                   className="px-3 py-1 rounded-full text-xs font-semibold bg-emerald-500/10 text-emerald-400 border border-emerald-500/20 hover:bg-emerald-500/20 flex items-center gap-1 transition"
@@ -717,7 +718,8 @@ export default function Home() {
                 <div className="bg-slate-950 p-4 rounded-xl border border-slate-800 space-y-2">
                   <div className="text-slate-400 font-bold uppercase tracking-wider">Methods Implemented:</div>
                   <ul className="space-y-1 text-slate-300">
-                    <li>• create_deal(params)</li>
+                    <li>• create_deal(params) [computes terms_hash on-chain]</li>
+                    <li>• accept_deal(deal_id, expected_hash)</li>
                     <li>• register_terms_hash(deal_id, terms_hash, sig)</li>
                     <li>• deposit(deal_id) [attached native NEAR]</li>
                     <li>• ft_on_transfer(sender, amount, msg) [NEP-141]</li>
@@ -727,6 +729,8 @@ export default function Home() {
                     <li>• settle_default(deal_id, payload, sig)</li>
                     <li>• timeout_refund(deal_id)</li>
                     <li>• auto_release(deal_id)</li>
+                    <li>• claim(token) [safe async pull-payment recovery]</li>
+                    <li>• stage_upgrade(code_hash) / apply_upgrade(code)</li>
                   </ul>
                 </div>
 

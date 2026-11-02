@@ -1,5 +1,5 @@
-use crate::types::{Deal, PayloadKind, SignedPayload};
-use near_sdk::{env, near, AccountId, CurveType, PublicKey};
+use crate::types::{Balance, Deal, PayloadKind, SignedPayload};
+use near_sdk::{env, near, AccountId, CurveType, Duration, PublicKey};
 
 #[near]
 pub struct CryptoHelper;
@@ -17,6 +17,48 @@ impl CryptoHelper {
         let mut raw = [0u8; 32];
         raw.copy_from_slice(&pk_bytes[1..33]);
         raw
+    }
+
+    /// Computes canonical terms_hash on-chain from the agreed deal parameters.
+    pub fn compute_terms_hash(
+        deal_id: u64,
+        buyer: &AccountId,
+        seller: &AccountId,
+        token: &Option<AccountId>,
+        price: Balance,
+        credit_amount: Balance,
+        buyer_collateral: Balance,
+        seller_collateral: Balance,
+        tee_pubkey: &PublicKey,
+        deposit_duration: Duration,
+        key_duration: Duration,
+        tee_liveness_timeout: Duration,
+        slash_bps_provider_ban: u16,
+        slash_bps_revoke: u16,
+    ) -> [u8; 32] {
+        let mut data = Vec::new();
+        data.extend_from_slice(b"conpi:v1:terms_hash:");
+        data.extend_from_slice(&deal_id.to_le_bytes());
+        data.extend_from_slice(buyer.as_bytes());
+        data.extend_from_slice(b":");
+        data.extend_from_slice(seller.as_bytes());
+        data.extend_from_slice(b":");
+        if let Some(tok) = token {
+            data.extend_from_slice(tok.as_bytes());
+        } else {
+            data.extend_from_slice(b"native_near");
+        }
+        data.extend_from_slice(&price.to_le_bytes());
+        data.extend_from_slice(&credit_amount.to_le_bytes());
+        data.extend_from_slice(&buyer_collateral.to_le_bytes());
+        data.extend_from_slice(&seller_collateral.to_le_bytes());
+        data.extend_from_slice(tee_pubkey.as_bytes());
+        data.extend_from_slice(&deposit_duration.to_le_bytes());
+        data.extend_from_slice(&key_duration.to_le_bytes());
+        data.extend_from_slice(&tee_liveness_timeout.to_le_bytes());
+        data.extend_from_slice(&slash_bps_provider_ban.to_le_bytes());
+        data.extend_from_slice(&slash_bps_revoke.to_le_bytes());
+        env::sha256_array(&data)
     }
 
     /// Serializes a SignedPayload canonically into Borsh bytes.
@@ -82,6 +124,15 @@ impl CryptoHelper {
             "Nonce must be strictly greater than last_nonce ({} vs {})",
             payload.nonce,
             deal.last_nonce
+        );
+
+        // Block timestamp verification: issued_at must not be in the future (> 5 min tolerance)
+        let now = env::block_timestamp();
+        assert!(
+            payload.issued_at <= now + 300_000_000_000,
+            "issued_at cannot be in the future (issued_at: {}, block_timestamp: {})",
+            payload.issued_at,
+            now
         );
 
         // Metered value must never decrease

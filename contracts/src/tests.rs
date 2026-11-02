@@ -57,9 +57,10 @@ mod tests {
         let context = get_context(owner.clone(), NearToken::from_yoctonear(0));
         testing_env!(context.build());
 
-        let mut contract = ConpiEscrow::new(owner.clone(), None);
+        let mut contract = ConpiEscrow::new(owner.clone(), None, None);
         assert_eq!(contract.owner, owner);
         assert!(!contract.is_paused());
+        assert_eq!(contract.get_chain_id(), "testnet");
 
         // Pause contract
         contract.set_paused(true);
@@ -91,7 +92,7 @@ mod tests {
         let mut context = get_context(owner.clone(), NearToken::from_yoctonear(0));
         testing_env!(context.build());
 
-        let mut contract = ConpiEscrow::new(owner.clone(), None);
+        let mut contract = ConpiEscrow::new(owner.clone(), None, None);
         let (tee_sk, tee_pk) = generate_tee_keypair();
         contract.add_tee_signer(tee_pk.clone(), "tee_quote_mrtd".to_string());
 
@@ -120,8 +121,17 @@ mod tests {
             slash_bps_revoke: 8000,
         });
 
-        // Register Terms Hash
-        let terms_hash = [42u8; 32];
+        let deal = contract.get_deal(deal_id).unwrap();
+        let terms_hash = deal.terms_hash.unwrap();
+
+        // Seller accepts deal terms
+        testing_env!(context
+            .predecessor_account_id(seller.clone())
+            .attached_deposit(NearToken::from_yoctonear(0))
+            .build());
+        contract.accept_deal(deal_id, terms_hash);
+
+        // Optional TEE registration
         let terms_sig = sign_terms_hash(&tee_sk, "testnet", &contract_id, deal_id, &terms_hash);
         contract.register_terms_hash(deal_id, terms_hash, terms_sig);
 
@@ -132,7 +142,7 @@ mod tests {
             .build());
         contract.deposit(deal_id);
 
-        // Seller deposits (signals agreement and moves deal to Funded)
+        // Seller deposits (moves deal to Funded)
         testing_env!(context
             .predecessor_account_id(seller.clone())
             .attached_deposit(NearToken::from_yoctonear(seller_collateral))
@@ -203,7 +213,7 @@ mod tests {
         let mut context = get_context(owner.clone(), NearToken::from_yoctonear(0));
         testing_env!(context.build());
 
-        let mut contract = ConpiEscrow::new(owner.clone(), None);
+        let mut contract = ConpiEscrow::new(owner.clone(), None, None);
         let (tee_sk, tee_pk) = generate_tee_keypair();
         contract.add_tee_signer(tee_pk.clone(), "tee_quote_mrtd".to_string());
 
@@ -232,9 +242,15 @@ mod tests {
             slash_bps_revoke: 8000,
         });
 
-        let terms_hash = [99u8; 32];
-        let terms_sig = sign_terms_hash(&tee_sk, "testnet", &contract_id, deal_id, &terms_hash);
-        contract.register_terms_hash(deal_id, terms_hash, terms_sig);
+        let deal = contract.get_deal(deal_id).unwrap();
+        let terms_hash = deal.terms_hash.unwrap();
+
+        // Seller accepts deal
+        testing_env!(context
+            .predecessor_account_id(seller.clone())
+            .attached_deposit(NearToken::from_yoctonear(0))
+            .build());
+        contract.accept_deal(deal_id, terms_hash);
 
         // Buyer deposits
         testing_env!(context
@@ -322,10 +338,6 @@ mod tests {
         assert_eq!(seller_total_received + buyer_total_received, 78_000_000); // $78.00 total conserved
     }
 
-    /// CRITICAL INVARIANT TEST 1:
-    /// Default after 50% stage has already been released ($30 released from $60 price).
-    /// Metered value at default is 40% ($24 earned).
-    /// Tests that the contract DOES NOT over-payout ($84 bug) and exactly conserves the remaining $48 escrow!
     #[test]
     fn test_critical_no_overpayout_default_after_stage_50() {
         let owner: AccountId = "owner.testnet".parse().unwrap();
@@ -336,7 +348,7 @@ mod tests {
         let mut context = get_context(owner.clone(), NearToken::from_yoctonear(0));
         testing_env!(context.build());
 
-        let mut contract = ConpiEscrow::new(owner.clone(), None);
+        let mut contract = ConpiEscrow::new(owner.clone(), None, None);
         let (tee_sk, tee_pk) = generate_tee_keypair();
         contract.add_tee_signer(tee_pk.clone(), "tee_quote_mrtd".to_string());
 
@@ -365,9 +377,15 @@ mod tests {
             slash_bps_revoke: 8000,
         });
 
-        let terms_hash = [33u8; 32];
-        let terms_sig = sign_terms_hash(&tee_sk, "testnet", &contract_id, deal_id, &terms_hash);
-        contract.register_terms_hash(deal_id, terms_hash, terms_sig);
+        let deal = contract.get_deal(deal_id).unwrap();
+        let terms_hash = deal.terms_hash.unwrap();
+
+        // Seller accepts deal
+        testing_env!(context
+            .predecessor_account_id(seller.clone())
+            .attached_deposit(NearToken::from_yoctonear(0))
+            .build());
+        contract.accept_deal(deal_id, terms_hash);
 
         // Buyer & Seller Deposit
         testing_env!(context
@@ -436,7 +454,6 @@ mod tests {
         assert_eq!(deal.released_to_seller, 30_000_000); // $30 released
 
         // Now seller key dies at 40% metered usage ($32 metered of $80 = 40% = $24 earned)
-        // Seller was already paid $30, which is > $24 earned!
         let default_payload = SignedPayload {
             domain: "conpi:v1".to_string(),
             contract_id: contract_id.clone(),
@@ -445,7 +462,7 @@ mod tests {
             terms_hash,
             kind: PayloadKind::Default,
             stage: 50,
-            metered_value: U128(40_000_000), // cannot decrease below last signed (40M)
+            metered_value: U128(40_000_000),
             reason: Some(DefaultReason::InvalidKey),
             nonce: 4,
             issued_at: 4000,
@@ -456,28 +473,21 @@ mod tests {
         let final_deal = contract.get_deal(deal_id).unwrap();
         assert_eq!(final_deal.status, DealStatus::Defaulted);
 
-        // Invariant check on calculator:
         let dist = crate::settlement::SettlementCalculator::calculate_default_settlement(
             &deal,
             40_000_000,
             DefaultReason::InvalidKey,
         );
 
-        // Total remaining in escrow before default was: ($60 - $30) + $6 + $12 = $48.00!
         let remaining_escrow = 48_000_000u128;
         assert_eq!(
             dist.seller_payout + dist.buyer_refund,
             remaining_escrow,
             "Total settlement MUST equal exactly remaining escrow of $48.00"
         );
-        // Total across deal: $30 released + $48 settlement = $78.00 exactly!
         assert_eq!(30_000_000 + dist.seller_payout + dist.buyer_refund, 78_000_000);
     }
 
-    /// CRITICAL INVARIANT TEST 2:
-    /// Timeout settlement with an old checkpoint ($30 already released at stage 50%,
-    /// but checkpoint was recorded at 20% metered = $12).
-    /// Tests that the contract DOES NOT over-payout ($108 bug) and exactly conserves the remaining $48 escrow!
     #[test]
     fn test_critical_no_overpayout_timeout_with_old_checkpoint() {
         let price = 60_000_000u128;
@@ -505,7 +515,7 @@ mod tests {
             slash_bps_revoke: 8000,
             buyer_deposited: price + buyer_collateral,
             seller_deposited: seller_collateral,
-            released_to_seller: 30_000_000, // $30 already released
+            released_to_seller: 30_000_000,
             stage_reached: 50,
             last_signed: None,
             last_nonce: 5,
@@ -514,35 +524,28 @@ mod tests {
             counterparty_accepted: true,
         };
 
-        // Old checkpoint at $16 metered (20% of credit = $12 value)
         let checkpoint_metered = 16_000_000u128;
         let dist = crate::settlement::SettlementCalculator::calculate_timeout_settlement(
             &deal,
             checkpoint_metered,
         );
 
-        // Remaining escrow is ($60 - $30) + $6 + $12 = $48.00!
         let remaining_escrow = 48_000_000u128;
         assert_eq!(dist.seller_payout + dist.buyer_refund, remaining_escrow);
-        // Total funds conserved: $30 + $48 = $78.00!
         assert_eq!(30_000_000 + dist.seller_payout + dist.buyer_refund, 78_000_000);
     }
 
-    /// CRITICAL ISSUE 2 TEST:
-    /// Funded deal where seller fails to submit key before key_deadline.
-    /// Tests that timeout_refund cancels deal and refunds both parties without TEE signature.
     #[test]
     fn test_critical_funded_deal_key_deadline_timeout_refund() {
         let owner: AccountId = "owner.testnet".parse().unwrap();
         let buyer: AccountId = "buyer.testnet".parse().unwrap();
         let seller: AccountId = "seller.testnet".parse().unwrap();
-        let contract_id: AccountId = "conpi.testnet".parse().unwrap();
 
         let mut context = get_context(owner.clone(), NearToken::from_yoctonear(0));
         testing_env!(context.build());
 
-        let mut contract = ConpiEscrow::new(owner.clone(), None);
-        let (tee_sk, tee_pk) = generate_tee_keypair();
+        let mut contract = ConpiEscrow::new(owner.clone(), None, None);
+        let (_tee_sk, tee_pk) = generate_tee_keypair();
         contract.add_tee_signer(tee_pk.clone(), "tee_quote_mrtd".to_string());
 
         testing_env!(context
@@ -565,9 +568,15 @@ mod tests {
             slash_bps_revoke: 8000,
         });
 
-        let terms_hash = [10u8; 32];
-        let terms_sig = sign_terms_hash(&tee_sk, "testnet", &contract_id, deal_id, &terms_hash);
-        contract.register_terms_hash(deal_id, terms_hash, terms_sig);
+        let deal = contract.get_deal(deal_id).unwrap();
+        let terms_hash = deal.terms_hash.unwrap();
+
+        // Seller accepts deal
+        testing_env!(context
+            .predecessor_account_id(seller.clone())
+            .attached_deposit(NearToken::from_yoctonear(0))
+            .build());
+        contract.accept_deal(deal_id, terms_hash);
 
         // Buyer & Seller deposit -> Status = Funded
         testing_env!(context
@@ -584,21 +593,18 @@ mod tests {
         let deal = contract.get_deal(deal_id).unwrap();
         assert_eq!(deal.status, DealStatus::Funded);
 
-        // Seller vanishes! Time passes beyond key_deadline (2000s = 2_000_000_000_000 ns)
+        // Seller vanishes! Time passes beyond key_deadline
         testing_env!(context
             .block_timestamp(deal.key_deadline + 1_000_000)
             .attached_deposit(NearToken::from_yoctonear(0))
             .build());
 
-        // Anyone calls timeout_refund
         contract.timeout_refund(deal_id);
 
         let final_deal = contract.get_deal(deal_id).unwrap();
         assert_eq!(final_deal.status, DealStatus::Cancelled);
     }
 
-    /// HIGH ISSUE 8 TEST:
-    /// Revoking TEE signer MUST reject any further operations for all live deals.
     #[test]
     fn test_high_tee_signer_revocation_protects_live_deals() {
         let owner: AccountId = "owner.testnet".parse().unwrap();
@@ -609,7 +615,7 @@ mod tests {
         let mut context = get_context(owner.clone(), NearToken::from_yoctonear(0));
         testing_env!(context.build());
 
-        let mut contract = ConpiEscrow::new(owner.clone(), None);
+        let mut contract = ConpiEscrow::new(owner.clone(), None, None);
         let (tee_sk, tee_pk) = generate_tee_keypair();
         contract.add_tee_signer(tee_pk.clone(), "tee_quote_mrtd".to_string());
 
@@ -633,9 +639,15 @@ mod tests {
             slash_bps_revoke: 8000,
         });
 
-        let terms_hash = [11u8; 32];
-        let terms_sig = sign_terms_hash(&tee_sk, "testnet", &contract_id, deal_id, &terms_hash);
-        contract.register_terms_hash(deal_id, terms_hash, terms_sig);
+        let deal = contract.get_deal(deal_id).unwrap();
+        let terms_hash = deal.terms_hash.unwrap();
+
+        // Seller accepts deal
+        testing_env!(context
+            .predecessor_account_id(seller.clone())
+            .attached_deposit(NearToken::from_yoctonear(0))
+            .build());
+        contract.accept_deal(deal_id, terms_hash);
 
         // Deposits & Activate
         testing_env!(context
@@ -665,14 +677,14 @@ mod tests {
         let act_sig = sign_payload(&tee_sk, &act_payload);
         contract.activate(deal_id, act_payload, act_sig);
 
-        // Now owner detects TEE compromise and revokes the TEE signer key!
+        // Revoke TEE signer key
         testing_env!(context
             .predecessor_account_id(owner.clone())
             .attached_deposit(NearToken::from_yoctonear(0))
             .build());
         contract.revoke_tee_signer(tee_pk.clone());
 
-        // Now an attacker/compromised TEE tries to emit release_stage on the active deal
+        // Compromised TEE tries to emit release_stage
         let stage_payload = SignedPayload {
             domain: "conpi:v1".to_string(),
             contract_id: contract_id.clone(),
@@ -704,13 +716,12 @@ mod tests {
         let buyer: AccountId = "buyer.testnet".parse().unwrap();
         let seller: AccountId = "seller.testnet".parse().unwrap();
         let usdc_token: AccountId = "usdc.testnet".parse().unwrap();
-        let contract_id: AccountId = "conpi.testnet".parse().unwrap();
 
         let mut context = get_context(owner.clone(), NearToken::from_yoctonear(0));
         testing_env!(context.build());
 
-        let mut contract = ConpiEscrow::new(owner.clone(), None);
-        let (tee_sk, tee_pk) = generate_tee_keypair();
+        let mut contract = ConpiEscrow::new(owner.clone(), None, None);
+        let (_tee_sk, tee_pk) = generate_tee_keypair();
         contract.add_tee_signer(tee_pk.clone(), "tee_quote_mrtd".to_string());
 
         let price = 50_000_000u128; // 50 USDC (6 decimals)
@@ -738,9 +749,15 @@ mod tests {
             slash_bps_revoke: 8000,
         });
 
-        let terms_hash = [7u8; 32];
-        let terms_sig = sign_terms_hash(&tee_sk, "testnet", &contract_id, deal_id, &terms_hash);
-        contract.register_terms_hash(deal_id, terms_hash, terms_sig);
+        let deal = contract.get_deal(deal_id).unwrap();
+        let terms_hash = deal.terms_hash.unwrap();
+
+        // Seller accepts deal
+        testing_env!(context
+            .predecessor_account_id(seller.clone())
+            .attached_deposit(NearToken::from_yoctonear(0))
+            .build());
+        contract.accept_deal(deal_id, terms_hash);
 
         // Buyer transfers NEP-141 token with 5 USDC excess using JSON message format
         let excess_sent = 5_000_000u128;
@@ -773,5 +790,276 @@ mod tests {
 
         let deal = contract.get_deal(deal_id).unwrap();
         assert_eq!(deal.status, DealStatus::Funded);
+    }
+
+    #[test]
+    fn test_failed_transfer_credits_pending_payout_and_claim_pull() {
+        let owner: AccountId = "owner.testnet".parse().unwrap();
+        let seller: AccountId = "seller.testnet".parse().unwrap();
+        let usdc_token: AccountId = "usdc.testnet".parse().unwrap();
+
+        let mut context = get_context(owner.clone(), NearToken::from_yoctonear(0));
+        testing_env!(context.build());
+
+        let mut contract = ConpiEscrow::new(owner.clone(), None, None);
+
+        // Initially no pending payouts
+        assert_eq!(contract.get_pending_payout(seller.clone(), Some(usdc_token.clone())).0, 0);
+
+        // Simulate failed ft_transfer callback
+        testing_env!(context
+            .predecessor_account_id("conpi.testnet".parse().unwrap())
+            .attached_deposit(NearToken::from_yoctonear(0))
+            .build());
+        // Since near_sdk::is_promise_success() in unit test environment returns false:
+        let res = contract.on_transfer_resolved(seller.clone(), U128(10_000_000), Some(usdc_token.clone()));
+        assert!(!res);
+
+        // Funds are credited to pending_payouts
+        let pending = contract.get_pending_payout(seller.clone(), Some(usdc_token.clone()));
+        assert_eq!(pending.0, 10_000_000);
+
+        // Seller claims the pending payout
+        testing_env!(context
+            .predecessor_account_id(seller.clone())
+            .attached_deposit(NearToken::from_yoctonear(0))
+            .build());
+        let claim_res = contract.claim(Some(usdc_token.clone()));
+        match claim_res {
+            near_sdk::PromiseOrValue::Promise(_) => {}
+            _ => panic!("Expected Promise returned for cross-contract claim"),
+        }
+
+        // Pending payout is cleared from state
+        assert_eq!(contract.get_pending_payout(seller.clone(), Some(usdc_token.clone())).0, 0);
+    }
+
+    #[test]
+    fn test_pause_allows_claim_and_timeout_refund() {
+        let owner: AccountId = "owner.testnet".parse().unwrap();
+        let buyer: AccountId = "buyer.testnet".parse().unwrap();
+        let seller: AccountId = "seller.testnet".parse().unwrap();
+
+        let mut context = get_context(owner.clone(), NearToken::from_yoctonear(0));
+        testing_env!(context.build());
+
+        let mut contract = ConpiEscrow::new(owner.clone(), None, None);
+        let (_tee_sk, tee_pk) = generate_tee_keypair();
+        contract.add_tee_signer(tee_pk.clone(), "tee_quote_mrtd".to_string());
+
+        // Create a deal before pause
+        testing_env!(context
+            .predecessor_account_id(buyer.clone())
+            .attached_deposit(STORAGE_DEPOSIT)
+            .build());
+        let deal_id = contract.create_deal(CreateDealParams {
+            buyer: buyer.clone(),
+            seller: seller.clone(),
+            token: None,
+            price: U128(100),
+            credit_amount: U128(100),
+            buyer_collateral: U128(10),
+            seller_collateral: U128(20),
+            tee_pubkey: tee_pk.clone(),
+            deposit_duration_sec: 86400,
+            key_duration_sec: 86400,
+            tee_liveness_timeout_sec: 3600,
+            slash_bps_provider_ban: 5000,
+            slash_bps_revoke: 8000,
+        });
+
+        // Pause contract
+        testing_env!(context
+            .predecessor_account_id(owner.clone())
+            .attached_deposit(NearToken::from_yoctonear(0))
+            .build());
+        contract.set_paused(true);
+        assert!(contract.is_paused());
+
+        // New deal creation is blocked
+        testing_env!(context
+            .predecessor_account_id(buyer.clone())
+            .attached_deposit(STORAGE_DEPOSIT)
+            .build());
+        let res = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            contract.create_deal(CreateDealParams {
+                buyer: buyer.clone(),
+                seller: seller.clone(),
+                token: None,
+                price: U128(100),
+                credit_amount: U128(100),
+                buyer_collateral: U128(10),
+                seller_collateral: U128(20),
+                tee_pubkey: tee_pk.clone(),
+                deposit_duration_sec: 86400,
+                key_duration_sec: 86400,
+                tee_liveness_timeout_sec: 3600,
+                slash_bps_provider_ban: 5000,
+                slash_bps_revoke: 8000,
+            });
+        }));
+        assert!(res.is_err(), "create_deal must be blocked while paused");
+
+        // BUT timeout_refund is NOT blocked by pause!
+        let deal = contract.get_deal(deal_id).unwrap();
+        testing_env!(context
+            .block_timestamp(deal.deposit_deadline + 1000)
+            .build());
+        contract.timeout_refund(deal_id);
+        let cancelled = contract.get_deal(deal_id).unwrap();
+        assert_eq!(cancelled.status, DealStatus::Cancelled);
+    }
+
+    #[test]
+    fn test_terms_hash_rejection_on_mismatch() {
+        let owner: AccountId = "owner.testnet".parse().unwrap();
+        let buyer: AccountId = "buyer.testnet".parse().unwrap();
+        let seller: AccountId = "seller.testnet".parse().unwrap();
+
+        let mut context = get_context(owner.clone(), NearToken::from_yoctonear(0));
+        testing_env!(context.build());
+
+        let mut contract = ConpiEscrow::new(owner.clone(), None, None);
+        let (_tee_sk, tee_pk) = generate_tee_keypair();
+        contract.add_tee_signer(tee_pk.clone(), "tee_quote_mrtd".to_string());
+
+        testing_env!(context
+            .predecessor_account_id(buyer.clone())
+            .attached_deposit(STORAGE_DEPOSIT)
+            .build());
+        let deal_id = contract.create_deal(CreateDealParams {
+            buyer: buyer.clone(),
+            seller: seller.clone(),
+            token: None,
+            price: U128(100),
+            credit_amount: U128(100),
+            buyer_collateral: U128(10),
+            seller_collateral: U128(20),
+            tee_pubkey: tee_pk.clone(),
+            deposit_duration_sec: 86400,
+            key_duration_sec: 86400,
+            tee_liveness_timeout_sec: 3600,
+            slash_bps_provider_ban: 5000,
+            slash_bps_revoke: 8000,
+        });
+
+        // Counterparty calls accept_deal with wrong expected hash
+        let bad_hash = [0xEE; 32];
+        testing_env!(context
+            .predecessor_account_id(seller.clone())
+            .attached_deposit(NearToken::from_yoctonear(0))
+            .build());
+        let res = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            contract.accept_deal(deal_id, bad_hash);
+        }));
+        assert!(res.is_err(), "Wrong terms_hash must be rejected");
+    }
+
+    #[test]
+    fn test_buyer_collateral_slashed_on_buyer_breach() {
+        let price = 60_000_000u128;
+        let credit_amount = 80_000_000u128;
+        let buyer_collateral = 10_000_000u128; // $10 buyer collateral
+        let seller_collateral = 12_000_000u128;
+
+        let deal = crate::types::Deal {
+            id: 1,
+            buyer: "buyer.testnet".parse().unwrap(),
+            seller: "seller.testnet".parse().unwrap(),
+            token: None,
+            price,
+            credit_amount,
+            buyer_collateral,
+            seller_collateral,
+            terms_hash: Some([1u8; 32]),
+            tee_pubkey: "ed25519:6E8jqdGwGMtVEUNGRtF3rMKDStVn1oK76dYqJ2mB9n9N".parse().unwrap(),
+            deposit_deadline: 0,
+            key_deadline: 0,
+            usage_deadline: 0,
+            notice_deadline: None,
+            tee_liveness_timeout: 3600,
+            slash_bps_provider_ban: 5000,
+            slash_bps_revoke: 8000, // 80% slashing rate
+            buyer_deposited: price + buyer_collateral,
+            seller_deposited: seller_collateral,
+            released_to_seller: 0,
+            stage_reached: 0,
+            last_signed: None,
+            last_nonce: 1,
+            last_tee_seen: 1000,
+            status: DealStatus::Active,
+            counterparty_accepted: true,
+        };
+
+        // When buyer breaches (BuyerBreach) at 0 metered value:
+        let dist = crate::settlement::SettlementCalculator::calculate_default_settlement(
+            &deal,
+            0,
+            DefaultReason::BuyerBreach,
+        );
+
+        // Buyer collateral ($10) slashed at 80% = $8 slashed to seller
+        assert_eq!(dist.slashed_collateral, 8_000_000);
+        // Seller gets their full collateral ($12) + slashed buyer collateral ($8) = $20
+        assert_eq!(dist.seller_payout, 20_000_000);
+        // Buyer gets price refunded ($60) + unslashed collateral ($2) = $62
+        assert_eq!(dist.buyer_refund, 62_000_000);
+
+        // Total funds conserved: $20 + $62 = $82 ($60 price + $10 buyer col + $12 seller col)
+        assert_eq!(dist.seller_payout + dist.buyer_refund, 82_000_000);
+    }
+
+    #[test]
+    fn test_timelocked_upgrade() {
+        let owner: AccountId = "owner.testnet".parse().unwrap();
+        let mut context = get_context(owner.clone(), NearToken::from_yoctonear(0));
+        testing_env!(context.build());
+
+        let mut contract = ConpiEscrow::new(owner.clone(), None, None);
+        let mock_code = b"new_wasm_binary_bytes".to_vec();
+        let code_hash = near_sdk::env::sha256_array(&mock_code);
+
+        // Stage upgrade
+        contract.stage_upgrade(code_hash);
+        assert!(contract.get_staged_upgrade().is_some());
+
+        // Immediate apply must fail due to 48-hour timelock
+        let fail_res = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _ = contract.apply_upgrade(mock_code.clone());
+        }));
+        assert!(fail_res.is_err(), "Upgrade before timelock elapses must fail");
+
+        // Advance time past timelock (48 hours = 172,800s)
+        testing_env!(context
+            .block_timestamp(1_000_000_000_000 + 172_800_000_000_001)
+            .build());
+
+        let _prom = contract.apply_upgrade(mock_code);
+        assert!(contract.get_staged_upgrade().is_none(), "Staged upgrade cleared on apply");
+    }
+
+    #[test]
+    fn test_update_config_bounds() {
+        let owner: AccountId = "owner.testnet".parse().unwrap();
+        let context = get_context(owner.clone(), NearToken::from_yoctonear(0));
+        testing_env!(context.build());
+
+        let mut contract = ConpiEscrow::new(owner.clone(), None, None);
+
+        // Attempt to set storage deposit fee to 0 (bypassing anti-spam)
+        let mut bad_config = contract.get_config();
+        bad_config.storage_deposit_fee = 0;
+        let res = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            contract.update_config(bad_config);
+        }));
+        assert!(res.is_err(), "Zero storage deposit fee must be rejected");
+
+        // Attempt to set min_slash_bps to 0 (bypassing minimum collateral penalty)
+        let mut bad_slash_config = contract.get_config();
+        bad_slash_config.min_slash_bps = 0;
+        let res2 = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            contract.update_config(bad_slash_config);
+        }));
+        assert!(res2.is_err(), "Zero min_slash_bps must be rejected");
     }
 }
