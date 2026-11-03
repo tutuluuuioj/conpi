@@ -15,6 +15,7 @@ export interface AttestationResult {
   reportDataHex: string;
   nonce: string | null;
   rawQuoteHex: string | null;
+  eventLog?: any;
   timestamp: string;
 }
 
@@ -74,13 +75,21 @@ export class AttestationService {
     const reportData = enclaveKeys.getReportData(nonce);
     const reportDataHex = Buffer.from(reportData).toString("hex");
     let rawQuoteHex: string | null = null;
+    let eventLog: any = undefined;
     let inEnclave = false;
 
     if (this.client) {
       try {
-        // Dynamic fresh TDX quote query binding reportData (sha256(ed25519PubKey + x25519PubKey + nonce))
-        const quoteRes = await this.client.getQuote(reportDataHex);
+        // Dynamic fresh TDX quote query binding raw 32-byte reportData (sha256(ed25519PubKey + x25519PubKey + nonce))
+        const quoteRes = await this.client.getQuote(reportData);
         rawQuoteHex = quoteRes.quote;
+        if ((quoteRes as any).event_log) {
+          try {
+            eventLog = JSON.parse((quoteRes as any).event_log);
+          } catch {
+            eventLog = (quoteRes as any).event_log;
+          }
+        }
         inEnclave = true;
       } catch (err) {
         console.warn("[Attestation] Live TDX quote socket request failed:", err);
@@ -105,6 +114,7 @@ export class AttestationService {
       reportDataHex,
       nonce: nonce || null,
       rawQuoteHex,
+      eventLog,
       timestamp: new Date().toISOString(),
     };
   }
