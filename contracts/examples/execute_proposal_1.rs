@@ -135,8 +135,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .transact()
         .await?;
 
-    let req_tx_hash = req_res.receipt_outcomes().first().map(|r| r.transaction_hash.to_string());
-    println!("Step 1 Success! Member 1 Tx Hash: {:?}", req_tx_hash);
+    if req_res.is_failure() {
+        eprintln!("add_request_and_confirm failed: {:?}", req_res.failures());
+        std::process::exit(1);
+    }
+
+    let req_tx_hash = req_res.outcome().transaction_hash;
+    println!("Step 1 Success! Member 1 Tx Hash: {}", req_tx_hash);
 
     let req_id: u32 = req_res.json()?;
     println!("Multisig Request ID: {}", req_id);
@@ -157,8 +162,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         std::process::exit(1);
     }
 
-    let confirm_tx_hash = confirm_res.receipt_outcomes().first().map(|r| r.transaction_hash.to_string());
-    println!("Step 2 Success! Member 2 Tx Hash: {:?}", confirm_tx_hash);
+    let confirm_tx_hash = confirm_res.outcome().transaction_hash;
+    println!("Step 2 Success! Member 2 Tx Hash: {}", confirm_tx_hash);
     println!("Proposal #1 successfully executed on-chain through 2-of-3 Multisig!");
 
     // 5. Verify proposal is no longer staged and new config is live
