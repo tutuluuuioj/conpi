@@ -58,15 +58,15 @@ export function TrustView() {
             </div>
           </div>
           <ol className="mt-4 list-decimal space-y-1 pl-4 text-sm text-muted">
-            <li>Build with <span className="font-mono text-ink">cargo near build non-reproducible-wasm --locked</span>.</li>
-            <li>Compare the wasm hash with the code hash above.</li>
+            <li>Build with <span className="font-mono text-ink">cargo near build reproducible-wasm</span> in Docker via GitHub Actions workflow (<span className="font-mono text-ink">sourcescan/cargo-near:0.22.0-rust-1.99.1</span>).</li>
+            <li>Compare the resulting wasm SHA-256 with the code hash above.</li>
             <li>Confirm the signer key on this page matches the key stored on the contract.</li>
           </ol>
         </Card>
       </div>
       <Card>
         <Overline>Owner</Overline>
-        <p className="mt-2 text-sm">DAO {DAO_ID}. Threshold 2 of 3. Timelock 48 hours.</p>
+        <p className="mt-2 text-sm">DAO {DAO_ID}. Threshold 2 of 3. Timelock 5 minutes.</p>
         <ul className="mt-3 divide-y divide-line text-sm">
           {MEMBERS.map((member) => (
             <li key={member.account} className="flex justify-between py-2"><span className="font-mono">{member.account}</span><span className="text-muted">{member.role}</span></li>

@@ -1,6 +1,6 @@
-export const CONTRACT_ID = "dev-20261103021728-21839689153509.testnet";
+export const CONTRACT_ID = "dev-20261103062448-30583839049419.testnet";
 export const DAO_ID = "dev-20261103021740-59711933581376.testnet";
-export const CODE_HASH = "E5YED19GaPXvpc8kiVn5kCXB21eWMA5SpCBDn7iV7nG";
+export const CODE_HASH = "443254174227e76be673a8036d663cf7fe2bc70f2414773129b3f008423ad21f";
 export const TEE_SIGNER = "ed25519:Hq4DqffDiM6pHXzwRXzLrjbPGUKkM2WMkpTZB13dZh8G";
 export const MRTD =
   "c7b60e6e7655074d2e772e737c385b08fb8e15d8628bb9fb3d0ff08b98263ef26e5a40733568c07f45778a4f91ef2c01";
@@ -14,11 +14,13 @@ export const CONFIG = {
   slashRevokeBps: 8000,
   slashProviderBanBps: 5000,
   slashBuyerBreachBps: 5000,
+  minSlashBps: 2000, // 20% updated on-chain via Proposal #1
   buyerCollateralPct: 10,
   teeLivenessSec: 3600,
   usageDays: 30,
   noticeHours: 24,
-  timelockHours: 48,
+  timelockMinutes: 5,
+  timelockSeconds: 300,
   minDeposit: "5 minutes",
   maxDeposit: "7 days",
   storageDeposit: "0.05 NEAR",
@@ -44,6 +46,16 @@ export function explorerTx(tx: string) {
 }
 
 export const TX = {
+  initEscrow: "BhCPrQnQo1Prmcgo3LnndU6mmShqwaZysGtQ6c9Fba1P",
+  deleteDeployerKey: "6yo7o4q3PJ9455GKtrbxdsrszxDkLfY82enKYZ2yoFAm",
+  proposeConfig: "4bMHezeD4YfYFLLJPaeVELzrKBxNsoB7NPKCowj3EEWR",
+  confirmStageProposal: "CxCgD8n1i4EJk8bhMx3CL78ZBxPcMApM5am3khHPyicc",
+  proposeExecution: "CSjjr9fGEDZtC6h9n52zQ5TrzVZYdYhEYBo6Sf6i7Fwy",
+  confirmExecuteProposal: "F1LZouvrjdfvcwq6EvgLoxWL4qND6EZit1DNN6D53SbK",
+  cancelProposal2_Member1: "5Dx6V9VHQvzJps1mypSeGx5gdGKX6QAmKAwAZsLsut2g",
+  cancelProposal2_Member2: "H2x7HJhkuuStvvz7ix12xj4ebTDBrGfc5yzuFLRp23ho",
+  cancelProposal3_Member1: "AvjEV2J4baMjsJs38TiZBmhBwnNN3bG6Yj693nYCHFxC",
+  cancelProposal3_Member2: "G2wqbPEPHX3EzwEKyuhANi7uUevRXHoiWA7gtuLZkPH1",
   create: "8sKp2mQn7vLx4RcTdYh1aWbUe3Nf6GjH9ZkC5DpA2qR",
   terms: "3fH8aLk2pQv9sNwE6rTbYc4uXd1Zm7GjA5kP8hCqR2e",
   accept: "6dR1nQw8eYt4uHbK2cLp9sVmA3xZ7fGj5NkC1pDqW8a",

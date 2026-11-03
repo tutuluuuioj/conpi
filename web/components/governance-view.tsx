@@ -7,22 +7,24 @@ import { Badge, Button, Card, Countdown, Overline } from "./ui";
 
 export function GovernanceView() {
   const app = useApp();
-  const [open, setOpen] = useState<string | null>("p-14");
+  const [open, setOpen] = useState<string | null>("prop-4");
   const member = app.account === "buyer.near";
   return (
     <div className="space-y-6">
       <div>
         <h1 className="text-2xl font-semibold tracking-tight md:text-[32px] md:leading-10">Governance</h1>
-        <p className="mt-2 text-sm text-muted">Owner {DAO_ID}. Threshold 2 of 3. Every admin action waits 48 hours.</p>
+        <p className="mt-2 text-sm text-muted">Owner {DAO_ID}. Threshold 2 of 3. Every admin action waits 5 minutes.</p>
       </div>
       <div className="grid gap-4 md:grid-cols-3">
         <Card><Overline>Paused</Overline><p className="mt-2 text-lg font-semibold">{app.paused ? "Yes" : "No"}</p></Card>
-        <Card><Overline>Slash on revoke</Overline><p className="mt-2 text-lg font-semibold tabular">{CONFIG.slashRevokeBps / 100}%</p></Card>
-        <Card><Overline>Usage window</Overline><p className="mt-2 text-lg font-semibold">{CONFIG.usageDays} days</p></Card>
+        <Card><Overline>Min slash bps</Overline><p className="mt-2 text-lg font-semibold tabular">{CONFIG.minSlashBps / 100}%</p></Card>
+        <Card><Overline>Timelock delay</Overline><p className="mt-2 text-lg font-semibold tabular">{CONFIG.timelockMinutes} minutes</p></Card>
       </div>
       <Card>
         <h2 className="text-lg font-semibold">Config</h2>
         <dl className="mt-3 grid gap-x-10 text-sm sm:grid-cols-2">
+          <div className="flex justify-between gap-4 border-b border-line py-2"><dt className="text-muted">Min slash rate</dt><dd className="tabular">{CONFIG.minSlashBps / 100}%</dd></div>
+          <div className="flex justify-between gap-4 border-b border-line py-2"><dt className="text-muted">Slash on revoke</dt><dd className="tabular">{CONFIG.slashRevokeBps / 100}%</dd></div>
           <div className="flex justify-between gap-4 border-b border-line py-2"><dt className="text-muted">Provider-ban slash</dt><dd className="tabular">{CONFIG.slashProviderBanBps / 100}%</dd></div>
           <div className="flex justify-between gap-4 border-b border-line py-2"><dt className="text-muted">Buyer-breach slash</dt><dd className="tabular">{CONFIG.slashBuyerBreachBps / 100}%</dd></div>
           <div className="flex justify-between gap-4 border-b border-line py-2"><dt className="text-muted">TEE liveness</dt><dd className="tabular">{CONFIG.teeLivenessSec / 3600} hour</dd></div>
