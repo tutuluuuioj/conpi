@@ -2,6 +2,7 @@
 name = "conpi-escrow"
 version = "0.1.0"
 edition = "2021"
+repository = "https://github.com/tutuluuuioj/conpi"
 
 [lib]
 crate-type = ["cdylib", "rlib"]
@@ -31,5 +32,6 @@ overflow-checks = true
 
 [package.metadata.near.reproducible_build]
 image = "sourcescan/cargo-near:0.13.4-rust-1.99.1"
+image_digest = "sha256:d894086adbe79ecff61b8495b281f6ebad6bc7285a21808602b13c23101b0b5e"
 container_build_command = ["cargo", "near", "build", "non-reproducible-wasm", "--locked"]
 
