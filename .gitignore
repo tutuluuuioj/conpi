@@ -27,6 +27,8 @@ yarn-error.log*
 *key*.json
 *keys*.json
 credentials/
+.credentials/
 tee/credentials/
 **/credentials/
+**/.credentials/
 *.sock

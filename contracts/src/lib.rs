@@ -1310,3 +1310,17 @@ impl ConpiEscrow {
         );
     }
 }
+
+/* -------------------------------------------------------------------------
+   STATE MIGRATION & SCHEMA EVOLUTION ARCHITECTURE PLAN
+   -------------------------------------------------------------------------
+   `ConpiEscrowV1` represents the frozen storage schema layout of the initial
+   production release (state_version = 1).
+   
+   Evolution Plan:
+   1. `ConpiEscrowV1` remains permanently frozen to deterministically deserialize
+      historical on-chain v1 storage snapshots.
+   2. When future storage layout changes occur, `ConpiEscrowV2` will be added,
+      and `VersionedEscrowOldState` will wrap legacy versions (V1(ConpiEscrowV1), V2(ConpiEscrowV2)).
+   3. `migrate()` will inspect `state_version` to perform safe, sequential migrations.
+   ------------------------------------------------------------------------- */
