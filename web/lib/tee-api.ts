@@ -2,7 +2,7 @@ import { CONTRACT_ID } from "./chain";
 
 const TEE_BASE_URL =
   process.env.NEXT_PUBLIC_TEE_URL ||
-  "https://2dba4d4f68ab082e126801c1271d5fbc1abff3bd-3000.dstack-pha-prod5.phala.network";
+  "https://b1b35377079ac7b7937afc607481587bc6d22665-3000.dstack-pha-prod9.phala.network";
 const NEAR_RPC_URL = process.env.NEXT_PUBLIC_NEAR_RPC || "https://rpc.testnet.near.org";
 
 export interface TeeAttestation {

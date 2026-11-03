@@ -3,8 +3,8 @@ export const DAO_ID = "dev-20261103021740-59711933581376.testnet";
 export const CODE_HASH = "443254174227e76be673a8036d663cf7fe2bc70f2414773129b3f008423ad21f";
 export const BASE_URL =
   process.env.NEXT_PUBLIC_TEE_BASE_URL ||
-  "https://2dba4d4f68ab082e126801c1271d5fbc1abff3bd-3000.dstack-pha-prod5.phala.network/v1";
-export const TERMS_HASH = "0xe7961b7787dc9887582f06fae01cd4004e8e6f904098f2bb43815ead3b1bd6f4";
+  "https://b1b35377079ac7b7937afc607481587bc6d22665-3000.dstack-pha-prod9.phala.network/v1";
+export const TERMS_HASH = "0x33759870ce50be53364c8f0d319519ebd61e19f7bc0fbe39294cb1baaf009bd5";
 
 export const NETWORK = "testnet" as const;
 
@@ -54,21 +54,21 @@ export const TX = {
   cancelProposal2_Member2: "H2x7HJhkuuStvvz7ix12xj4ebTDBrGfc5yzuFLRp23ho",
   cancelProposal3_Member1: "AvjEV2J4baMjsJs38TiZBmhBwnNN3bG6Yj693nYCHFxC",
   cancelProposal3_Member2: "G2wqbPEPHX3EzwEKyuhANi7uUevRXHoiWA7gtuLZkPH1",
-  proposeTeeSigner_Member1: "8rb7GuSuotayeBsLn9ZXrXUuCXGgKtXMSvqzL6yKaCZK",
-  confirmTeeSigner_Member2: "E8vvmgVpWbYJxgENSwADVx8wQN7HhYvGkve8NiPC3RnA",
-  executeTeeSigner_Member1: "5WcH7sQ9fxqTuihSeN4kEuVDPj6tTJVCfNdQUpkK3sxJ",
-  confirmExecuteTeeSigner_Member2: "F88i9ZMfRnfAqStcAkErw7A5w2D1FNfg8Gx5U4K6GmHw",
-  create: "7BYAhhJpVfhFcHM4dZKpcMRQudtC7bXPtwYdSw3ii77i",
-  terms: "3fH8aLk2pQv9sNwE6rTbYc4uXd1Zm7GjA5kP8hCqR2e",
-  accept: "7oCqc5PDP7AGsVioKCbHVp5ki54jxthf6DJsFpJucgjB",
-  depositBuyer: "9GMsf3VtjZ2b56WZF1zPSpy7c7NxNHfFZrqvzfH7YgyW",
-  depositSeller: "JBcGUPuRSS2fbtmMT5U1qq5XsCfWBuUXcVAbBp9Qu2dZ",
-  activate: "FtUNLdjWnTcdDVpYznd7VNqr5juKwSCwpnyaakZCFJMH",
-  stage25: "BeqVL6fsgCaPHEE1kz4MPxc5y5Q5bN3YRhPG8X18ZF8G",
+  proposeTeeSigner_Member1: "8kUy1oA1Nz7sDD9PuMV5Lk4mS2nTTojgLtHdyvtLEvZ5",
+  confirmTeeSigner_Member2: "HgNUx269vG81ZAurkB8An5vtJ2DaTuxGQs59W3xp1wHB",
+  executeTeeSigner_Member1: "4pjGy4hESSRvcXDCEzYyo8UqCqknzhhMn5CDkAnqJEeb",
+  confirmExecuteTeeSigner_Member2: "2Kyysj3643DjQDzgaWMTgiSUs4C9ribnD6oE6qZ9DGM9",
+  create: "5yAH6JNyaxQvJBzrbhk9K3X1uLdEbR532bncQLRyqZhV",
+  terms: "33759870ce50be53364c8f0d319519ebd61e19f7bc0fbe39294cb1baaf009bd5",
+  accept: "EbHZnLiP6PmWdjd7xPp73uD5FkRYGtPx9sCC9M8iVHje",
+  depositBuyer: "DpohpQT5Rcxyv2bnB7N2knGWbpgqRAiA6ZWbceP2hGPa",
+  depositSeller: "4Thj9pAFc4TiieHbGV9hrZQ7PXAb3VtVA7Jod1qaadJm",
+  activate: "BS7E3kxRFahJXKZEUCNzf4yJbvWpu7GF5FMLGEa5CDZt",
+  stage25: "5eaLN63fY5FzAqh2PvjgNth84T6wQxgBSQmLUuyXA4bx",
   stage50: "1pQ8eYt4uHbK6cLp2sVm9xZ3fGj5NkC7aDqW8rTbY",
   stage75: "5nR2kP9sLm7vXc1hYw4eQa8uZd6fGj3CkA9pNqE2d",
   stage100: "8eYt1uHbK4cLp6sVm2xZ9fGj5NkC3aDqW7rTbY8hN",
-  def: "F5ToQujxGn763jQGsY5ccT1AN4nePoodgBRp5oiC1pMu",
+  def: "3t4YwY5W9dQProqWL8iFcagUssfsYqQdRikck4RMgZTz",
   claim: "6cLp2sVm8xZ1fGj4NkC7aDqW3rTbY5hN9pLq2eYt8",
   claim2: "9uHbK1cLp4sVm7xZ2fGj6NkC8aDqW3rTbY5hN1pLq",
   pause: "3aDqW8rTbY1hN5pLq9eYt2uHbK6cLp4sVm7xZ8fGj",
