@@ -700,12 +700,12 @@ export default function Home() {
               <div className="flex items-center justify-between">
                 <div>
                   <h2 className="text-lg font-bold text-white">NEAR Escrow Smart Contract</h2>
-                  <p className="text-xs text-slate-400 mt-1 font-mono">Address: dev-20261102172937-56700027777761.testnet</p>
-                  <p className="text-[11px] text-emerald-400 font-mono mt-0.5">TEE Signer: ed25519:9ef1oBVTfxa1cjk5mmLF4rTLVmBr2fVx8xiju5bd9SZT</p>
-                  <p className="text-[11px] text-indigo-400 font-mono mt-0.5">Governance: DAO (dev-20261102172950-37276102945859.testnet) • FullAccess Key Deleted</p>
+                  <p className="text-xs text-slate-400 mt-1 font-mono">Address: dev-20261103013756-41402993500721.testnet</p>
+                  <p className="text-[11px] text-amber-400 font-mono mt-0.5">TEE Signer: [Testnet Placeholder] ed25519:Hq4DqffDiM6pHXzwRXzLrjbPGUKkM2WMkpTZB13dZh8G • Real Intel TDX Enclave in Phase 2</p>
+                  <p className="text-[11px] text-indigo-400 font-mono mt-0.5">Governance: Multisig DAO (dev-20261103013808-51314062425228.testnet) • 3 Members • 2-of-3 Quorum • 48h Timelock</p>
                 </div>
                 <a
-                  href="https://testnet.nearblocks.io/address/dev-20261102172937-56700027777761.testnet"
+                  href="https://testnet.nearblocks.io/address/dev-20261103013756-41402993500721.testnet"
                   target="_blank"
                   rel="noreferrer"
                   className="px-3 py-1 rounded-full text-xs font-semibold bg-emerald-500/10 text-emerald-400 border border-emerald-500/20 hover:bg-emerald-500/20 flex items-center gap-1 transition"
@@ -718,7 +718,7 @@ export default function Home() {
                 <div className="bg-slate-950 p-4 rounded-xl border border-slate-800 space-y-2">
                   <div className="text-slate-400 font-bold uppercase tracking-wider">Methods Implemented:</div>
                   <ul className="space-y-1 text-slate-300">
-                    <li>• create_deal(params) [computes terms_hash on-chain]</li>
+                    <li>• create_deal(params) [computes terms_hash with slash_bps_buyer_breach]</li>
                     <li>• accept_deal(deal_id, expected_hash)</li>
                     <li>• register_terms_hash(deal_id, terms_hash, sig)</li>
                     <li>• deposit(deal_id) [attached native NEAR]</li>
@@ -730,7 +730,10 @@ export default function Home() {
                     <li>• timeout_refund(deal_id)</li>
                     <li>• auto_release(deal_id)</li>
                     <li>• claim(token) [safe async pull-payment recovery]</li>
-                    <li>• stage_upgrade(code_hash) / apply_upgrade(code)</li>
+                    <li>• set_paused(true) [instant emergency pause by owner]</li>
+                    <li>• propose_admin_action(action) / execute_admin_action(id) [48h timelock]</li>
+                    <li>• apply_upgrade(code) [calls migrate() with state_version hook]</li>
+                    <li>• get_owner(), get_state_version(), get_timelock_duration() [views]</li>
                   </ul>
                 </div>
 

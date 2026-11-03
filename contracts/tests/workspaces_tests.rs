@@ -6,7 +6,7 @@ use near_workspaces::types::NearToken;
 use rand::rngs::OsRng;
 use serde::{Deserialize, Serialize};
 
-const WASM_PATH: &str = "./target/wasm32-unknown-unknown/release/conpi_escrow.wasm";
+const WASM_PATH: &str = "./target/near/conpi_escrow.wasm";
 
 #[derive(BorshSerialize, Serialize, Deserialize)]
 #[borsh(crate = "near_sdk::borsh")]
@@ -63,7 +63,7 @@ async fn test_workspaces_full_lifecycle() -> Result<(), Box<dyn std::error::Erro
     // 1. Start NEAR Sandbox
     let worker = near_workspaces::sandbox().await?;
 
-    // 2. Read compiled WASM contract
+    // 2. Read compiled WASM contract (with embedded ABI and wasm-opt from cargo-near)
     let wasm = std::fs::read(WASM_PATH)?;
     let contract = worker.dev_deploy(&wasm).await?;
 
@@ -71,31 +71,24 @@ async fn test_workspaces_full_lifecycle() -> Result<(), Box<dyn std::error::Erro
     let buyer = worker.dev_create_account().await?;
     let seller = worker.dev_create_account().await?;
 
-    // 3. Initialize Contract
+    // 3. Register TEE Signer with genuine TDX format measurement at initialization
+    let (tee_sk, tee_pk) = generate_tee_keypair();
     let init_res = contract
         .call("new")
         .args_json(serde_json::json!({
             "owner": owner.id(),
             "chain_id": "testnet",
-            "config": null
+            "config": null,
+            "initial_tee_signer": [
+                tee_pk,
+                "tdx_mrtd:c7b60e6e7655074d2e772e737c385b08fb8e15d8628bb9fb3d0ff08b98263ef26e5a40733568c07f45778a4f91ef2c01"
+            ]
         }))
         .transact()
         .await?;
     assert!(init_res.is_success());
 
-    // 4. Register TEE Signer with genuine TDX format measurement
-    let (tee_sk, tee_pk) = generate_tee_keypair();
-    let add_signer_res = owner
-        .call(contract.id(), "add_tee_signer")
-        .args_json(serde_json::json!({
-            "public_key": tee_pk,
-            "measurement": "tdx_mrtd:c7b60e6e7655074d2e772e737c385b08fb8e15d8628bb9fb3d0ff08b98263ef26e5a40733568c07f45778a4f91ef2c01"
-        }))
-        .transact()
-        .await?;
-    assert!(add_signer_res.is_success());
-
-    // 5. Create Deal on-chain: Price = 5 NEAR, Buyer Collateral = 1 NEAR, Seller Collateral = 2 NEAR
+    // 4. Create Deal on-chain: Price = 5 NEAR, Buyer Collateral = 1 NEAR, Seller Collateral = 2 NEAR
     let price = NearToken::from_near(5);
     let credit_amount = NearToken::from_near(8);
     let buyer_collateral = NearToken::from_near(1);
@@ -117,7 +110,8 @@ async fn test_workspaces_full_lifecycle() -> Result<(), Box<dyn std::error::Erro
                 "key_duration_sec": 86400,
                 "tee_liveness_timeout_sec": 3600,
                 "slash_bps_provider_ban": 5000,
-                "slash_bps_revoke": 8000
+                "slash_bps_revoke": 8000,
+                "slash_bps_buyer_breach": 8000
             }
         }))
         .deposit(NearToken::from_millinear(50))
@@ -127,7 +121,7 @@ async fn test_workspaces_full_lifecycle() -> Result<(), Box<dyn std::error::Erro
     let deal_id: u64 = create_res.json()?;
     assert_eq!(deal_id, 1);
 
-    // 6. Inspect Deal on-chain to retrieve canonical terms_hash computed on-chain
+    // 5. Inspect Deal on-chain to retrieve canonical terms_hash computed on-chain
     let deal_view: serde_json::Value = contract
         .view("get_deal")
         .args_json(serde_json::json!({ "deal_id": deal_id }))
@@ -137,7 +131,7 @@ async fn test_workspaces_full_lifecycle() -> Result<(), Box<dyn std::error::Erro
     let mut terms_hash = [0u8; 32];
     terms_hash.copy_from_slice(&terms_hash_raw);
 
-    // 7. Counterparty (seller) explicitly accepts the deal terms on-chain
+    // 6. Counterparty (seller) explicitly accepts the deal terms on-chain
     let accept_res = seller
         .call(contract.id(), "accept_deal")
         .args_json(serde_json::json!({
@@ -148,7 +142,7 @@ async fn test_workspaces_full_lifecycle() -> Result<(), Box<dyn std::error::Erro
         .await?;
     assert!(accept_res.is_success());
 
-    // 8. TEE submits attestation for terms hash
+    // 7. TEE submits attestation for terms hash
     let terms_sig = sign_terms_hash(&tee_sk, contract.id().as_str(), deal_id, &terms_hash);
     let reg_terms_res = contract
         .call("register_terms_hash")
@@ -161,7 +155,7 @@ async fn test_workspaces_full_lifecycle() -> Result<(), Box<dyn std::error::Erro
         .await?;
     assert!(reg_terms_res.is_success());
 
-    // 9. Buyer Deposit: 5 NEAR + 1 NEAR = 6 NEAR attached deposit
+    // 8. Buyer Deposit: 5 NEAR + 1 NEAR = 6 NEAR attached deposit
     let buyer_dep_res = buyer
         .call(contract.id(), "deposit")
         .args_json(serde_json::json!({ "deal_id": deal_id }))
@@ -170,7 +164,7 @@ async fn test_workspaces_full_lifecycle() -> Result<(), Box<dyn std::error::Erro
         .await?;
     assert!(buyer_dep_res.is_success());
 
-    // 10. Seller Deposit: 2 NEAR attached deposit
+    // 9. Seller Deposit: 2 NEAR attached deposit
     let seller_dep_res = seller
         .call(contract.id(), "deposit")
         .args_json(serde_json::json!({ "deal_id": deal_id }))
@@ -187,7 +181,7 @@ async fn test_workspaces_full_lifecycle() -> Result<(), Box<dyn std::error::Erro
         .json()?;
     assert_eq!(deal_view_funded["status"], "Funded");
 
-    // 11. Activate Deal on-chain via TEE SignedPayload
+    // 10. Activate Deal on-chain via TEE SignedPayload
     let activate_payload = serde_json::json!({
         "domain": "conpi:v1",
         "contract_id": contract.id().to_string(),
@@ -259,7 +253,8 @@ async fn test_workspaces_failed_transfer_and_claim() -> Result<(), Box<dyn std::
         .args_json(serde_json::json!({
             "owner": owner.id(),
             "chain_id": "testnet",
-            "config": null
+            "config": null,
+            "initial_tee_signer": null
         }))
         .transact()
         .await?;
@@ -320,13 +315,290 @@ async fn test_workspaces_failed_transfer_and_claim() -> Result<(), Box<dyn std::
         .json()?;
     assert_eq!(pending_after.0, 0, "Pending payouts must be 0 after claim");
 
-    // 9. Verify user received the funds (allowing for gas overhead)
+    // 9. Verify user received the funds
     let user_balance_after = user.view_account().await?.balance;
     assert!(
         user_balance_after > user_balance_before,
         "User balance must increase by claimed amount"
     );
     println!("near-workspaces: Successfully claimed pending payout! Balance increased from {} to {}", user_balance_before, user_balance_after);
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_workspaces_timelocked_governance() -> Result<(), Box<dyn std::error::Error>> {
+    let worker = near_workspaces::sandbox().await?;
+    let wasm = std::fs::read(WASM_PATH)?;
+    let contract = worker.dev_deploy(&wasm).await?;
+
+    let owner = worker.root_account()?;
+    let new_owner = worker.dev_create_account().await?;
+
+    // Initialize contract
+    let init_res = contract
+        .call("new")
+        .args_json(serde_json::json!({
+            "owner": owner.id(),
+            "chain_id": "testnet",
+            "config": null,
+            "initial_tee_signer": null
+        }))
+        .transact()
+        .await?;
+    assert!(init_res.is_success());
+
+    // Propose ownership transfer
+    let propose_res = owner
+        .call(contract.id(), "propose_admin_action")
+        .args_json(serde_json::json!({
+            "action": {
+                "TransferOwnership": {
+                    "new_owner": new_owner.id()
+                }
+            }
+        }))
+        .max_gas()
+        .transact()
+        .await?;
+    assert!(propose_res.is_success());
+    let proposal_id: u64 = propose_res.json()?;
+    assert_eq!(proposal_id, 1);
+
+    // Immediate execution must fail on sandbox (timelock delay not passed)
+    let early_exec = owner
+        .call(contract.id(), "execute_admin_action")
+        .args_json(serde_json::json!({
+            "proposal_id": proposal_id,
+            "code": null
+        }))
+        .max_gas()
+        .transact()
+        .await?;
+    assert!(early_exec.is_failure(), "Immediate execution must fail 48h timelock");
+    println!("near-workspaces: Proved that premature admin execution is rejected by 48h timelock!");
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_workspaces_multisig_dao_governance_cycle() -> Result<(), Box<dyn std::error::Error>> {
+    use near_sdk::json_types::Base64VecU8;
+    use near_workspaces::types::AccessKey;
+
+    let worker = near_workspaces::sandbox().await?;
+    let wasm = std::fs::read(WASM_PATH)?;
+    let escrow_contract = worker.dev_deploy(&wasm).await?;
+
+    // Deploy Multisig DAO Contract
+    let multisig_wasm = std::fs::read("./multisig.wasm")?;
+    let dao_account = worker.dev_create_account().await?;
+    dao_account.deploy(&multisig_wasm).await?.into_result()?;
+
+    // Init multisig with 2 confirmations required
+    dao_account
+        .call(dao_account.id(), "new")
+        .args_json(serde_json::json!({
+            "num_confirmations": 2
+        }))
+        .max_gas()
+        .transact()
+        .await?
+        .into_result()?;
+
+    // Generate 3 real member keypairs
+    let member1_sk = near_workspaces::types::SecretKey::from_random(near_workspaces::types::KeyType::ED25519);
+    let member2_sk = near_workspaces::types::SecretKey::from_random(near_workspaces::types::KeyType::ED25519);
+    let member3_sk = near_workspaces::types::SecretKey::from_random(near_workspaces::types::KeyType::ED25519);
+
+    let deployer_pk = dao_account.secret_key().public_key();
+
+    // Add 3 member keys to the multisig account and delete the deployer key
+    let batch_res = dao_account
+        .batch(dao_account.id())
+        .add_key(member1_sk.public_key(), AccessKey::full_access())
+        .add_key(member2_sk.public_key(), AccessKey::full_access())
+        .add_key(member3_sk.public_key(), AccessKey::full_access())
+        .delete_key(deployer_pk)
+        .transact()
+        .await?;
+    assert!(batch_res.is_success(), "Batch add member keys must succeed");
+
+    println!("near-workspaces: Multisig DAO initialized with 3 member keys and 2 required confirmations. Deployer key deleted!");
+
+    // Verify DAO has 3 keys and deployer key is gone
+    let keys = dao_account.view_access_keys().await?;
+    assert_eq!(keys.len(), 3, "DAO must have exactly 3 member access keys");
+
+    // Initialize Escrow with DAO as owner and 5-second timelock for test demonstration
+    let init_escrow = escrow_contract
+        .call("new")
+        .args_json(serde_json::json!({
+            "owner": dao_account.id(),
+            "chain_id": "testnet",
+            "config": null,
+            "initial_tee_signer": null,
+            "timelock_duration": 5_000_000_000u64 // 5 seconds
+        }))
+        .max_gas()
+        .transact()
+        .await?;
+    assert!(init_escrow.is_success());
+
+    // Member signers acting on behalf of the DAO account
+    let member1_account = near_workspaces::Account::from_secret_key(dao_account.id().clone(), member1_sk, &worker);
+    let member2_account = near_workspaces::Account::from_secret_key(dao_account.id().clone(), member2_sk, &worker);
+
+    // Prepare payload to propose admin action on escrow
+    let new_owner_acc = worker.dev_create_account().await?;
+    let propose_args = serde_json::to_vec(&serde_json::json!({
+        "action": {
+            "TransferOwnership": {
+                "new_owner": new_owner_acc.id()
+            }
+        }
+    }))?;
+    let base64_args = Base64VecU8::from(propose_args);
+
+    println!("near-workspaces: Member 1 submits MultiSig proposal to propose admin action on Escrow...");
+    let add_req_res = member1_account
+        .call(dao_account.id(), "add_request_and_confirm")
+        .args_json(serde_json::json!({
+            "request": {
+                "receiver_id": escrow_contract.id(),
+                "actions": [
+                    {
+                        "type": "FunctionCall",
+                        "method_name": "propose_admin_action",
+                        "args": base64_args,
+                        "deposit": "0",
+                        "gas": "50000000000000"
+                    }
+                ]
+            }
+        }))
+        .max_gas()
+        .transact()
+        .await?;
+    assert!(add_req_res.is_success());
+
+    let request_id: u32 = add_req_res.json()?;
+    println!("near-workspaces: Proposal created on Multisig with request_id = {}. 1/2 confirmations.", request_id);
+
+    // Verify escrow does NOT have the proposal yet (only 1 confirmation so far)
+    let pending_prop: Option<serde_json::Value> = escrow_contract
+        .view("get_staged_proposal")
+        .args_json(serde_json::json!({ "proposal_id": 1 }))
+        .await?
+        .json()?;
+    assert!(pending_prop.is_none(), "Proposal must not be staged until quorum is reached");
+
+    // Member 2 confirms the proposal
+    println!("near-workspaces: Member 2 confirms request {}. Quorum reached (2/2) -> Multisig executes cross-contract call!", request_id);
+    let confirm_res = member2_account
+        .call(dao_account.id(), "confirm")
+        .args_json(serde_json::json!({
+            "request_id": request_id
+        }))
+        .max_gas()
+        .transact()
+        .await?;
+    assert!(confirm_res.is_success());
+
+    // Verify escrow now HAS the proposal staged (proposal_id: 1)!
+    let staged_prop: Option<serde_json::Value> = escrow_contract
+        .view("get_staged_proposal")
+        .args_json(serde_json::json!({ "proposal_id": 1 }))
+        .await?
+        .json()?;
+    assert!(staged_prop.is_some(), "Proposal #1 must be staged on Escrow contract!");
+    println!("near-workspaces: Successfully verified Proposal #1 is staged on Escrow via Multisig DAO!");
+
+    // Attempt immediate execution via multisig -> must fail due to timelock delay
+    let exec_args = serde_json::to_vec(&serde_json::json!({
+        "proposal_id": 1,
+        "code": null
+    }))?;
+    let exec_b64 = Base64VecU8::from(exec_args);
+
+    let early_exec_req = member1_account
+        .call(dao_account.id(), "add_request_and_confirm")
+        .args_json(serde_json::json!({
+            "request": {
+                "receiver_id": escrow_contract.id(),
+                "actions": [
+                    {
+                        "type": "FunctionCall",
+                        "method_name": "execute_admin_action",
+                        "args": exec_b64,
+                        "deposit": "0",
+                        "gas": "50000000000000"
+                    }
+                ]
+            }
+        }))
+        .max_gas()
+        .transact()
+        .await?;
+    assert!(early_exec_req.is_success());
+    let early_req_id: u32 = early_exec_req.json()?;
+
+    let early_confirm = member2_account
+        .call(dao_account.id(), "confirm")
+        .args_json(serde_json::json!({
+            "request_id": early_req_id
+        }))
+        .max_gas()
+        .transact()
+        .await?;
+    assert!(early_confirm.is_failure(), "Early execution must fail timelock on Escrow!");
+    println!("near-workspaces: Verified that premature multisig execution is rejected by Escrow timelock!");
+
+    // Advance time past the timelock
+    println!("near-workspaces: Waiting for timelock delay to elapse...");
+    tokio::time::sleep(tokio::time::Duration::from_secs(6)).await;
+
+    // Now execute after timelock elapses
+    let valid_exec_req = member1_account
+        .call(dao_account.id(), "add_request_and_confirm")
+        .args_json(serde_json::json!({
+            "request": {
+                "receiver_id": escrow_contract.id(),
+                "actions": [
+                    {
+                        "type": "FunctionCall",
+                        "method_name": "execute_admin_action",
+                        "args": exec_b64,
+                        "deposit": "0",
+                        "gas": "50000000000000"
+                    }
+                ]
+            }
+        }))
+        .max_gas()
+        .transact()
+        .await?;
+    assert!(valid_exec_req.is_success());
+    let valid_req_id: u32 = valid_exec_req.json()?;
+
+    let valid_confirm = member2_account
+        .call(dao_account.id(), "confirm")
+        .args_json(serde_json::json!({
+            "request_id": valid_req_id
+        }))
+        .max_gas()
+        .transact()
+        .await?;
+    assert!(valid_confirm.is_success());
+
+    // Verify ownership successfully transferred to new_owner_acc!
+    let owner_after: near_sdk::AccountId = escrow_contract
+        .view("get_owner")
+        .args_json(serde_json::json!({}))
+        .await?
+        .json()?;
+    assert_eq!(&owner_after, new_owner_acc.id());
+    println!("near-workspaces: SUCCESS! Ownership transferred via 3-member Multisig DAO with 2 confirmations after timelock!");
 
     Ok(())
 }

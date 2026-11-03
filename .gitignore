@@ -18,3 +18,13 @@ yarn-error.log*
 .DS_Store
 *.pem
 *.swp
+
+# TEE Keys, Secrets & Credentials (NEVER commit private keys or enclave seeds)
+*.key
+*.seed
+*secret*
+*private*
+credentials/
+tee/credentials/
+**/credentials/
+*.sock

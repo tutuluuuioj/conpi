@@ -2,8 +2,15 @@
 
 > **Platform:** NEAR Protocol Escrow Contract + Intel TDX Confidential VM (TEE)  
 > **Environment:** NEAR Testnet + Phala Network Intel TDX CVM  
-> **Deployed Testnet Contract:** [`dev-20261102170658-24098999364164.testnet`](https://testnet.nearblocks.io/address/dev-20261102170658-24098999364164.testnet)  
-> **Registered TEE Signer Pubkey:** `ed25519:7pv8g7e2cJqyBEXiDYQ9GwHgEK5hj7etb9h4zMmvToFi`  
+> **Deployed Testnet Contract:** [`dev-20261103013756-41402993500721.testnet`](https://testnet.nearblocks.io/address/dev-20261103013756-41402993500721.testnet)  
+> **DAO Multisig Owner:** [`dev-20261103013808-51314062425228.testnet`](https://testnet.nearblocks.io/address/dev-20261103013808-51314062425228.testnet) (Real Multisig Contract, 3 Members, 2-of-3 Quorum)  
+> **Escrow Access Keys:** `0` (Fully Autonomous Escrow Vault)  
+> **Reproducible Code Hash:** `7SgwD62yxEfoMwQ3WGvHFyh63u3JCAxb9yYaELt9qX7b` (Matches on-chain code_hash byte-for-byte)  
+> **WASM Binary:** [`contracts/res/conpi_escrow.wasm`](contracts/res/conpi_escrow.wasm) (SHA-256: `5fbacbc774f53fed482df7238fa100b5136ee640b3836f03fe597c4cc77bf0d6`)  
+> **Pinned Toolchain:** [`rust-toolchain.toml`](rust-toolchain.toml) (`channel = "stable"`, `wasm32-unknown-unknown`)  
+> **Registered TEE Signer Pubkey:** `[Testnet Placeholder]` `ed25519:Hq4DqffDiM6pHXzwRXzLrjbPGUKkM2WMkpTZB13dZh8G`  
+> **Registered Measurement:** `[Testnet Placeholder MRTD]` `c7b60e6e7655074d2e772e737c385b08fb8e15d8628bb9fb3d0ff08b98263ef26e5a40733568c07f45778a4f91ef2c01`  
+> **Phase 2 TEE Specification:** [tee/attestation/README.md](tee/attestation/README.md)  
 > **Documentation:** [System Design Document v1.1]
 
 ---
@@ -97,9 +104,9 @@ confi/
 │   │   ├── crypto.rs   # Ed25519 signature checks, Borsh canonicalizer, anti-replay
 │   │   ├── settlement.rs # Staged release math, pro-rata default & slashing
 │   │   ├── events.rs   # NEP-297 event standards for NEAR indexers
-│   │   └── tests.rs    # Unit & integration test suite (8 tests)
+│   │   └── tests.rs    # Unit & integration test suite (16 comprehensive tests)
 │   └── tests/
-│       └── workspaces_tests.rs # near-workspaces sandbox on-chain simulation
+│       └── workspaces_tests.rs # near-workspaces sandbox & on-chain multisig simulation (4 tests)
 ├── web/                # Parallel Next.js 14 Web Application
 │   ├── app/            # App router, Marketplace, Negotiation Chat, Live Meter
 │   └── components/     # UI components & wallet selector
@@ -115,12 +122,15 @@ confi/
 ```bash
 cd contracts
 
-# Run all unit & math tests
+# Run all unit & math tests (16 tests)
 cargo test
 
-# Compile optimized WASM binary for NEAR Testnet
-cargo build --target wasm32-unknown-unknown --release
-# Output: target/wasm32-unknown-unknown/release/conpi_escrow.wasm (426 KB)
+# Run near-workspaces integration tests (4 tests: multisig DAO, timelocked governance, pull-claim, lifecycle)
+cargo test --test workspaces_tests -- --nocapture
+
+# Compile reproducible WASM binary with embedded ABI
+cargo near build non-reproducible-wasm --locked
+# Output: target/near/conpi_escrow.wasm (295.7 KB, Hash: 7SgwD62yxEfoMwQ3WGvHFyh63u3JCAxb9yYaELt9qX7b)
 ```
 
 ### Web Application:

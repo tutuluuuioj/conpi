@@ -2,7 +2,7 @@ use near_sdk::collections::{LookupMap, UnorderedMap};
 use near_sdk::json_types::U128;
 use near_sdk::{
     env, near, require, AccountId, Duration, Gas, NearToken, PanicOnDefault, Promise,
-    PromiseOrValue, PublicKey, Timestamp,
+    PromiseOrValue, PublicKey,
 };
 
 pub mod crypto;
@@ -17,8 +17,8 @@ use crypto::CryptoHelper;
 use events::{emit_event, ConpiEvent};
 use settlement::SettlementCalculator;
 use types::{
-    Balance, Config, CreateDealParams, Deal, DealId, DealStatus, DefaultReason, PayloadKind,
-    SignedPayload, SignedState, TeeSigner,
+    AdminAction, Balance, Config, CreateDealParams, Deal, DealId, DealStatus, DefaultReason,
+    PayloadKind, SignedPayload, SignedState, StagedAction, TeeSigner,
 };
 
 const GAS_FOR_FT_TRANSFER: Gas = Gas::from_tgas(20);
@@ -37,17 +37,24 @@ pub struct ConpiEscrow {
     pub pending_payouts: LookupMap<(AccountId, Option<AccountId>), Balance>,
     pub next_deal_id: u64,
     pub config: Config,
-    pub staged_upgrade_hash: Option<[u8; 32]>,
-    pub staged_upgrade_timestamp: Option<Timestamp>,
+    pub next_proposal_id: u64,
+    pub staged_proposals: UnorderedMap<u64, StagedAction>,
     pub timelock_duration: Duration,
+    pub state_version: u32,
 }
 
 #[near]
 impl ConpiEscrow {
     #[init]
-    pub fn new(owner: AccountId, chain_id: Option<String>, config: Option<Config>) -> Self {
+    pub fn new(
+        owner: AccountId,
+        chain_id: Option<String>,
+        config: Option<Config>,
+        initial_tee_signer: Option<(PublicKey, String)>,
+        timelock_duration: Option<u64>,
+    ) -> Self {
         require!(!env::state_exists(), "Already initialized");
-        Self {
+        let mut contract = Self {
             owner,
             chain_id: chain_id.unwrap_or_else(|| "testnet".to_string()),
             paused: false,
@@ -57,135 +64,228 @@ impl ConpiEscrow {
             pending_payouts: LookupMap::new(b"p"),
             next_deal_id: 1,
             config: config.unwrap_or_default(),
-            staged_upgrade_hash: None,
-            staged_upgrade_timestamp: None,
-            timelock_duration: 172_800_000_000_000, // 48-hour default timelock
+            next_proposal_id: 1,
+            staged_proposals: UnorderedMap::new(b"s"),
+            timelock_duration: timelock_duration.unwrap_or(172_800_000_000_000), // 48-hour default timelock
+            state_version: 1,
+        };
+
+        if let Some((pk, measurement)) = initial_tee_signer {
+            contract.tee_signers.insert(
+                &pk,
+                &TeeSigner {
+                    measurement,
+                    registered_at: env::block_timestamp(),
+                    active: true,
+                },
+            );
         }
+
+        contract
     }
 
     /* -------------------------------------------------------------------------
-       GOVERNANCE & ADMIN METHODS
+       TIMELOCKED GOVERNANCE (48-HOUR DELAY FOR ALL ADMIN ACTIONS)
     ------------------------------------------------------------------------- */
-
-    pub fn transfer_ownership(&mut self, new_owner: AccountId) {
-        self.assert_owner();
-        self.owner = new_owner;
-    }
 
     pub fn set_paused(&mut self, paused: bool) {
         self.assert_owner();
-        self.paused = paused;
+        if paused {
+            self.paused = true;
+            env::log_str("Contract paused by owner in emergency circuit-breaker mode");
+        } else {
+            env::panic_str("Unpausing requires timelocked governance via propose_admin_action(AdminAction::Unpause)");
+        }
     }
 
-    pub fn add_tee_signer(&mut self, public_key: PublicKey, measurement: String) {
+    /// Proposes an administrative action (update config, add/revoke signer, transfer ownership, upgrade, unpause).
+    /// Enforces a strict 48-hour delay before execution can take place.
+    pub fn propose_admin_action(&mut self, action: AdminAction) -> u64 {
         self.assert_owner();
-        self.tee_signers.insert(
-            &public_key,
-            &TeeSigner {
-                measurement,
-                registered_at: env::block_timestamp(),
-                active: true,
+
+        // Validate action invariants upfront before staging
+        match &action {
+            AdminAction::UpdateConfig { config } => {
+                Self::validate_config(config);
+            }
+            AdminAction::AddTeeSigner { public_key, .. } => {
+                CryptoHelper::extract_ed25519_bytes(public_key);
+            }
+            AdminAction::RevokeTeeSigner { public_key } => {
+                require!(
+                    self.tee_signers.get(public_key).is_some(),
+                    "TEE signer not registered"
+                );
+            }
+            AdminAction::TransferOwnership { new_owner } => {
+                require!(new_owner != &self.owner, "New owner must differ from current");
+            }
+            AdminAction::Upgrade { .. } => {}
+            AdminAction::Unpause => {
+                require!(self.paused, "Contract is not paused");
+            }
+        }
+
+        let ready_at = env::block_timestamp() + self.timelock_duration;
+        let proposal_id = self.next_proposal_id;
+        self.next_proposal_id += 1;
+
+        self.staged_proposals.insert(
+            &proposal_id,
+            &StagedAction {
+                action: action.clone(),
+                ready_at,
             },
         );
-    }
 
-    pub fn revoke_tee_signer(&mut self, public_key: PublicKey) {
-        self.assert_owner();
-        let mut signer = self
-            .tee_signers
-            .get(&public_key)
-            .expect("TEE signer not registered");
-        signer.active = false;
-        self.tee_signers.insert(&public_key, &signer);
-    }
+        let action_type = match &action {
+            AdminAction::TransferOwnership { .. } => "TRANSFER_OWNERSHIP",
+            AdminAction::UpdateConfig { .. } => "UPDATE_CONFIG",
+            AdminAction::AddTeeSigner { .. } => "ADD_TEE_SIGNER",
+            AdminAction::RevokeTeeSigner { .. } => "REVOKE_TEE_SIGNER",
+            AdminAction::Upgrade { .. } => "UPGRADE",
+            AdminAction::Unpause => "UNPAUSE",
+        };
 
-    pub fn update_config(&mut self, config: Config) {
-        self.assert_owner();
-        require!(
-            config.storage_deposit_fee >= 10_000_000_000_000_000_000_000,
-            "storage_deposit_fee must be at least 0.01 NEAR"
-        );
-        require!(
-            config.min_slash_bps >= 500 && config.max_slash_bps <= 10_000,
-            "min_slash_bps must be >= 500 (5%) and max_slash_bps <= 10,000 (100%)"
-        );
-        require!(
-            config.min_slash_bps <= config.max_slash_bps,
-            "min_slash_bps must be <= max_slash_bps"
-        );
-        require!(
-            config.min_deposit_duration >= 60_000_000_000,
-            "min_deposit_duration must be at least 60 seconds"
-        );
-        require!(
-            config.min_deposit_duration <= config.max_deposit_duration,
-            "min_deposit_duration must be <= max_deposit_duration"
-        );
-        require!(
-            config.min_tee_liveness_timeout >= 60_000_000_000,
-            "min_tee_liveness_timeout must be at least 60 seconds"
-        );
-        require!(
-            config.default_usage_duration >= 86_400_000_000_000,
-            "default_usage_duration must be at least 1 day"
-        );
-        require!(
-            config.notice_period_duration >= 3_600_000_000_000,
-            "notice_period_duration must be at least 1 hour"
-        );
-
-        self.config = config;
-    }
-
-    /* -------------------------------------------------------------------------
-       TIMELOCKED CONTRACT UPGRADES
-    ------------------------------------------------------------------------- */
-
-    pub fn stage_upgrade(&mut self, code_hash: [u8; 32]) {
-        self.assert_owner();
-        let ready_at = env::block_timestamp() + self.timelock_duration;
-        self.staged_upgrade_hash = Some(code_hash);
-        self.staged_upgrade_timestamp = Some(ready_at);
-
-        emit_event(ConpiEvent::UpgradeStaged {
-            code_hash: &hex::encode(code_hash),
+        emit_event(ConpiEvent::GovernanceActionProposed {
+            proposal_id,
             ready_at,
-        });
-    }
-
-    pub fn apply_upgrade(&mut self, code: Vec<u8>) -> Promise {
-        self.assert_owner();
-        let ready_at = self
-            .staged_upgrade_timestamp
-            .expect("No upgrade currently staged");
-        require!(
-            env::block_timestamp() >= ready_at,
-            "Upgrade timelock delay has not elapsed yet"
-        );
-        let expected_hash = self
-            .staged_upgrade_hash
-            .expect("No staged code hash found");
-        let actual_hash = env::sha256_array(&code);
-        require!(
-            actual_hash == expected_hash,
-            "Code hash mismatch with staged upgrade"
-        );
-
-        self.staged_upgrade_hash = None;
-        self.staged_upgrade_timestamp = None;
-
-        emit_event(ConpiEvent::UpgradeApplied {
-            code_hash: &hex::encode(expected_hash),
+            action_type,
         });
 
-        Promise::new(env::current_account_id()).deploy_contract(code)
+        proposal_id
     }
 
-    pub fn cancel_upgrade(&mut self) {
+    /// Executes a staged administrative action after the 48-hour timelock has elapsed.
+    pub fn execute_admin_action(
+        &mut self,
+        proposal_id: u64,
+        code: Option<Vec<u8>>,
+    ) -> PromiseOrValue<bool> {
         self.assert_owner();
-        self.staged_upgrade_hash = None;
-        self.staged_upgrade_timestamp = None;
-        emit_event(ConpiEvent::UpgradeCancelled);
+        let staged = self
+            .staged_proposals
+            .get(&proposal_id)
+            .expect("Proposal not found");
+
+        require!(
+            env::block_timestamp() >= staged.ready_at,
+            "48-hour timelock delay has not elapsed yet"
+        );
+
+        self.staged_proposals.remove(&proposal_id);
+
+        match staged.action {
+            AdminAction::TransferOwnership { new_owner } => {
+                self.owner = new_owner;
+                emit_event(ConpiEvent::GovernanceActionExecuted {
+                    proposal_id,
+                    action_type: "TRANSFER_OWNERSHIP",
+                });
+                PromiseOrValue::Value(true)
+            }
+            AdminAction::UpdateConfig { config } => {
+                Self::validate_config(&config);
+                self.config = config;
+                emit_event(ConpiEvent::GovernanceActionExecuted {
+                    proposal_id,
+                    action_type: "UPDATE_CONFIG",
+                });
+                PromiseOrValue::Value(true)
+            }
+            AdminAction::AddTeeSigner {
+                public_key,
+                measurement,
+            } => {
+                self.tee_signers.insert(
+                    &public_key,
+                    &TeeSigner {
+                        measurement,
+                        registered_at: env::block_timestamp(),
+                        active: true,
+                    },
+                );
+                emit_event(ConpiEvent::GovernanceActionExecuted {
+                    proposal_id,
+                    action_type: "ADD_TEE_SIGNER",
+                });
+                PromiseOrValue::Value(true)
+            }
+            AdminAction::RevokeTeeSigner { public_key } => {
+                let mut signer = self
+                    .tee_signers
+                    .get(&public_key)
+                    .expect("TEE signer not registered");
+                signer.active = false;
+                self.tee_signers.insert(&public_key, &signer);
+                emit_event(ConpiEvent::GovernanceActionExecuted {
+                    proposal_id,
+                    action_type: "REVOKE_TEE_SIGNER",
+                });
+                PromiseOrValue::Value(true)
+            }
+            AdminAction::Upgrade { code_hash } => {
+                let code_bytes = code.expect("WASM code bytes required for contract upgrade");
+                require!(
+                    env::sha256_array(&code_bytes) == code_hash,
+                    "Code hash mismatch with staged upgrade proposal"
+                );
+
+                emit_event(ConpiEvent::GovernanceActionExecuted {
+                    proposal_id,
+                    action_type: "UPGRADE",
+                });
+
+                let prom = Promise::new(env::current_account_id())
+                    .deploy_contract(code_bytes)
+                    .function_call(
+                        "migrate".to_string(),
+                        vec![],
+                        NearToken::from_yoctonear(0),
+                        Gas::from_tgas(30),
+                    );
+                PromiseOrValue::Promise(prom)
+            }
+            AdminAction::Unpause => {
+                self.paused = false;
+                emit_event(ConpiEvent::GovernanceActionExecuted {
+                    proposal_id,
+                    action_type: "UNPAUSE",
+                });
+                PromiseOrValue::Value(true)
+            }
+        }
+    }
+
+    pub fn cancel_admin_action(&mut self, proposal_id: u64) {
+        self.assert_owner();
+        require!(
+            self.staged_proposals.get(&proposal_id).is_some(),
+            "Proposal not found"
+        );
+        self.staged_proposals.remove(&proposal_id);
+        emit_event(ConpiEvent::GovernanceActionCancelled { proposal_id });
+    }
+
+    /// Migration entry point executed immediately after contract code deployment.
+    #[private]
+    #[init(ignore_state)]
+    pub fn migrate() -> Self {
+        let prev: ConpiEscrow = env::state_read().expect("Old contract state not found");
+        require!(prev.state_version >= 1, "Unsupported contract state version for migration");
+        emit_event(ConpiEvent::ContractMigrated);
+        Self {
+            state_version: prev.state_version + 1,
+            ..prev
+        }
+    }
+
+    pub fn get_staged_proposal(&self, proposal_id: u64) -> Option<StagedAction> {
+        self.staged_proposals.get(&proposal_id)
+    }
+
+    pub fn list_staged_proposals(&self) -> Vec<(u64, StagedAction)> {
+        self.staged_proposals.to_vec()
     }
 
     /* -------------------------------------------------------------------------
@@ -251,6 +351,11 @@ impl ConpiEscrow {
                 && params.slash_bps_provider_ban >= self.config.min_slash_bps,
             "Provider ban slash bps out of bounds"
         );
+        require!(
+            params.slash_bps_buyer_breach <= self.config.max_slash_bps
+                && params.slash_bps_buyer_breach >= self.config.min_slash_bps,
+            "Buyer breach slash bps out of bounds"
+        );
 
         let now = env::block_timestamp();
         let deal_id = self.next_deal_id;
@@ -272,6 +377,7 @@ impl ConpiEscrow {
             liveness_timeout,
             params.slash_bps_provider_ban,
             params.slash_bps_revoke,
+            params.slash_bps_buyer_breach,
         );
 
         let deal = Deal {
@@ -292,6 +398,7 @@ impl ConpiEscrow {
             tee_liveness_timeout: liveness_timeout,
             slash_bps_provider_ban: params.slash_bps_provider_ban,
             slash_bps_revoke: params.slash_bps_revoke,
+            slash_bps_buyer_breach: params.slash_bps_buyer_breach,
             buyer_deposited: 0,
             seller_deposited: 0,
             released_to_seller: 0,
@@ -1020,11 +1127,16 @@ impl ConpiEscrow {
         self.chain_id.clone()
     }
 
-    pub fn get_staged_upgrade(&self) -> Option<(String, Timestamp)> {
-        match (self.staged_upgrade_hash, self.staged_upgrade_timestamp) {
-            (Some(hash), Some(ts)) => Some((hex::encode(hash), ts)),
-            _ => None,
-        }
+    pub fn get_owner(&self) -> AccountId {
+        self.owner.clone()
+    }
+
+    pub fn get_state_version(&self) -> u32 {
+        self.state_version
+    }
+
+    pub fn get_timelock_duration(&self) -> u64 {
+        self.timelock_duration
     }
 
     /* -------------------------------------------------------------------------
@@ -1069,7 +1181,7 @@ impl ConpiEscrow {
         if let Some(creator) = self.deal_creators.get(&deal_id) {
             let fee = self.config.storage_deposit_fee;
             if fee > 0 {
-                let _ = Promise::new(creator).transfer(NearToken::from_yoctonear(fee));
+                let _ = self.payout(&creator, fee, &None);
             }
         }
     }
@@ -1113,5 +1225,40 @@ impl ConpiEscrow {
                     )
             }
         }
+    }
+
+    fn validate_config(config: &Config) {
+        require!(
+            config.storage_deposit_fee >= 10_000_000_000_000_000_000_000,
+            "storage_deposit_fee must be at least 0.01 NEAR"
+        );
+        require!(
+            config.min_slash_bps >= 500 && config.max_slash_bps <= 10_000,
+            "min_slash_bps must be >= 500 (5%) and max_slash_bps <= 10,000 (100%)"
+        );
+        require!(
+            config.min_slash_bps <= config.max_slash_bps,
+            "min_slash_bps must be <= max_slash_bps"
+        );
+        require!(
+            config.min_deposit_duration >= 60_000_000_000,
+            "min_deposit_duration must be at least 60 seconds"
+        );
+        require!(
+            config.min_deposit_duration <= config.max_deposit_duration,
+            "min_deposit_duration must be <= max_deposit_duration"
+        );
+        require!(
+            config.min_tee_liveness_timeout >= 60_000_000_000,
+            "min_tee_liveness_timeout must be at least 60 seconds"
+        );
+        require!(
+            config.default_usage_duration >= 86_400_000_000_000,
+            "default_usage_duration must be at least 1 day"
+        );
+        require!(
+            config.notice_period_duration >= 3_600_000_000_000,
+            "notice_period_duration must be at least 1 hour"
+        );
     }
 }

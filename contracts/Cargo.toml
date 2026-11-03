@@ -28,3 +28,9 @@ lto = true
 debug = false
 panic = "abort"
 overflow-checks = true
+
+[package.metadata.near.reproducible_build]
+image = "sourcescan/cargo-near:0.13.4-rust-1.84.0"
+image_digest = "sha256:d894086adbe79ecff61b8495b281f6ebad6bc7285a21808602b13c23101b0b5e"
+container_build_command = ["cargo", "near", "build", "non-reproducible-wasm", "--locked"]
+

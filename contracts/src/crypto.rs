@@ -35,6 +35,7 @@ impl CryptoHelper {
         tee_liveness_timeout: Duration,
         slash_bps_provider_ban: u16,
         slash_bps_revoke: u16,
+        slash_bps_buyer_breach: u16,
     ) -> [u8; 32] {
         let mut data = Vec::new();
         data.extend_from_slice(b"conpi:v1:terms_hash:");
@@ -58,6 +59,7 @@ impl CryptoHelper {
         data.extend_from_slice(&tee_liveness_timeout.to_le_bytes());
         data.extend_from_slice(&slash_bps_provider_ban.to_le_bytes());
         data.extend_from_slice(&slash_bps_revoke.to_le_bytes());
+        data.extend_from_slice(&slash_bps_buyer_breach.to_le_bytes());
         env::sha256_array(&data)
     }
 

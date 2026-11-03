@@ -95,17 +95,23 @@ pub enum ConpiEvent<'a> {
         token: &'a Option<AccountId>,
         amount: U128,
     },
-    #[serde(rename = "upgrade_staged")]
-    UpgradeStaged {
-        code_hash: &'a str,
+    #[serde(rename = "governance_action_proposed")]
+    GovernanceActionProposed {
+        proposal_id: u64,
         ready_at: Timestamp,
+        action_type: &'static str,
     },
-    #[serde(rename = "upgrade_applied")]
-    UpgradeApplied {
-        code_hash: &'a str,
+    #[serde(rename = "governance_action_executed")]
+    GovernanceActionExecuted {
+        proposal_id: u64,
+        action_type: &'static str,
     },
-    #[serde(rename = "upgrade_cancelled")]
-    UpgradeCancelled,
+    #[serde(rename = "governance_action_cancelled")]
+    GovernanceActionCancelled {
+        proposal_id: u64,
+    },
+    #[serde(rename = "contract_migrated")]
+    ContractMigrated,
 }
 
 pub fn emit_event(event: ConpiEvent) {

@@ -1,14 +1,12 @@
-use borsh::{BorshDeserialize, BorshSerialize};
 use near_sdk::json_types::U128;
-use near_sdk::serde::{Deserialize, Serialize};
+use near_sdk::near;
 use near_sdk::{AccountId, Duration, PublicKey, Timestamp};
 
 pub type DealId = u64;
 pub type Balance = u128;
 
-#[derive(BorshSerialize, BorshDeserialize, Serialize, Deserialize, Clone, Copy, Debug, PartialEq, Eq)]
-#[serde(crate = "near_sdk::serde")]
-#[borsh(crate = "borsh")]
+#[near(serializers = [json, borsh])]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum DealStatus {
     Created,
     Funded,
@@ -19,9 +17,8 @@ pub enum DealStatus {
     SettledTimeout,
 }
 
-#[derive(BorshSerialize, BorshDeserialize, Serialize, Deserialize, Clone, Copy, Debug, PartialEq, Eq)]
-#[serde(crate = "near_sdk::serde")]
-#[borsh(crate = "borsh")]
+#[near(serializers = [json, borsh])]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum DefaultReason {
     InvalidKey,
     InsufficientQuota,
@@ -32,9 +29,8 @@ pub enum DefaultReason {
     BuyerBreach,
 }
 
-#[derive(BorshSerialize, BorshDeserialize, Serialize, Deserialize, Clone, Copy, Debug, PartialEq, Eq)]
-#[serde(crate = "near_sdk::serde")]
-#[borsh(crate = "borsh")]
+#[near(serializers = [json, borsh])]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum PayloadKind {
     Terms,
     Activate,
@@ -43,9 +39,8 @@ pub enum PayloadKind {
     Default,
 }
 
-#[derive(BorshSerialize, BorshDeserialize, Serialize, Deserialize, Clone, Debug, PartialEq)]
-#[serde(crate = "near_sdk::serde")]
-#[borsh(crate = "borsh")]
+#[near(serializers = [json, borsh])]
+#[derive(Clone, Debug, PartialEq)]
 pub struct SignedPayload {
     pub domain: String,
     pub contract_id: AccountId,
@@ -60,9 +55,8 @@ pub struct SignedPayload {
     pub issued_at: u64,
 }
 
-#[derive(BorshSerialize, BorshDeserialize, Serialize, Deserialize, Clone, Debug, PartialEq)]
-#[serde(crate = "near_sdk::serde")]
-#[borsh(crate = "borsh")]
+#[near(serializers = [json, borsh])]
+#[derive(Clone, Debug, PartialEq)]
 pub struct SignedState {
     pub stage: u8,
     pub metered_value: U128,
@@ -70,18 +64,16 @@ pub struct SignedState {
     pub issued_at: u64,
 }
 
-#[derive(BorshSerialize, BorshDeserialize, Serialize, Deserialize, Clone, Debug)]
-#[serde(crate = "near_sdk::serde")]
-#[borsh(crate = "borsh")]
+#[near(serializers = [json, borsh])]
+#[derive(Clone, Debug)]
 pub struct TeeSigner {
     pub measurement: String,
     pub registered_at: Timestamp,
     pub active: bool,
 }
 
-#[derive(BorshSerialize, BorshDeserialize, Serialize, Deserialize, Clone, Debug)]
-#[serde(crate = "near_sdk::serde")]
-#[borsh(crate = "borsh")]
+#[near(serializers = [json, borsh])]
+#[derive(Clone, Debug, PartialEq)]
 pub struct Config {
     pub min_deposit_duration: Duration,
     pub max_deposit_duration: Duration,
@@ -108,9 +100,8 @@ impl Default for Config {
     }
 }
 
-#[derive(BorshSerialize, BorshDeserialize, Serialize, Deserialize, Clone, Debug)]
-#[serde(crate = "near_sdk::serde")]
-#[borsh(crate = "borsh")]
+#[near(serializers = [json, borsh])]
+#[derive(Clone, Debug)]
 pub struct Deal {
     pub id: DealId,
     pub buyer: AccountId,
@@ -129,6 +120,7 @@ pub struct Deal {
     pub tee_liveness_timeout: Duration,
     pub slash_bps_provider_ban: u16,
     pub slash_bps_revoke: u16,
+    pub slash_bps_buyer_breach: u16,
     pub buyer_deposited: Balance,
     pub seller_deposited: Balance,
     pub released_to_seller: Balance,
@@ -140,8 +132,8 @@ pub struct Deal {
     pub counterparty_accepted: bool,
 }
 
-#[derive(Serialize, Deserialize, Clone, Debug)]
-#[serde(crate = "near_sdk::serde")]
+#[near(serializers = [json, borsh])]
+#[derive(Clone, Debug)]
 pub struct CreateDealParams {
     pub buyer: AccountId,
     pub seller: AccountId,
@@ -156,4 +148,23 @@ pub struct CreateDealParams {
     pub tee_liveness_timeout_sec: u64,
     pub slash_bps_provider_ban: u16,
     pub slash_bps_revoke: u16,
+    pub slash_bps_buyer_breach: u16,
+}
+
+#[near(serializers = [json, borsh])]
+#[derive(Clone, Debug, PartialEq)]
+pub enum AdminAction {
+    TransferOwnership { new_owner: AccountId },
+    UpdateConfig { config: Config },
+    AddTeeSigner { public_key: PublicKey, measurement: String },
+    RevokeTeeSigner { public_key: PublicKey },
+    Upgrade { code_hash: [u8; 32] },
+    Unpause,
+}
+
+#[near(serializers = [json, borsh])]
+#[derive(Clone, Debug, PartialEq)]
+pub struct StagedAction {
+    pub action: AdminAction,
+    pub ready_at: Timestamp,
 }

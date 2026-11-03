@@ -63,8 +63,8 @@ impl SettlementCalculator {
 
         let (seller_payout, buyer_refund, slash_amount) = match reason {
             DefaultReason::BuyerBreach => {
-                // Buyer faulted: slash buyer collateral and award to seller
-                let slash_bps = deal.slash_bps_revoke as u128;
+                // Buyer faulted: slash buyer collateral at slash_bps_buyer_breach and award to seller
+                let slash_bps = deal.slash_bps_buyer_breach as u128;
                 let slashed = (slash_bps * deal.buyer_collateral) / 10_000;
                 let buyer_collateral_refund = deal.buyer_collateral.saturating_sub(slashed);
 

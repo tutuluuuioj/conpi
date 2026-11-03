@@ -1,0 +1,9 @@
+{
+  "_NOTICE": "TESTNET PLACEHOLDER SCHEMA ONLY - NOT A REAL HARDWARE QUOTE. In Phase 2, real Intel TDX quotes are generated in-enclave via Phala dstack CVM (/var/run/tappd.sock) and verified before DAO registration.",
+  "version": 4,
+  "tee_type": "INTEL_TDX_PLACEHOLDER",
+  "attestation_provider": "Phala Network dstack CVM (Phase 2 Target)",
+  "testnet_placeholder_mrtd": "c7b60e6e7655074d2e772e737c385b08fb8e15d8628bb9fb3d0ff08b98263ef26e5a40733568c07f45778a4f91ef2c01",
+  "expected_quote_format": "RAW_BINARY_HEX_QUOTE",
+  "verification_mode": "PHASE_2_DAO_OR_ON_CHAIN_VERIFICATION"
+}
