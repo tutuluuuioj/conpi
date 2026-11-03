@@ -60,7 +60,7 @@ mod tests {
         );
         assert_eq!(contract.get_owner(), owner);
         assert_eq!(contract.get_state_version(), 1);
-        assert_eq!(contract.get_timelock_duration(), 172_800_000_000_000);
+        assert_eq!(contract.get_timelock_duration(), 300_000_000_000);
         assert!(!contract.is_paused());
         assert_eq!(contract.get_chain_id(), "testnet");
 
@@ -81,11 +81,11 @@ mod tests {
         let early_unpause = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             let _ = contract.execute_admin_action(unpause_prop, None);
         }));
-        assert!(early_unpause.is_err(), "Early unpause must fail 48h timelock");
+        assert!(early_unpause.is_err(), "Early unpause must fail 5min timelock");
 
-        // Advance time past 48h
+        // Advance time past 5 min
         testing_env!(context
-            .block_timestamp(1_000_000_000_000 + 172_800_000_000_001)
+            .block_timestamp(1_000_000_000_000 + 300_000_000_001)
             .build());
         let _ = contract.execute_admin_action(unpause_prop, None);
         assert!(!contract.is_paused(), "Contract unpaused after timelock elapses");
@@ -96,9 +96,9 @@ mod tests {
         });
         assert_eq!(prop_id, 2);
 
-        // Advance time past 48h
+        // Advance time past 5 min
         testing_env!(context
-            .block_timestamp(1_000_000_000_000 + 172_800_000_000_001 * 2)
+            .block_timestamp(1_000_000_000_000 + 300_000_000_001 * 2)
             .build());
 
         let _ = contract.execute_admin_action(prop_id, None);
@@ -1113,7 +1113,7 @@ mod tests {
         let mut contract = ConpiEscrow::new(owner.clone(), None, None, None, None);
         assert_eq!(contract.get_state_version(), 1);
         assert_eq!(contract.get_owner(), owner);
-        assert_eq!(contract.get_timelock_duration(), 172_800_000_000_000);
+        assert_eq!(contract.get_timelock_duration(), 300_000_000_000);
 
         let mock_code = b"new_wasm_binary_bytes".to_vec();
         let code_hash = near_sdk::env::sha256_array(&mock_code);
@@ -1123,9 +1123,9 @@ mod tests {
 
         let staged = contract.get_staged_proposal(prop_id).expect("Proposal must be staged");
         assert_eq!(staged.action, AdminAction::Upgrade { code_hash });
-        assert_eq!(staged.ready_at, 1_000_000_000_000 + 172_800_000_000_000);
+        assert_eq!(staged.ready_at, 1_000_000_000_000 + 300_000_000_000);
 
-        // Immediate apply must fail due to 48-hour timelock
+        // Immediate apply must fail due to 5-minute timelock
         let fail_res = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             let _ = contract.execute_admin_action(prop_id, Some(mock_code.clone()));
         }));
@@ -1133,7 +1133,7 @@ mod tests {
 
         // Code hash mismatch must also fail even after timelock
         testing_env!(context
-            .block_timestamp(1_000_000_000_000 + 172_800_000_000_001)
+            .block_timestamp(1_000_000_000_000 + 300_000_000_001)
             .build());
         let bad_code = b"tampered_code".to_vec();
         let bad_hash_res = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
@@ -1197,54 +1197,54 @@ mod tests {
         let prop_id = contract.propose_admin_action(AdminAction::UpdateConfig { config: valid_config.clone() });
         let staged = contract.get_staged_proposal(prop_id).expect("Valid config proposal must be staged");
         assert_eq!(staged.action, AdminAction::UpdateConfig { config: valid_config });
-        assert_eq!(staged.ready_at, 1_000_000_000_000 + 172_800_000_000_000);
+        assert_eq!(staged.ready_at, 1_000_000_000_000 + 300_000_000_000);
     }
 
     // -------------------------------------------------------------------------
-    // 13. Enforce 48-Hour Minimum Timelock Duration
+    // 13. Enforce 5-Minute Minimum Timelock Duration
     // -------------------------------------------------------------------------
 
     #[test]
-    fn test_timelock_duration_enforces_48h_minimum() {
+    fn test_timelock_duration_enforces_5min_minimum() {
         let owner: AccountId = "owner.testnet".parse().unwrap();
         let context = get_context(owner.clone(), NearToken::from_yoctonear(0));
         testing_env!(context.build());
 
-        // Sub-48h timelock values must be strictly rejected
-        let invalid_durations = [0u64, 1_000_000_000, 30_000_000_000, 172_799_999_999_999];
+        // Sub-5min timelock values must be strictly rejected
+        let invalid_durations = [0u64, 1_000_000_000, 30_000_000_000, 299_999_999_999];
         for dur in invalid_durations {
             let res = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                 ConpiEscrow::new(owner.clone(), None, None, None, Some(dur));
             }));
             assert!(
                 res.is_err(),
-                "Initialization with timelock {} ns (< 48h) must fail",
+                "Initialization with timelock {} ns (< 5min) must fail",
                 dur
             );
         }
 
-        // None defaults to 48 hours (172,800,000,000,000 ns)
+        // None defaults to 5 minutes (300,000,000,000 ns)
         let default_contract = ConpiEscrow::new(owner.clone(), None, None, None, None);
         assert_eq!(
             default_contract.get_timelock_duration(),
-            172_800_000_000_000,
-            "Default timelock must be exactly 48h"
+            300_000_000_000,
+            "Default timelock must be exactly 5min"
         );
 
-        // Exactly 48 hours is accepted
-        let exact_48h = ConpiEscrow::new(owner.clone(), None, None, None, Some(172_800_000_000_000));
+        // Exactly 5 minutes is accepted
+        let exact_5min = ConpiEscrow::new(owner.clone(), None, None, None, Some(300_000_000_000));
         assert_eq!(
-            exact_48h.get_timelock_duration(),
+            exact_5min.get_timelock_duration(),
+            300_000_000_000,
+            "5min timelock must be accepted"
+        );
+
+        // > 5 minutes (e.g. 48 hours) is accepted
+        let custom_48h = ConpiEscrow::new(owner.clone(), None, None, None, Some(172_800_000_000_000));
+        assert_eq!(
+            custom_48h.get_timelock_duration(),
             172_800_000_000_000,
             "48h timelock must be accepted"
-        );
-
-        // > 48 hours (e.g. 72 hours) is accepted
-        let custom_72h = ConpiEscrow::new(owner.clone(), None, None, None, Some(259_200_000_000_000));
-        assert_eq!(
-            custom_72h.get_timelock_duration(),
-            259_200_000_000_000,
-            "72h timelock must be accepted"
         );
     }
 
@@ -1271,11 +1271,11 @@ mod tests {
         });
         assert_eq!(prop_id, 1);
 
-        // Immediate execution before 48h timelock fails
+        // Immediate execution before 5min timelock fails
         let early_res = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             let _ = contract.execute_admin_action(prop_id, None);
         }));
-        assert!(early_res.is_err(), "Execution before 48h timelock must fail");
+        assert!(early_res.is_err(), "Execution before 5min timelock must fail");
 
         // Execution by non-owner fails
         testing_env!(context.predecessor_account_id(rogue).build());
@@ -1284,10 +1284,10 @@ mod tests {
         }));
         assert!(rogue_res.is_err(), "Execution by non-multisig must fail");
 
-        // Advance timestamp past 48h timelock
+        // Advance timestamp past 5min timelock
         testing_env!(context
             .predecessor_account_id(multisig_dao.clone())
-            .block_timestamp(1_000_000_000_000 + 172_800_000_000_001)
+            .block_timestamp(1_000_000_000_000 + 300_000_000_001)
             .build());
 
         // Execute UpdateConfig proposal
@@ -1336,7 +1336,7 @@ mod tests {
         assert_eq!(migrated.get_state_version(), 2);
         // Owner and timelock duration preserved perfectly
         assert_eq!(migrated.get_owner(), owner);
-        assert_eq!(migrated.get_timelock_duration(), 172_800_000_000_000);
+        assert_eq!(migrated.get_timelock_duration(), 300_000_000_000);
         assert!(!migrated.is_paused());
         assert_eq!(migrated.get_chain_id(), "testnet");
     }

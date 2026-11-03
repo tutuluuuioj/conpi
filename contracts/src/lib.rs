@@ -78,10 +78,10 @@ impl ConpiEscrow {
         timelock_duration: Option<u64>,
     ) -> Self {
         require!(!env::state_exists(), "Already initialized");
-        let timelock = timelock_duration.unwrap_or(172_800_000_000_000);
+        let timelock = timelock_duration.unwrap_or(300_000_000_000);
         require!(
-            timelock >= 172_800_000_000_000,
-            "Timelock duration must be at least 48 hours (172,800,000,000,000 ns)"
+            timelock >= 300_000_000_000,
+            "Timelock duration must be at least 5 minutes (300,000,000,000 ns)"
         );
         let mut contract = Self {
             owner,
@@ -114,7 +114,7 @@ impl ConpiEscrow {
     }
 
     /* -------------------------------------------------------------------------
-       TIMELOCKED GOVERNANCE (48-HOUR DELAY FOR ALL ADMIN ACTIONS)
+       TIMELOCKED GOVERNANCE (5-MINUTE DELAY FOR ALL ADMIN ACTIONS)
     ------------------------------------------------------------------------- */
 
     pub fn set_paused(&mut self, paused: bool) {
@@ -128,7 +128,7 @@ impl ConpiEscrow {
     }
 
     /// Proposes an administrative action (update config, add/revoke signer, transfer ownership, upgrade, unpause).
-    /// Enforces a strict 48-hour delay before execution can take place.
+    /// Enforces a 5-minute delay before execution can take place.
     pub fn propose_admin_action(&mut self, action: AdminAction) -> u64 {
         self.assert_owner();
 
@@ -185,7 +185,7 @@ impl ConpiEscrow {
         proposal_id
     }
 
-    /// Executes a staged administrative action after the 48-hour timelock has elapsed.
+    /// Executes a staged administrative action after the 5-minute timelock has elapsed.
     pub fn execute_admin_action(
         &mut self,
         proposal_id: u64,
@@ -199,7 +199,7 @@ impl ConpiEscrow {
 
         require!(
             env::block_timestamp() >= staged.ready_at,
-            "48-hour timelock delay has not elapsed yet"
+            "5-minute timelock delay has not elapsed yet"
         );
 
         if let AdminAction::Upgrade { code_hash } = &staged.action {

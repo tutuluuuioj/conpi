@@ -79,10 +79,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         &worker,
     );
 
-    // 1. Query proposal status on Escrow contract
+    // 1. Query proposal status on Escrow contract (Proposal #3 is the verifiable container build)
+    let proposal_id = 3u64;
     let proposal_info: Option<serde_json::Value> = escrow_contract
         .view("get_staged_proposal")
-        .args_json(serde_json::json!({ "proposal_id": 2 }))
+        .args_json(serde_json::json!({ "proposal_id": proposal_id }))
         .await?
         .json()?;
 
@@ -96,7 +97,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 .duration_since(std::time::UNIX_EPOCH)?
                 .as_secs();
 
-            println!("\nStaged Action:     {:?}", staged["action"]);
+            println!("\nStaged Proposal ID: {}", proposal_id);
+            println!("Staged Action:     {:?}", staged["action"]);
             println!("Ready At (ns):     {}", ready_at_ns);
             println!("Ready At (Unix):   {}", ready_at_secs);
             println!("Current Time:      {}", now_secs);
@@ -107,8 +109,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 let mins = (remaining_secs % 3600) / 60;
                 let secs = remaining_secs % 60;
                 eprintln!(
-                    "\n[TIMELOCK ENFORCED] Proposal #2 is not mature yet! Remaining time: {}h {}m {}s.",
-                    hours, mins, secs
+                    "\n[TIMELOCK ENFORCED] Proposal #{} is not mature yet! Remaining time: {}h {}m {}s.",
+                    proposal_id, hours, mins, secs
                 );
                 return Ok(());
             }
@@ -116,14 +118,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             println!("\nTimelock period has elapsed! Proceeding with 2-of-3 Multisig upgrade execution...");
         }
         None => {
-            println!("Proposal #2 is not staged (it may have already been executed or not yet proposed).");
+            println!("Proposal #{} is not staged (it may have already been executed or not yet proposed).", proposal_id);
             return Ok(());
         }
     }
 
     // 2. Prepare function-call arguments for execute_admin_action with WASM code
     let exec_call_args = serde_json::to_vec(&serde_json::json!({
-        "proposal_id": 2,
+        "proposal_id": proposal_id,
         "code": wasm_bytes
     }))?;
     let exec_b64 = Base64VecU8::from(exec_call_args);

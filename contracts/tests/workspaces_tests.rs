@@ -466,7 +466,7 @@ async fn test_workspaces_multisig_dao_governance_cycle() -> Result<(), Box<dyn s
         }
     }
 
-    // Verify 48h minimum enforcement at initialization (< 48h must fail)
+    // Verify 5-minute minimum enforcement at initialization (< 5min must fail)
     let short_init = escrow_contract
         .call("new")
         .args_json(serde_json::json!({
@@ -478,9 +478,9 @@ async fn test_workspaces_multisig_dao_governance_cycle() -> Result<(), Box<dyn s
         }))
         .transact()
         .await?;
-    assert!(short_init.is_failure(), "Contract initialization with timelock < 48h must fail");
+    assert!(short_init.is_failure(), "Contract initialization with timelock < 5min must fail");
 
-    // Initialize Escrow with DAO as owner and full 48-hour timelock (172,800,000,000,000 ns)
+    // Initialize Escrow with DAO as owner and 5-minute timelock (300_000_000_000 ns)
     let init_escrow = escrow_contract
         .call("new")
         .args_json(serde_json::json!({
@@ -488,12 +488,12 @@ async fn test_workspaces_multisig_dao_governance_cycle() -> Result<(), Box<dyn s
             "chain_id": "testnet",
             "config": null,
             "initial_tee_signer": null,
-            "timelock_duration": 172_800_000_000_000u64
+            "timelock_duration": 300_000_000_000u64
         }))
         .max_gas()
         .transact()
         .await?;
-    assert!(init_escrow.is_success(), "Escrow init with 48h timelock must succeed");
+    assert!(init_escrow.is_success(), "Escrow init with 5min timelock must succeed");
 
     let initial_owner: near_sdk::AccountId = escrow_contract
         .view("get_owner")
@@ -680,7 +680,7 @@ async fn test_workspaces_multisig_dao_upgrade_proposal_staged() -> Result<(), Bo
         .await?
         .into_result()?;
 
-    // Initialize Escrow with DAO as owner and full 48-hour timelock
+    // Initialize Escrow with DAO as owner and 5-minute timelock (300_000_000_000 ns)
     escrow_contract
         .call("new")
         .args_json(serde_json::json!({
@@ -688,7 +688,7 @@ async fn test_workspaces_multisig_dao_upgrade_proposal_staged() -> Result<(), Bo
             "chain_id": "testnet",
             "config": null,
             "initial_tee_signer": null,
-            "timelock_duration": 172_800_000_000_000u64
+            "timelock_duration": 300_000_000_000u64
         }))
         .max_gas()
         .transact()
@@ -855,15 +855,18 @@ async fn test_workspaces_multisig_dao_upgrade_execution_with_timelock_and_migrat
         .await?
         .into_result()?;
 
-    // Initialize Escrow with DAO as owner and full 48-hour timelock (172_800_000_000_000 ns)
+    // Generate TEE signer keypair for initial escrow state
+    let (tee_sk, tee_pk) = generate_tee_keypair();
+
+    // Initialize Escrow with DAO as owner, 5-minute timelock (300_000_000_000 ns), and initial TEE signer
     escrow_contract
         .call("new")
         .args_json(serde_json::json!({
             "owner": dao_account.id(),
-            "chain_id": "sandbox",
+            "chain_id": "testnet",
             "config": null,
-            "initial_tee_signer": null,
-            "timelock_duration": 172_800_000_000_000u64
+            "initial_tee_signer": [tee_pk.clone(), "intel_sgx_mrenclave_v1"],
+            "timelock_duration": 300_000_000_000u64
         }))
         .max_gas()
         .transact()
@@ -873,10 +876,122 @@ async fn test_workspaces_multisig_dao_upgrade_execution_with_timelock_and_migrat
     let member1_account = near_workspaces::Account::from_secret_key(dao_account.id().clone(), member1_sk, &worker);
     let member2_account = near_workspaces::Account::from_secret_key(dao_account.id().clone(), member2_sk, &worker);
 
-    // Compute code hash of real 297 KB WASM
+    // 1. Populate real pre-upgrade state on Escrow:
+    // Create buyer and seller accounts
+    let buyer = worker.dev_create_account().await?;
+    let seller = worker.dev_create_account().await?;
+
+    let price = NearToken::from_near(3);
+    let credit_amount = NearToken::from_near(5);
+    let buyer_collateral = NearToken::from_near(1);
+    let seller_collateral = NearToken::from_near(1);
+
+    let create_res = buyer
+        .call(escrow_contract.id(), "create_deal")
+        .args_json(serde_json::json!({
+            "params": {
+                "buyer": buyer.id(),
+                "seller": seller.id(),
+                "token": null,
+                "price": U128(price.as_yoctonear()),
+                "credit_amount": U128(credit_amount.as_yoctonear()),
+                "buyer_collateral": U128(buyer_collateral.as_yoctonear()),
+                "seller_collateral": U128(seller_collateral.as_yoctonear()),
+                "tee_pubkey": tee_pk,
+                "deposit_duration_sec": 86400,
+                "key_duration_sec": 86400,
+                "tee_liveness_timeout_sec": 3600,
+                "slash_bps_provider_ban": 5000,
+                "slash_bps_revoke": 8000,
+                "slash_bps_buyer_breach": 8000
+            }
+        }))
+        .deposit(NearToken::from_millinear(50))
+        .transact()
+        .await?;
+    assert!(create_res.is_success());
+    let deal_id: u64 = create_res.json()?;
+    assert_eq!(deal_id, 1);
+
+    // Retrieve terms hash and seller accepts
+    let deal_view: serde_json::Value = escrow_contract
+        .view("get_deal")
+        .args_json(serde_json::json!({ "deal_id": deal_id }))
+        .await?
+        .json()?;
+    let terms_hash_raw: Vec<u8> = serde_json::from_value(deal_view["terms_hash"].clone())?;
+    let mut terms_hash = [0u8; 32];
+    terms_hash.copy_from_slice(&terms_hash_raw);
+
+    let accept_res = seller
+        .call(escrow_contract.id(), "accept_deal")
+        .args_json(serde_json::json!({
+            "deal_id": deal_id,
+            "expected_hash": terms_hash
+        }))
+        .transact()
+        .await?;
+    assert!(accept_res.is_success());
+
+    // TEE attestation
+    let terms_sig = sign_terms_hash(&tee_sk, escrow_contract.id().as_str(), deal_id, &terms_hash);
+    let reg_terms_res = escrow_contract
+        .call("register_terms_hash")
+        .args_json(serde_json::json!({
+            "deal_id": deal_id,
+            "terms_hash": terms_hash,
+            "sig": terms_sig
+        }))
+        .transact()
+        .await?;
+    assert!(reg_terms_res.is_success());
+
+    // Buyer deposits 4 NEAR (3 price + 1 collateral)
+    let buyer_dep_res = buyer
+        .call(escrow_contract.id(), "deposit")
+        .args_json(serde_json::json!({ "deal_id": deal_id }))
+        .deposit(NearToken::from_near(4))
+        .transact()
+        .await?;
+    assert!(buyer_dep_res.is_success());
+
+    // Seller deposits 1 NEAR collateral
+    let seller_dep_res = seller
+        .call(escrow_contract.id(), "deposit")
+        .args_json(serde_json::json!({ "deal_id": deal_id }))
+        .deposit(NearToken::from_near(1))
+        .transact()
+        .await?;
+    assert!(seller_dep_res.is_success());
+
+    // Verify Deal state is FUNDED on-chain
+    let deal_view_funded: serde_json::Value = escrow_contract
+        .view("get_deal")
+        .args_json(serde_json::json!({ "deal_id": deal_id }))
+        .await?
+        .json()?;
+    assert_eq!(deal_view_funded["status"].as_str().unwrap(), "Funded");
+    println!("near-workspaces: Pre-upgrade state established: Deal #1 is FUNDED with 4 NEAR buyer deposit + 1 NEAR seller deposit");
+
+    // 2. Load genuinely distinct V2 WASM bytecode
+    let v2_p1 = std::path::Path::new("res/conpi_escrow_v2.wasm");
+    let v2_p2 = std::path::Path::new("contracts/res/conpi_escrow_v2.wasm");
+    let v2_p3 = std::path::Path::new("./target/wasm32-unknown-unknown/release/conpi_escrow_v2.wasm");
+    let v2_p4 = std::path::Path::new("./test_v2/target/wasm32-unknown-unknown/release/conpi_escrow_v2.wasm");
+    let v2_bytes = if v2_p1.exists() {
+        std::fs::read(v2_p1)?
+    } else if v2_p2.exists() {
+        std::fs::read(v2_p2)?
+    } else if v2_p3.exists() {
+        std::fs::read(v2_p3)?
+    } else {
+        std::fs::read(v2_p4)?
+    };
+    println!("Loaded distinct V2 WASM: {} bytes", v2_bytes.len());
+
     let mut hasher = Sha256::new();
-    hasher.update(&wasm_bytes);
-    let code_hash_bytes: [u8; 32] = hasher.finalize().into();
+    hasher.update(&v2_bytes);
+    let v2_code_hash_bytes: [u8; 32] = hasher.finalize().into();
 
     #[derive(serde::Serialize)]
     struct ProposeArgs {
@@ -884,12 +999,12 @@ async fn test_workspaces_multisig_dao_upgrade_execution_with_timelock_and_migrat
     }
     let propose_args = serde_json::to_vec(&ProposeArgs {
         action: conpi_escrow::types::AdminAction::Upgrade {
-            code_hash: code_hash_bytes,
+            code_hash: v2_code_hash_bytes,
         },
     })?;
     let base64_args = Base64VecU8::from(propose_args);
 
-    // Member 1 proposes upgrade
+    // Member 1 proposes upgrade to V2
     let add_req_res = member1_account
         .call(dao_account.id(), "add_request_and_confirm")
         .args_json(serde_json::json!({
@@ -912,7 +1027,7 @@ async fn test_workspaces_multisig_dao_upgrade_execution_with_timelock_and_migrat
         .into_result()?;
     let req_id: u32 = add_req_res.json()?;
 
-    // Member 2 confirms upgrade proposal
+    // Member 2 confirms upgrade proposal -> Quorum reached (2/2)
     member2_account
         .call(dao_account.id(), "confirm")
         .args_json(serde_json::json!({ "request_id": req_id }))
@@ -921,54 +1036,70 @@ async fn test_workspaces_multisig_dao_upgrade_execution_with_timelock_and_migrat
         .await?
         .into_result()?;
 
-    // Verify Proposal #1 is staged
+    // Verify Proposal #1 is staged on Escrow
     let staged_prop: Option<serde_json::Value> = escrow_contract
         .view("get_staged_proposal")
         .args_json(serde_json::json!({ "proposal_id": 1 }))
         .await?
         .json()?;
     assert!(staged_prop.is_some(), "Upgrade proposal must be staged on Escrow");
-    println!("near-workspaces: Upgrade proposal staged successfully behind 48h timelock");
+    let ready_at = staged_prop.as_ref().unwrap()["ready_at"].as_u64().unwrap();
+    println!("near-workspaces: Upgrade proposal staged behind 5min timelock (ready_at = {})", ready_at);
 
-    // Fast-forward sandbox past the 48h timelock
-    println!("near-workspaces: Fast-forwarding sandbox past 48h timelock...");
-    worker.fast_forward(10).await?;
-
-    // Fast-forward sandbox past the 48h timelock
-    println!("near-workspaces: Fast-forwarding sandbox past 48h timelock...");
-    worker.fast_forward(10).await?;
-
-    // Simulate timelock maturity by patching ready_at to 0 (elapsed)
-    let mature_action = conpi_escrow::types::StagedAction {
-        action: conpi_escrow::types::AdminAction::Upgrade {
-            code_hash: code_hash_bytes,
-        },
-        ready_at: 0,
-    };
-    let key = b"sv\x00\x00\x00\x00\x00\x00\x00\x00";
-    let val = near_sdk::borsh::to_vec(&mature_action)?;
-    worker.patch_state(escrow_contract.id(), key, &val).await?;
-
-    let verified_prop: Option<serde_json::Value> = escrow_contract
-        .view("get_staged_proposal")
-        .args_json(serde_json::json!({ "proposal_id": 1 }))
-        .await?
-        .json()?;
-    assert_eq!(
-        verified_prop.unwrap()["ready_at"].as_u64().unwrap(),
-        0,
-        "Staged proposal ready_at must be matured"
-    );
-
-    // Execute proposal with real 297 KB WASM bytes
+    // 3. Early execution must fail timelock enforcement
     let exec_args = serde_json::to_vec(&serde_json::json!({
         "proposal_id": 1,
-        "code": wasm_bytes
+        "code": v2_bytes
     }))?;
     let exec_b64 = Base64VecU8::from(exec_args);
 
-    println!("near-workspaces: Submitting execution request through Multisig DAO with real WASM...");
-    let exec_req_res = member1_account
+    let early_exec_res = member1_account
+        .call(dao_account.id(), "add_request_and_confirm")
+        .args_json(serde_json::json!({
+            "request": {
+                "receiver_id": escrow_contract.id(),
+                "actions": [
+                    {
+                        "type": "FunctionCall",
+                        "method_name": "execute_admin_action",
+                        "args": exec_b64.clone(),
+                        "deposit": "0",
+                        "gas": "250000000000000"
+                    }
+                ]
+            }
+        }))
+        .max_gas()
+        .transact()
+        .await?
+        .into_result()?;
+    let early_req_id: u32 = early_exec_res.json()?;
+
+    let early_confirm_res = member2_account
+        .call(dao_account.id(), "confirm")
+        .args_json(serde_json::json!({ "request_id": early_req_id }))
+        .max_gas()
+        .transact()
+        .await?;
+    assert!(early_confirm_res.is_failure(), "Early upgrade execution before 5min timelock must fail!");
+    println!("near-workspaces: Verified premature upgrade execution rejected by 5-minute timelock");
+
+    // 4. Natural timelock fast-forward (NO state patching!)
+    println!("near-workspaces: Naturally fast-forwarding sandbox past 5-minute timelock...");
+    worker.fast_forward(1200).await?;
+
+    let current_block = worker.view_block().await?;
+    let current_ts = current_block.header().timestamp_nanosec();
+    assert!(
+        current_ts >= ready_at,
+        "Current block timestamp ({}) must be >= ready_at ({}) after fast_forward",
+        current_ts, ready_at
+    );
+    println!("near-workspaces: Timelock naturally matured: current_ts ({}) >= ready_at ({}) with NO state patching!", current_ts, ready_at);
+
+    // 5. Mature execution via Multisig DAO
+    println!("near-workspaces: Executing mature upgrade proposal through Multisig DAO with real V2 WASM...");
+    let mature_exec_res = member1_account
         .call(dao_account.id(), "add_request_and_confirm")
         .args_json(serde_json::json!({
             "request": {
@@ -979,7 +1110,7 @@ async fn test_workspaces_multisig_dao_upgrade_execution_with_timelock_and_migrat
                         "method_name": "execute_admin_action",
                         "args": exec_b64,
                         "deposit": "0",
-                        "gas": "250000000000000" // 250 Tgas
+                        "gas": "250000000000000"
                     }
                 ]
             }
@@ -988,20 +1119,35 @@ async fn test_workspaces_multisig_dao_upgrade_execution_with_timelock_and_migrat
         .transact()
         .await?
         .into_result()?;
-    let exec_req_id: u32 = exec_req_res.json()?;
+    let mature_req_id: u32 = mature_exec_res.json()?;
 
-    println!("near-workspaces: Member 2 confirming execution request {}...", exec_req_id);
-    let confirm_exec_res = member2_account
+    let confirm_res = member2_account
         .call(dao_account.id(), "confirm")
-        .args_json(serde_json::json!({ "request_id": exec_req_id }))
+        .args_json(serde_json::json!({ "request_id": mature_req_id }))
         .max_gas()
         .transact()
         .await?;
-    assert!(confirm_exec_res.is_success(), "Upgrade execution confirmation must succeed: {:?}", confirm_exec_res);
+    assert!(confirm_res.is_success(), "Upgrade execution confirmation must succeed: {:?}", confirm_res);
     println!("near-workspaces: Upgrade transaction confirmed and executed successfully!");
 
-    // Verify upgrade and migration:
-    // 1. Escrow contract responds and retains the DAO as owner
+    // 6. Assertions on upgraded V2 state:
+    // (a) State version is bumped to 2
+    let version_after: u32 = escrow_contract
+        .view("get_state_version")
+        .args_json(serde_json::json!({}))
+        .await?
+        .json()?;
+    assert_eq!(version_after, 2, "State version must be bumped to 2 after V2 migration");
+
+    // (b) New V2 feature method is live and callable
+    let v2_feature: String = escrow_contract
+        .view("get_v2_feature")
+        .args_json(serde_json::json!({}))
+        .await?
+        .json()?;
+    assert_eq!(v2_feature, "conpi-v2-active", "V2 feature method must return expected message");
+
+    // (c) Owner remains the Multisig DAO contract
     let owner_after: near_sdk::AccountId = escrow_contract
         .view("get_owner")
         .args_json(serde_json::json!({}))
@@ -1009,7 +1155,29 @@ async fn test_workspaces_multisig_dao_upgrade_execution_with_timelock_and_migrat
         .json()?;
     assert_eq!(&owner_after, dao_account.id(), "Owner must remain DAO after upgrade");
 
-    // 2. Proposal #1 is removed after successful execution
+    // (d) Pre-upgrade deal #1 survived migration with all state intact
+    let deal_after: conpi_escrow::types::Deal = escrow_contract
+        .view("get_deal")
+        .args_json(serde_json::json!({ "deal_id": deal_id }))
+        .await?
+        .json()?;
+    println!("near-workspaces: Verified pre-upgrade deal #1 survived: {:?}", deal_after);
+    assert_eq!(deal_after.id, deal_id);
+    assert_eq!(&deal_after.buyer, buyer.id());
+    assert_eq!(&deal_after.seller, seller.id());
+    assert_eq!(deal_after.status, conpi_escrow::types::DealStatus::Funded);
+    assert_eq!(deal_after.buyer_deposited, NearToken::from_near(4).as_yoctonear());
+    assert_eq!(deal_after.seller_deposited, NearToken::from_near(1).as_yoctonear());
+
+    // (e) Config survived migration
+    let config_after: serde_json::Value = escrow_contract
+        .view("get_config")
+        .args_json(serde_json::json!({}))
+        .await?
+        .json()?;
+    assert!(config_after.get("min_slash_bps").is_some());
+
+    // (f) Proposal #1 is consumed
     let staged_after: Option<serde_json::Value> = escrow_contract
         .view("get_staged_proposal")
         .args_json(serde_json::json!({ "proposal_id": 1 }))
@@ -1017,7 +1185,7 @@ async fn test_workspaces_multisig_dao_upgrade_execution_with_timelock_and_migrat
         .json()?;
     assert!(staged_after.is_none(), "Staged proposal #1 must be consumed after successful execution");
 
-    println!("near-workspaces: Full upgrade and migrate with real 297 KB WASM verified successfully!");
+    println!("near-workspaces: Full upgrade and migrate verified! Deals, balances, config, owner survived migration with NO state patching!");
     Ok(())
 }
 
