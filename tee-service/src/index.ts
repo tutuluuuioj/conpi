@@ -75,7 +75,7 @@ async function bootstrap() {
   app.post("/v1/deals/:id/key", async (req, reply) => {
     const { id } = req.params as { id: string };
     const dealId = parseInt(id, 10);
-    const { provider, model, models, creditUsd, priceUsd, termsHashHex, encryptedEnvelope, plainApiKey } = req.body as any;
+    const { provider, model, models, creditUsd, priceUsd, termsHashHex, encryptedEnvelope, plainApiKey, creditAmountYocto } = req.body as any;
 
     try {
       const result = await keyVault.validateAndInjectKey(
@@ -87,7 +87,8 @@ async function bootstrap() {
         priceUsd,
         termsHashHex,
         encryptedEnvelope,
-        plainApiKey
+        plainApiKey,
+        creditAmountYocto
       );
       if (!result.ok) {
         return reply.status(400).send(result);

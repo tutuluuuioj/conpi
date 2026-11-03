@@ -1,6 +1,6 @@
 import { FastifyRequest, FastifyReply } from "fastify";
 import { keyVault, VaultEntry } from "../vault/preflight.js";
-import { calculateCost, meterEngine } from "./meter.js";
+import { calculateCost, meterEngine, PRICING_TABLE } from "./meter.js";
 import { DefaultReason } from "../crypto/borsh.js";
 
 function getProxyKey(req: FastifyRequest): string | null {
@@ -38,82 +38,46 @@ export async function handleChatCompletions(req: FastifyRequest, reply: FastifyR
     }
   }
 
+  // Verify requested model is supported in enclave pricing table
+  if (!PRICING_TABLE[requestedModel]) {
+    return reply.status(400).send({
+      error: { message: `Model '${requestedModel}' is not supported in the enclave pricing table`, code: "unsupported_model" },
+    });
+  }
+
+  // Hard credit cap check: reject before executing
   if (entry.usedUsd >= entry.creditUsd) {
     return reply.status(402).send({
       error: { message: `Deal credit cap ($${entry.creditUsd}) reached`, code: "quota_exhausted" },
     });
   }
 
-  // If using mock/test key, fail outside test mode
+  // Pre-flight check: ensure remaining credit can cover prompt tokens AND requested max_tokens
+  const estPromptTokens = Array.isArray(body.messages)
+    ? body.messages.reduce((acc: number, m: any) => acc + (typeof m.content === "string" ? Math.max(1, Math.ceil(m.content.length / 4)) : 4), 0)
+    : 15;
+  const requestedMaxTokens = typeof body.max_tokens === "number" && body.max_tokens > 0 ? body.max_tokens : 1000;
+  const maxPossibleCost = calculateCost(requestedModel, estPromptTokens, requestedMaxTokens).costUsd;
+
+  if (entry.usedUsd + maxPossibleCost > entry.creditUsd) {
+    return reply.status(402).send({
+      error: {
+        message: `Deal remaining credit ($${(entry.creditUsd - entry.usedUsd).toFixed(6)}) insufficient for requested max_tokens (${requestedMaxTokens} tokens = $${maxPossibleCost.toFixed(6)})`,
+        code: "quota_exhausted",
+      },
+    });
+  }
+
+  // If using mock/test key, delegate to test-mock module in test mode
   if (entry.apiKey.startsWith("mock_") || entry.apiKey.startsWith("test_") || entry.apiKey.startsWith("sk-test")) {
     if (process.env.NODE_ENV !== "test") {
       return reply.status(403).send({
         error: { message: "Mock API keys are disabled outside test mode (NODE_ENV !== 'test')", code: "mock_forbidden" },
       });
     }
-
-    const isStream = Boolean(body.stream);
-    // In test mode, count discrete message word tokens rather than character estimates
-    const inputTokens = Array.isArray(body.messages)
-      ? body.messages.reduce((acc: number, m: any) => acc + (typeof m.content === "string" ? Math.max(1, m.content.trim().split(/\s+/).filter(Boolean).length) : 4), 0)
-      : 15;
-    const outputTokens = 12;
-    const usage = calculateCost(requestedModel, inputTokens, outputTokens);
-
-    entry.usedUsd += usage.costUsd;
-    entry.tokensTotal += (inputTokens + outputTokens);
-
-    const stagePayload = meterEngine.checkAndEmitStage(entry, entry.termsHashHex);
-    if (stagePayload) {
-      entry.signedPayloads.push(stagePayload);
-    }
-
-    if (isStream) {
-      reply.raw.setHeader("Content-Type", "text/event-stream");
-      reply.raw.setHeader("Cache-Control", "no-cache");
-      reply.raw.setHeader("Connection", "keep-alive");
-
-      const testContent = `[Test Output]: ${Array.isArray(body.messages) ? (body.messages[body.messages.length - 1]?.content || "ok") : "ok"}`;
-      const deltaChunk = {
-        id: `chatcmpl-${Date.now()}`,
-        object: "chat.completion.chunk",
-        created: Math.floor(Date.now() / 1000),
-        model: requestedModel,
-        choices: [{ index: 0, delta: { role: "assistant", content: testContent }, finish_reason: null }],
-      };
-      reply.raw.write(`data: ${JSON.stringify(deltaChunk)}\n\n`);
-
-      const finalChunk = {
-        id: `chatcmpl-${Date.now()}`,
-        object: "chat.completion.chunk",
-        created: Math.floor(Date.now() / 1000),
-        model: requestedModel,
-        choices: [{ index: 0, delta: {}, finish_reason: "stop" }],
-        usage: { prompt_tokens: inputTokens, completion_tokens: outputTokens, total_tokens: inputTokens + outputTokens },
-      };
-      reply.raw.write(`data: ${JSON.stringify(finalChunk)}\n\n`);
-      reply.raw.write("data: [DONE]\n\n");
-      return reply.raw.end();
-    }
-
-    const testContent = `[Test Output]: ${Array.isArray(body.messages) ? (body.messages[body.messages.length - 1]?.content || "ok") : "ok"}`;
-    return reply.send({
-      id: `chatcmpl-${Date.now()}`,
-      object: "chat.completion",
-      created: Math.floor(Date.now() / 1000),
-      model: requestedModel,
-      choices: [{
-        index: 0,
-        message: { role: "assistant", content: testContent },
-        finish_reason: "stop",
-      }],
-      usage: {
-        prompt_tokens: inputTokens,
-        completion_tokens: outputTokens,
-        total_tokens: inputTokens + outputTokens,
-        conpi_cost_usd: usage.costUsd,
-      },
-    });
+    const mockModulePath = "../../test/test-mock.js";
+    const { handleMockChatCompletion } = await (import(mockModulePath) as Promise<any>);
+    return handleMockChatCompletion(req, reply, entry, requestedModel);
   }
 
   // Real upstream forward
@@ -214,9 +178,9 @@ export async function handleChatCompletions(req: FastifyRequest, reply: FastifyR
       entry.usedUsd += usage.costUsd;
       entry.tokensTotal += (promptTokens + completionTokens);
 
-      const stagePayload = meterEngine.checkAndEmitStage(entry, entry.termsHashHex);
-      if (stagePayload) {
-        entry.signedPayloads.push(stagePayload);
+      const newStages = meterEngine.checkAndEmitStages(entry, entry.termsHashHex);
+      for (const stg of newStages) {
+        entry.signedPayloads.push(stg);
       }
 
       return reply.raw.end();
@@ -262,9 +226,9 @@ export async function handleChatCompletions(req: FastifyRequest, reply: FastifyR
       entry.usedUsd += usage.costUsd;
       entry.tokensTotal += (data.usage.total_tokens || 0);
 
-      const stagePayload = meterEngine.checkAndEmitStage(entry, entry.termsHashHex);
-      if (stagePayload) {
-        entry.signedPayloads.push(stagePayload);
+      const newStages = meterEngine.checkAndEmitStages(entry, entry.termsHashHex);
+      for (const stg of newStages) {
+        entry.signedPayloads.push(stg);
       }
     }
     return reply.status(upstreamRes.status).send(data);
@@ -299,48 +263,46 @@ export async function handleAnthropicMessages(req: FastifyRequest, reply: Fastif
     }
   }
 
+  if (!PRICING_TABLE[requestedModel]) {
+    return reply.status(400).send({
+      error: { type: "invalid_request_error", message: `Model '${requestedModel}' is not supported in the enclave pricing table` },
+    });
+  }
+
+  // Hard credit cap check
   if (entry.usedUsd >= entry.creditUsd) {
     return reply.status(402).send({
       error: { type: "quota_error", message: `Deal credit cap ($${entry.creditUsd}) reached` },
     });
   }
 
-  // If mock/test key, fail outside test mode
+  const estPromptTokens = Array.isArray(body.messages)
+    ? body.messages.reduce((acc: number, m: any) => acc + (typeof m.content === "string" ? Math.max(1, Math.ceil(m.content.length / 4)) : 4), 0)
+    : 15;
+  const requestedMaxTokens = typeof body.max_tokens === "number" && body.max_tokens > 0
+    ? body.max_tokens
+    : (typeof body.max_tokens_to_sample === "number" && body.max_tokens_to_sample > 0 ? body.max_tokens_to_sample : 1000);
+  const maxPossibleCost = calculateCost(requestedModel, estPromptTokens, requestedMaxTokens).costUsd;
+
+  if (entry.usedUsd + maxPossibleCost > entry.creditUsd) {
+    return reply.status(402).send({
+      error: {
+        type: "quota_error",
+        message: `Deal remaining credit ($${(entry.creditUsd - entry.usedUsd).toFixed(6)}) insufficient for requested max_tokens (${requestedMaxTokens} tokens = $${maxPossibleCost.toFixed(6)})`,
+      },
+    });
+  }
+
+  // If mock/test key, delegate to test-mock module in test mode
   if (entry.apiKey.startsWith("mock_") || entry.apiKey.startsWith("test_") || entry.apiKey.startsWith("sk-test")) {
     if (process.env.NODE_ENV !== "test") {
       return reply.status(403).send({
         error: { type: "permission_error", message: "Mock API keys are disabled outside test mode" },
       });
     }
-
-    // In test mode, count discrete message word tokens rather than character estimates
-    const inputTokens = Array.isArray(body.messages)
-      ? body.messages.reduce((acc: number, m: any) => acc + (typeof m.content === "string" ? Math.max(1, m.content.trim().split(/\s+/).filter(Boolean).length) : 4), 0)
-      : 15;
-    const outputTokens = 12;
-    const usage = calculateCost(requestedModel, inputTokens, outputTokens);
-    entry.usedUsd += usage.costUsd;
-    entry.tokensTotal += (inputTokens + outputTokens);
-
-    const stagePayload = meterEngine.checkAndEmitStage(entry, entry.termsHashHex);
-    if (stagePayload) {
-      entry.signedPayloads.push(stagePayload);
-    }
-
-    const testContent = `[Test Output]: ${Array.isArray(body.messages) ? (body.messages[body.messages.length - 1]?.content || "ok") : "ok"}`;
-    return reply.send({
-      id: `msg_${Date.now()}`,
-      type: "message",
-      role: "assistant",
-      model: requestedModel,
-      content: [{ type: "text", text: testContent }],
-      stop_reason: "end_turn",
-      stop_sequence: null,
-      usage: {
-        input_tokens: inputTokens,
-        output_tokens: outputTokens,
-      },
-    });
+    const mockModulePath = "../../test/test-mock.js";
+    const { handleMockAnthropicMessage } = await (import(mockModulePath) as Promise<any>);
+    return handleMockAnthropicMessage(req, reply, entry, requestedModel);
   }
 
   const provLower = entry.provider.toLowerCase();
@@ -374,9 +336,9 @@ export async function handleAnthropicMessages(req: FastifyRequest, reply: Fastif
       entry.usedUsd += usage.costUsd;
       entry.tokensTotal += ((data.usage.input_tokens || 0) + (data.usage.output_tokens || 0));
 
-      const stagePayload = meterEngine.checkAndEmitStage(entry, entry.termsHashHex);
-      if (stagePayload) {
-        entry.signedPayloads.push(stagePayload);
+      const newStages = meterEngine.checkAndEmitStages(entry, entry.termsHashHex);
+      for (const stg of newStages) {
+        entry.signedPayloads.push(stg);
       }
     }
     return reply.status(upstreamRes.status).send(data);
@@ -451,9 +413,9 @@ export async function handleAnthropicMessages(req: FastifyRequest, reply: Fastif
     entry.usedUsd += usage.costUsd;
     entry.tokensTotal += (promptTokens + completionTokens);
 
-    const stagePayload = meterEngine.checkAndEmitStage(entry, entry.termsHashHex);
-    if (stagePayload) {
-      entry.signedPayloads.push(stagePayload);
+    const newStages = meterEngine.checkAndEmitStages(entry, entry.termsHashHex);
+    for (const stg of newStages) {
+      entry.signedPayloads.push(stg);
     }
 
     // Return native Anthropic message format

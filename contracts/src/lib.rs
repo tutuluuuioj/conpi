@@ -365,6 +365,11 @@ impl ConpiEscrow {
         self.assert_active_tee_signer(&params.tee_pubkey);
 
         // Safe duration multiplication (prevent u64 overflow)
+        require!(
+            params.credit_amount.0 > 0,
+            "credit_amount must be greater than zero"
+        );
+
         let deposit_duration = params
             .deposit_duration_sec
             .checked_mul(1_000_000_000)
@@ -766,9 +771,10 @@ impl ConpiEscrow {
             "Payload stage must match parameter"
         );
 
+        require!(deal.credit_amount > 0, "Deal has zero credit amount");
         let required_metered = (stage as u128 * deal.credit_amount) / 100;
         require!(
-            payload.metered_value.0 >= required_metered,
+            payload.metered_value.0 >= required_metered && payload.metered_value.0 > 0,
             "Metered value is below threshold for this stage"
         );
 

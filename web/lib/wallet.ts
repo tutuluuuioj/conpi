@@ -59,12 +59,13 @@ export async function signAndSendCall(
   if (!ws) throw new Error("Wallet selector not initialized");
 
   const state = ws.selector.store.getState();
+  const walletId = state.selectedWalletId || "browser-account-wallet";
+  const wallet = await ws.selector.wallet(walletId);
+
   if (!state.accounts.length) {
-    ws.modal.show();
-    throw new Error("Please connect your wallet first");
+    await wallet.signIn({ contractId: receiverId } as any);
   }
 
-  const wallet = await ws.selector.wallet();
   const argsBytes = Buffer.from(JSON.stringify(args));
   const action = transactions.functionCall(
     methodName,
@@ -212,4 +213,19 @@ export async function txSettleDefault(dealId: number, payload: any, sigHex: stri
 // 9. Claim Payouts
 export async function txClaim(token: string | null = null) {
   return signAndSendCall("claim", { token }, "50000000000000");
+}
+
+if (typeof window !== "undefined") {
+  (window as any).__conpiWallet = {
+    getWalletSelector,
+    signAndSendCall,
+    txCreateDeal,
+    txAcceptDeal,
+    txDepositNear,
+    txDepositFt,
+    txActivateDeal,
+    txReleaseStage,
+    txSettleDefault,
+    txClaim,
+  };
 }

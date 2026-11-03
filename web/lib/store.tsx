@@ -215,7 +215,7 @@ function mapOnChainDeal(d: OnChainDeal, currentAccount: string | null): Deal {
       live: d.status === "Active" ? { time: "Active" } : undefined,
       settled: d.status === "Settled" || d.status === "Defaulted" ? { time: "Settled" } : undefined,
     },
-    createdAt: new Date(Number(d.created_at) / 1e6).toISOString(),
+    createdAt: d.created_at ? new Date(Number(d.created_at) / 1e6).toISOString() : new Date().toISOString(),
     pulseStage: null,
   };
 }
@@ -277,7 +277,7 @@ export function Providers({ children }: { children: React.ReactNode }) {
         token: "NEAR",
         rateLimit: "60 req/min",
         expectedTest: "One completion probe, max 32 tokens",
-        createdAt: new Date(Number(d.created_at) / 1e6).toISOString(),
+        createdAt: d.created_at ? new Date(Number(d.created_at) / 1e6).toISOString() : new Date().toISOString(),
       }));
 
       // Add default market listings if none yet
@@ -609,7 +609,8 @@ export function Providers({ children }: { children: React.ReactNode }) {
             setTimeout(loadOnChainData, 2000);
             return { ok: true, title: "Deposit confirmed on NEAR", body: `${amount} NEAR locked in escrow.`, href: `https://testnet.nearblocks.io/txns/${txHash}` };
           } else {
-            const tokenContract = (deal as any).tokenContract || (deal.token === "USDT" ? "usdt.fakes.testnet" : "usdc.fakes.testnet");
+            const tokenContract = (deal as any).tokenContract || (deal.token && deal.token.includes(".") ? deal.token : null);
+            if (!tokenContract) throw new Error(`FT token contract address required for token: ${deal.token}`);
             const rawAmount = Math.round(amount * 1e6).toString();
             const outcome: any = await txDepositFt(tokenContract, Number(dealId), rawAmount);
             const txHash = outcome?.transaction?.hash || outcome?.transaction_outcome?.id;
@@ -824,10 +825,16 @@ export function Providers({ children }: { children: React.ReactNode }) {
           const buyerCollatYocto = (BigInt(Math.round(listing.price * (listing.buyerCollateralPct / 100) * 1e6)) * BigInt(1e18)).toString();
           const sellerCollatYocto = (BigInt(Math.round(listing.price * (listing.collateralPct / 100) * 1e6)) * BigInt(1e18)).toString();
 
+          let ftToken: string | null = null;
+          if (listing.token !== "NEAR") {
+            ftToken = (listing as any).tokenContract || (listing.token && listing.token.includes(".") ? listing.token : null);
+            if (!ftToken) throw new Error(`A valid NEP-141 token contract ID is required for ${listing.token}`);
+          }
+
           const params = {
             buyer: listing.type === "buy" ? current.account : (listing.seller || "buyer.testnet"),
             seller: listing.type === "sell" ? current.account : listing.seller,
-            token: listing.token === "NEAR" ? null : ((listing as any).tokenContract || "usdc.fakes.testnet"),
+            token: ftToken,
             price: priceYocto,
             credit_amount: creditYocto,
             buyer_collateral: buyerCollatYocto,

@@ -38,6 +38,7 @@ export interface VaultEntry {
   priceUsd: number;
   usedUsd: number;
   tokensTotal: number;
+  creditAmountYocto?: string;
   active: boolean;
   registeredAt: string;
   signedPayloads: Array<{ payload: any; signatureHex: string }>;
@@ -67,7 +68,8 @@ class KeyVault {
     priceUsd: number,
     termsHashHex: string,
     encryptedEnvelope?: EncryptedEnvelope,
-    plainApiKey?: string
+    plainApiKey?: string,
+    creditAmountYocto?: string
   ): Promise<KeyCheckResult> {
     let apiKey: string;
     if (plainApiKey) {
@@ -96,6 +98,19 @@ class KeyVault {
     // Generate buyer bearer proxy key
     const proxyKey = `cpk_live_${crypto.randomBytes(16).toString("hex")}`;
 
+    let resolvedCreditYocto = creditAmountYocto;
+    if (!resolvedCreditYocto) {
+      try {
+        const { nearRelayer } = await import("../chain/relayer.js");
+        const deal = await nearRelayer.getDeal(dealId);
+        if (deal && deal.credit_amount) {
+          resolvedCreditYocto = deal.credit_amount.toString();
+        }
+      } catch {
+        // Fallback to undefined if query fails
+      }
+    }
+
     const entry: VaultEntry = {
       dealId,
       provider,
@@ -108,6 +123,7 @@ class KeyVault {
       priceUsd,
       usedUsd: 0,
       tokensTotal: 0,
+      creditAmountYocto: resolvedCreditYocto,
       active: true,
       registeredAt: new Date().toISOString(),
       signedPayloads: [],

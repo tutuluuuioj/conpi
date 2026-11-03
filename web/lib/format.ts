@@ -80,12 +80,3 @@ export function differingFields(a: { credit: number; price: number; buyerCollate
   if (a.models.join("|") !== b.models.join("|")) fields.push("model allowlist");
   return fields;
 }
-
-export function txId() {
-  const alphabet = "123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz";
-  let out = "";
-  const bytes = new Uint8Array(44);
-  crypto.getRandomValues(bytes);
-  for (let i = 0; i < bytes.length; i += 1) out += alphabet[bytes[i] % alphabet.length];
-  return out;
-}

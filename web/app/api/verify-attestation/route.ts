@@ -3,6 +3,8 @@ import crypto from "crypto";
 import * as qvl from "@phala/dcap-qvl";
 import { BASE_URL, CONTRACT_ID } from "@/lib/chain";
 
+export const dynamic = "force-dynamic";
+
 export async function GET(req: NextRequest) {
   try {
     const searchParams = req.nextUrl.searchParams;

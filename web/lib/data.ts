@@ -196,86 +196,11 @@ export const LISTINGS: Listing[] = [
 
 export const DEALS: Deal[] = [];
 
-export const CLAIMS: Claim[] = [
-  {
-    id: "cl-1",
-    token: "USDC",
-    amount: 4.2,
-    dealId: "1038",
-    reason: "Transfer failed, credited for claim",
-    claimed: false,
-  },
-  {
-    id: "cl-2",
-    token: "USDT",
-    amount: 12.4,
-    dealId: "1024",
-    reason: "Transfer failed, credited for claim",
-    claimed: false,
-  },
-];
+export const CLAIMS: Claim[] = [];
 
-export const NOTICES: Notice[] = [
-  { id: "n1", kind: "claim", title: "Claim available", body: "12.40 USDT is waiting in the contract.", time: "07:48", href: "/claims", read: false },
-  { id: "n2", kind: "stage", title: "Stage released", body: "Deal 1042 released $15.00 at 25%.", time: "07:21", href: "/deals/1042", read: false },
-  { id: "n3", kind: "quota", title: "Quota low", body: "Deal 1042 has $48.00 of credit left.", time: "07:05", href: "/meter", read: false },
-  { id: "n4", kind: "key", title: "Key verified", body: "The seller key for deal 1042 passed the test call.", time: "Yesterday", href: "/deals/1042", read: true },
-  { id: "n5", kind: "deposit", title: "Counterparty deposited", body: "seller.near deposited collateral on deal 1042.", time: "Yesterday", href: "/deals/1042", read: true },
-  { id: "n6", kind: "terms", title: "Terms matched", body: "Both sides submitted the same terms for deal 1042.", time: "Yesterday", href: "/deals/1042/ticket", read: true },
-  { id: "n7", kind: "governance", title: "Proposal staged", body: "Pause new deals is ready to execute.", time: "Yesterday", href: "/governance", read: true },
-  { id: "n8", kind: "notice", title: "Auto-release notice", body: "Deal 1042 still has 29 days before the usage deadline.", time: "Mon", href: "/deals/1042", read: true },
-];
+export const NOTICES: Notice[] = [];
 
-export const PROPOSALS: Proposal[] = [
-  {
-    id: "prop-1",
-    action: "UpdateConfig (min_slash_bps to 20%)",
-    proposer: "member1.near",
-    confirmations: 2,
-    threshold: 3,
-    stagedAt: "2026-11-03T06:25:35.000Z",
-    executableAt: "2026-11-03T06:30:35.000Z",
-    status: "Executed",
-    diff: [{ field: "min_slash_bps", from: "1000 (10%)", to: "2000 (20%)" }],
-    confirmedByMe: true,
-  },
-  {
-    id: "prop-2",
-    action: "Upgrade (non-reproducible WASM)",
-    proposer: "member1.near",
-    confirmations: 2,
-    threshold: 3,
-    stagedAt: "2026-11-03T04:30:00.000Z",
-    executableAt: "2026-11-05T04:30:00.000Z",
-    status: "Cancelled",
-    diff: [{ field: "code_hash", from: "E5YED19G...", to: "5d40e022..." }],
-    confirmedByMe: true,
-  },
-  {
-    id: "prop-3",
-    action: "Upgrade (intermediate macOS WASM)",
-    proposer: "member1.near",
-    confirmations: 2,
-    threshold: 3,
-    stagedAt: "2026-11-03T05:32:00.000Z",
-    executableAt: "2026-11-05T05:32:00.000Z",
-    status: "Cancelled",
-    diff: [{ field: "code_hash", from: "E5YED19G...", to: "7b1c28d9..." }],
-    confirmedByMe: true,
-  },
-  {
-    id: "prop-4",
-    action: "Pause new deals",
-    proposer: "member2.near",
-    confirmations: 2,
-    threshold: 3,
-    stagedAt: "2026-11-03T14:40:00.000Z",
-    executableAt: "2026-11-03T14:45:00.000Z",
-    status: "Ready",
-    diff: [{ field: "paused", from: "false", to: "true" }],
-    confirmedByMe: true,
-  },
-];
+export const PROPOSALS: Proposal[] = [];
 
 export const KEY_CHECKS = [
   "Key received",
