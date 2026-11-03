@@ -58,8 +58,9 @@ export function DealView({ id }: { id: string }) {
   const submitKey = (event: FormEvent) => {
     event.preventDefault();
     if (key.trim().length < 8) return;
+    const submittedKey = key.trim();
     setKey("");
-    app.submitSellerKey(deal.id);
+    app.submitSellerKey(deal.id, submittedKey);
   };
 
   const deposit = () => {

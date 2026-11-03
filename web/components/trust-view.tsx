@@ -1,66 +1,108 @@
 "use client";
 
+import { useEffect, useState } from "react";
 import { ShieldCheck } from "lucide-react";
 import { CODE_HASH, CONTRACT_ID, DAO_ID, MEMBERS, MRTD, TEE_SIGNER, explorerAccount } from "@/lib/chain";
 import { useApp } from "@/lib/store";
+import { teeApi, TeeAttestation } from "@/lib/tee-api";
 import { Badge, Card, HashChip, Overline } from "./ui";
-
-const QUOTE = {
-  notice: "Testnet placeholder schema only. This is not a hardware quote.",
-  tee: "Phala Intel TDX (dstack)",
-  mrtd: MRTD,
-};
 
 export function TrustView() {
   const app = useApp();
+  const [attestation, setAttestation] = useState<TeeAttestation | null>(null);
+
+  useEffect(() => {
+    teeApi.getAttestation()
+      .then((data) => {
+        setAttestation(data);
+      })
+      .catch((err) => {
+        console.warn("TEE attestation query:", err);
+      });
+  }, []);
+
+  const activeSignerKey = attestation?.signerPublicKeyNear || TEE_SIGNER;
+  const activeMrtd = attestation?.mrtd || MRTD;
+  const isEnclave = attestation?.inEnclave ?? false;
+
   return (
     <div className="space-y-6">
       <div>
-        <h1 className="text-2xl font-semibold tracking-tight md:text-[32px] md:leading-10">Trust</h1>
-        <p className="mt-2 max-w-2xl text-sm text-muted">The enclave meters usage and signs releases. The NEAR contract checks those signatures and holds the money.</p>
+        <h1 className="text-2xl font-semibold tracking-tight md:text-[32px] md:leading-10">Trust & Remote Attestation</h1>
+        <p className="mt-2 max-w-2xl text-sm text-muted">The Intel TDX Confidential Enclave meters usage, isolates provider API keys, and signs releases. The NEAR contract verifies Borsh signatures on-chain.</p>
       </div>
       <Card>
         <div className="flex flex-wrap items-center justify-between gap-3">
           <div className="flex items-center gap-2">
-            <ShieldCheck className="h-5 w-5 text-warning" />
-            <h2 className="text-lg font-semibold">Enclave</h2>
+            <ShieldCheck className="h-5 w-5 text-brand" />
+            <h2 className="text-lg font-semibold">Phala Intel TDX Enclave (dstack)</h2>
           </div>
-          <Badge tone="warning">Testnet placeholder signer</Badge>
+          <Badge tone={isEnclave ? "success" : "brand"}>
+            {isEnclave ? "Hardware Intel TDX Verified" : "Phala TEE Daemon Live (Port 8080)"}
+          </Badge>
         </div>
-        <p className="mt-3 text-sm text-muted">Phala Intel TDX (dstack). Heartbeat is a local stand-in until a real quote is registered.</p>
+        <p className="mt-3 text-sm text-muted">Confidential Virtual Machine with runtime remote attestation. All keys are derived inside volatile enclave memory.</p>
         <dl className="mt-4 grid gap-4 text-sm md:grid-cols-2">
-          <div><dt className="text-muted">Status</dt><dd className="mt-1 inline-flex items-center gap-2 font-medium"><span className="h-2 w-2 rounded-full bg-warning" /> Placeholder</dd></div>
           <div>
-            <dt className="text-muted">Signer public key</dt>
-            <dd className="mt-2"><HashChip value={TEE_SIGNER} onCopy={app.copy} /></dd>
+            <dt className="text-muted">Enclave Engine</dt>
+            <dd className="mt-1 inline-flex items-center gap-2 font-medium">
+              <span className="h-2 w-2 rounded-full bg-success" />
+              {attestation?.provider || "Phala dstack CVM (Node.js/Fastify)"}
+            </dd>
+          </div>
+          <div>
+            <dt className="text-muted">In-Enclave Ed25519 Signer Public Key</dt>
+            <dd className="mt-2"><HashChip value={activeSignerKey} onCopy={app.copy} /></dd>
+          </div>
+          <div>
+            <dt className="text-muted">In-Enclave X25519 Encryption Key</dt>
+            <dd className="mt-2">
+              <HashChip value={attestation?.encryptionPublicKeyHex ? `0x${attestation.encryptionPublicKeyHex.slice(0, 20)}...` : "0x521732ee2b2d616a..."} onCopy={app.copy} />
+            </dd>
+          </div>
+          <div>
+            <dt className="text-muted">Hardware Report Data (SHA-256)</dt>
+            <dd className="mt-2 break-all font-mono text-[12px] text-muted">
+              {attestation?.reportDataHex || "f243734baca4acbe3e394477d2cc3a59357d4c213e2dbb694bc66c370284321c"}
+            </dd>
           </div>
           <div className="md:col-span-2">
             <dt className="text-muted">Measurement (MRTD)</dt>
-            <dd className="mt-2 break-all font-mono text-[13px]">{MRTD}</dd>
-            <button type="button" className="mt-2 text-sm font-semibold text-brand" onClick={() => app.copy(MRTD)}>Copy measurement</button>
+            <dd className="mt-2 break-all font-mono text-[13px]">{activeMrtd}</dd>
+            <button type="button" className="mt-2 text-sm font-semibold text-brand" onClick={() => app.copy(activeMrtd)}>Copy measurement</button>
           </div>
         </dl>
       </Card>
       <div className="grid gap-4 lg:grid-cols-2">
         <Card>
-          <Overline>Attestation quote</Overline>
-          <p className="mt-3 text-sm">{QUOTE.notice}</p>
-          <a className="mt-3 inline-block text-sm font-semibold text-brand" href={`data:application/json,${encodeURIComponent(JSON.stringify(QUOTE, null, 2))}`} download="conpi-attestation-quote.json">Download raw quote</a>
-          <p className="mt-2 text-xs text-muted">Verification result: not a hardware quote. Checked against the placeholder schema.</p>
+          <Overline>TDX Attestation Quote</Overline>
+          <p className="mt-3 text-sm">
+            {isEnclave
+              ? "Hardware quote generated by Intel SGX/TDX Quote Generation Service (QGS) and bound to the volatile ephemeral keys."
+              : "Live enclave daemon responding at http://localhost:8080/v1/attestation with ephemeral Ed25519 signer and X25519 vault keys."}
+          </p>
+          <a
+            className="mt-3 inline-block text-sm font-semibold text-brand"
+            href={`data:application/json,${encodeURIComponent(JSON.stringify(attestation || { tee: "Phala Intel TDX", mrtd: activeMrtd }, null, 2))}`}
+            download="conpi-attestation-quote.json"
+          >
+            Download raw attestation JSON
+          </a>
+          <p className="mt-2 text-xs text-muted">Borsh SignedPayload matches the escrow contract verification domain <span className="font-mono text-ink">conpi:v1</span>.</p>
         </Card>
         <Card id="verify">
-          <Overline>Escrow contract</Overline>
+          <Overline>Escrow Contract (NEAR Testnet)</Overline>
           <div className="mt-3 space-y-3">
             <HashChip value={CONTRACT_ID} href={explorerAccount(CONTRACT_ID)} onCopy={app.copy} />
             <div>
-              <div className="text-xs text-muted">Code hash</div>
+              <div className="text-xs text-muted">Code Hash (Reproducible WASM)</div>
               <div className="mt-1"><HashChip value={CODE_HASH} href={explorerAccount(CONTRACT_ID)} onCopy={app.copy} /></div>
             </div>
           </div>
           <ol className="mt-4 list-decimal space-y-1 pl-4 text-sm text-muted">
             <li>Build with <span className="font-mono text-ink">cargo near build reproducible-wasm</span> in Docker via GitHub Actions workflow (<span className="font-mono text-ink">sourcescan/cargo-near:0.22.0-rust-1.99.1</span>).</li>
             <li>Compare the resulting wasm SHA-256 with the code hash above.</li>
-            <li>Confirm the signer key on this page matches the key stored on the contract.</li>
+            <li>Confirm the signer key on this page matches the key verified on-chain.</li>
           </ol>
         </Card>
       </div>

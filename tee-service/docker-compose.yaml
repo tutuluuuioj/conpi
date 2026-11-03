@@ -1,0 +1,22 @@
+version: "3.8"
+
+services:
+  conpi-tee:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: conpi-tee-service:latest
+    ports:
+      - "8080:8080"
+    volumes:
+      - /var/run/tappd.sock:/var/run/tappd.sock
+    environment:
+      - PORT=8080
+      - HOST=0.0.0.0
+      - CONTRACT_ID=dev-20261103062448-30583839049419.testnet
+      - DAO_ID=dev-20261103021740-59711933581376.testnet
+      - NEAR_NETWORK=testnet
+      - NEAR_NODE_URL=https://rpc.testnet.near.org
+      - DSTACK_SOCKET_PATH=/var/run/tappd.sock
+      - IS_ENCLAVE=true
+    restart: always
