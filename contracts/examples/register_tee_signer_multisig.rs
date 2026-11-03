@@ -35,7 +35,7 @@ struct ExecuteArgs {
 
 const ESCROW_ID: &str = "dev-20261103062448-30583839049419.testnet";
 const DSTACK_HARDWARE_SIGNER: &str = "ed25519:CLHhDLsLCCqFeTjz7g31NkfbtN1UqT2mJRmRZgcRPTj3";
-const HARDWARE_MEASUREMENT: &str = "mrtd:7fe60787222bd394cb516abca2435f22f035ab2cc9c0a4b4b3b148e46297f3d931a237b72f359052c6e657d8c1409173|compose:8cfb0010ba59280514396cd53b81edbcd58839e07702b326cf0b2ebfe0b8f2da";
+const HARDWARE_MEASUREMENT: &str = "mrtd:7fe60787222bd394cb516abca2435f22f035ab2cc9c0a4b4b3b148e46297f3d931a237b72f359052c6e657d8c1409173|compose:3b2df1746e75e7be40019af7995e73239adcdc3b3b1be82d02d663a009ad1979";
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
