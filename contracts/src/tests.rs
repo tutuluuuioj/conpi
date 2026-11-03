@@ -710,6 +710,17 @@ mod tests {
             result.is_err(),
             "Revoked TEE signer MUST be rejected on active deal operations!"
         );
+
+        // Verify signer is strictly recorded as revoked
+        let signer = contract.get_tee_signer(tee_pk).unwrap();
+        assert!(!signer.active, "Signer active flag must be false");
+        assert_eq!(signer.measurement, "tee_quote_mrtd");
+
+        // Verify deal remains active and safe from unauthorized stage release
+        let live_deal = contract.get_deal(deal_id).unwrap();
+        assert_eq!(live_deal.status, DealStatus::Active);
+        assert_eq!(live_deal.stage_reached, 0);
+        assert_eq!(live_deal.released_to_seller, 0);
     }
 
     // -------------------------------------------------------------------------
@@ -813,7 +824,10 @@ mod tests {
         testing_env!(context.build());
 
         let mut contract = ConpiEscrow::new(owner.clone(), None, None, None, None);
+        assert!(!contract.is_paused(), "Contract must initially not be paused");
+
         contract.set_paused(true);
+        assert!(contract.is_paused(), "Contract must be paused");
 
         testing_env!(context
             .predecessor_account_id(usdc_token.clone())
@@ -827,6 +841,11 @@ mod tests {
             }
             _ => panic!("Expected Value refund"),
         }
+
+        // Verify state is unaltered and no phantom pending payouts exist
+        assert_eq!(contract.get_pending_payout(buyer.clone(), Some(usdc_token.clone())).0, 0);
+        assert_eq!(contract.next_deal_id, 1);
+        assert!(contract.get_deal(1).is_none());
     }
 
     // -------------------------------------------------------------------------
@@ -1009,6 +1028,19 @@ mod tests {
             contract.accept_deal(deal_id, bad_hash);
         }));
         assert!(res.is_err(), "Wrong terms_hash must be rejected");
+
+        // Verify deal state is preserved after rejection
+        let deal = contract.get_deal(deal_id).unwrap();
+        assert!(!deal.counterparty_accepted, "Counterparty acceptance must remain false");
+        assert_eq!(deal.status, DealStatus::Created);
+
+        // Now call accept_deal with the genuine matching terms_hash -> must succeed
+        let good_hash = deal.terms_hash.unwrap();
+        contract.accept_deal(deal_id, good_hash);
+
+        let accepted_deal = contract.get_deal(deal_id).unwrap();
+        assert!(accepted_deal.counterparty_accepted, "Counterparty accepted must now be true");
+        assert_eq!(accepted_deal.status, DealStatus::Created);
     }
 
     // -------------------------------------------------------------------------
@@ -1080,11 +1112,18 @@ mod tests {
 
         let mut contract = ConpiEscrow::new(owner.clone(), None, None, None, None);
         assert_eq!(contract.get_state_version(), 1);
+        assert_eq!(contract.get_owner(), owner);
+        assert_eq!(contract.get_timelock_duration(), 172_800_000_000_000);
 
         let mock_code = b"new_wasm_binary_bytes".to_vec();
         let code_hash = near_sdk::env::sha256_array(&mock_code);
 
         let prop_id = contract.propose_admin_action(AdminAction::Upgrade { code_hash });
+        assert_eq!(prop_id, 1);
+
+        let staged = contract.get_staged_proposal(prop_id).expect("Proposal must be staged");
+        assert_eq!(staged.action, AdminAction::Upgrade { code_hash });
+        assert_eq!(staged.ready_at, 1_000_000_000_000 + 172_800_000_000_000);
 
         // Immediate apply must fail due to 48-hour timelock
         let fail_res = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
@@ -1092,10 +1131,15 @@ mod tests {
         }));
         assert!(fail_res.is_err(), "Upgrade before timelock elapses must fail");
 
-        // Advance time past timelock
+        // Code hash mismatch must also fail even after timelock
         testing_env!(context
             .block_timestamp(1_000_000_000_000 + 172_800_000_000_001)
             .build());
+        let bad_code = b"tampered_code".to_vec();
+        let bad_hash_res = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _ = contract.execute_admin_action(prop_id, Some(bad_code));
+        }));
+        assert!(bad_hash_res.is_err(), "Upgrade with mismatched code hash must fail");
 
         let _prom = contract.execute_admin_action(prop_id, Some(mock_code));
         assert!(contract.get_staged_proposal(prop_id).is_none());
@@ -1128,5 +1172,172 @@ mod tests {
             contract.propose_admin_action(AdminAction::UpdateConfig { config: bad_slash_config });
         }));
         assert!(res2.is_err(), "Zero min_slash_bps must be rejected");
+
+        // max_slash_bps > 10_000 must be rejected
+        let mut bad_max_slash = contract.get_config();
+        bad_max_slash.max_slash_bps = 10_001;
+        let res3 = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            contract.propose_admin_action(AdminAction::UpdateConfig { config: bad_max_slash });
+        }));
+        assert!(res3.is_err(), "max_slash_bps > 10_000 must be rejected");
+
+        // min_slash_bps > max_slash_bps must be rejected
+        let mut inverted_slash = contract.get_config();
+        inverted_slash.min_slash_bps = 5_000;
+        inverted_slash.max_slash_bps = 4_000;
+        let res4 = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            contract.propose_admin_action(AdminAction::UpdateConfig { config: inverted_slash });
+        }));
+        assert!(res4.is_err(), "min_slash_bps > max_slash_bps must be rejected");
+
+        // Valid updated config is accepted and staged with exact 48h delay
+        let mut valid_config = contract.get_config();
+        valid_config.min_slash_bps = 2_000;
+        valid_config.notice_period_duration = 172_800_000_000_000;
+        let prop_id = contract.propose_admin_action(AdminAction::UpdateConfig { config: valid_config.clone() });
+        let staged = contract.get_staged_proposal(prop_id).expect("Valid config proposal must be staged");
+        assert_eq!(staged.action, AdminAction::UpdateConfig { config: valid_config });
+        assert_eq!(staged.ready_at, 1_000_000_000_000 + 172_800_000_000_000);
+    }
+
+    // -------------------------------------------------------------------------
+    // 13. Enforce 48-Hour Minimum Timelock Duration
+    // -------------------------------------------------------------------------
+
+    #[test]
+    fn test_timelock_duration_enforces_48h_minimum() {
+        let owner: AccountId = "owner.testnet".parse().unwrap();
+        let context = get_context(owner.clone(), NearToken::from_yoctonear(0));
+        testing_env!(context.build());
+
+        // Sub-48h timelock values must be strictly rejected
+        let invalid_durations = [0u64, 1_000_000_000, 30_000_000_000, 172_799_999_999_999];
+        for dur in invalid_durations {
+            let res = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                ConpiEscrow::new(owner.clone(), None, None, None, Some(dur));
+            }));
+            assert!(
+                res.is_err(),
+                "Initialization with timelock {} ns (< 48h) must fail",
+                dur
+            );
+        }
+
+        // None defaults to 48 hours (172,800,000,000,000 ns)
+        let default_contract = ConpiEscrow::new(owner.clone(), None, None, None, None);
+        assert_eq!(
+            default_contract.get_timelock_duration(),
+            172_800_000_000_000,
+            "Default timelock must be exactly 48h"
+        );
+
+        // Exactly 48 hours is accepted
+        let exact_48h = ConpiEscrow::new(owner.clone(), None, None, None, Some(172_800_000_000_000));
+        assert_eq!(
+            exact_48h.get_timelock_duration(),
+            172_800_000_000_000,
+            "48h timelock must be accepted"
+        );
+
+        // > 48 hours (e.g. 72 hours) is accepted
+        let custom_72h = ConpiEscrow::new(owner.clone(), None, None, None, Some(259_200_000_000_000));
+        assert_eq!(
+            custom_72h.get_timelock_duration(),
+            259_200_000_000_000,
+            "72h timelock must be accepted"
+        );
+    }
+
+    // -------------------------------------------------------------------------
+    // 14. Multisig Owner Governance Cycle with UpdateConfig (Owner Retained)
+    // -------------------------------------------------------------------------
+
+    #[test]
+    fn test_multisig_governance_cycle_with_update_config_retains_owner() {
+        let multisig_dao: AccountId = "multisig-dao.testnet".parse().unwrap();
+        let rogue: AccountId = "rogue.testnet".parse().unwrap();
+        let mut context = get_context(multisig_dao.clone(), NearToken::from_yoctonear(0));
+        testing_env!(context.build());
+
+        let mut contract = ConpiEscrow::new(multisig_dao.clone(), None, None, None, None);
+        assert_eq!(contract.get_owner(), multisig_dao);
+
+        // Multisig proposes UpdateConfig
+        let mut new_config = contract.get_config();
+        new_config.notice_period_duration = 172_800_000_000_000; // 48h notice
+        new_config.min_slash_bps = 2_000;                       // 20%
+        let prop_id = contract.propose_admin_action(AdminAction::UpdateConfig {
+            config: new_config.clone(),
+        });
+        assert_eq!(prop_id, 1);
+
+        // Immediate execution before 48h timelock fails
+        let early_res = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _ = contract.execute_admin_action(prop_id, None);
+        }));
+        assert!(early_res.is_err(), "Execution before 48h timelock must fail");
+
+        // Execution by non-owner fails
+        testing_env!(context.predecessor_account_id(rogue).build());
+        let rogue_res = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _ = contract.execute_admin_action(prop_id, None);
+        }));
+        assert!(rogue_res.is_err(), "Execution by non-multisig must fail");
+
+        // Advance timestamp past 48h timelock
+        testing_env!(context
+            .predecessor_account_id(multisig_dao.clone())
+            .block_timestamp(1_000_000_000_000 + 172_800_000_000_001)
+            .build());
+
+        // Execute UpdateConfig proposal
+        let exec_res = contract.execute_admin_action(prop_id, None);
+        match exec_res {
+            near_sdk::PromiseOrValue::Value(success) => assert!(success),
+            _ => panic!("Expected Value(true) for UpdateConfig"),
+        }
+
+        // CRITICAL: Multisig MUST remain the escrow owner!
+        assert_eq!(
+            contract.get_owner(),
+            multisig_dao,
+            "Escrow owner MUST remain the Multisig DAO contract"
+        );
+
+        // Config was updated
+        assert_eq!(contract.get_config(), new_config);
+        assert_eq!(contract.get_config().min_slash_bps, 2_000);
+        assert_eq!(contract.get_config().notice_period_duration, 172_800_000_000_000);
+
+        // Proposal consumed
+        assert!(contract.get_staged_proposal(prop_id).is_none());
+    }
+
+    // -------------------------------------------------------------------------
+    // 15. Versioned State Migration with ConpiEscrowV1
+    // -------------------------------------------------------------------------
+
+    #[test]
+    fn test_versioned_state_migration_with_conpi_escrow_v1() {
+        let owner: AccountId = "dao.testnet".parse().unwrap();
+        let context = get_context(owner.clone(), NearToken::from_yoctonear(0));
+        testing_env!(context.build());
+
+        let contract = ConpiEscrow::new(owner.clone(), None, None, None, None);
+        assert_eq!(contract.get_state_version(), 1);
+
+        // Write contract state to simulate pre-upgrade on-chain state
+        near_sdk::env::state_write(&contract);
+
+        // Execute migration reading versioned ConpiEscrowV1
+        let migrated = ConpiEscrow::migrate();
+
+        // State version incremented to 2
+        assert_eq!(migrated.get_state_version(), 2);
+        // Owner and timelock duration preserved perfectly
+        assert_eq!(migrated.get_owner(), owner);
+        assert_eq!(migrated.get_timelock_duration(), 172_800_000_000_000);
+        assert!(!migrated.is_paused());
+        assert_eq!(migrated.get_chain_id(), "testnet");
     }
 }

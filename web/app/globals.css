@@ -3,23 +3,172 @@
 @tailwind utilities;
 
 :root {
-  --foreground-rgb: 255, 255, 255;
-  --background-start-rgb: 10, 15, 29;
-  --background-end-rgb: 3, 7, 18;
+  --bg: 246 247 249;
+  --surface: 255 255 255;
+  --surface-2: 240 242 246;
+  --line: 226 229 236;
+  --ink: 18 20 26;
+  --muted: 92 101 120;
+  --brand: 76 63 224;
+  --brand-ink: 255 255 255;
+  --mint: 14 122 74;
+  --violet: 76 63 224;
+  --orange: 168 88 12;
+  --blue: 24 98 176;
+  --danger: 176 42 48;
+  --warning: 138 96 12;
+  --amber: 154 102 14;
+  --shadow-1: 0 1px 2px rgb(16 18 27 / 0.06);
+  --shadow-2: 0 8px 24px rgb(16 18 27 / 0.1);
+  --shadow-3: 0 24px 48px rgb(16 18 27 / 0.16);
+  --shadow-focus: 0 0 0 3px rgb(76 63 224 / 0.35);
+  color-scheme: light;
+}
+
+.dark {
+  --bg: 11 13 18;
+  --surface: 19 22 29;
+  --surface-2: 27 31 41;
+  --line: 46 54 70;
+  --ink: 243 245 248;
+  --muted: 158 166 184;
+  --brand: 148 136 255;
+  --brand-ink: 11 13 18;
+  --mint: 61 214 146;
+  --violet: 176 166 255;
+  --orange: 240 164 82;
+  --blue: 132 184 255;
+  --danger: 240 120 128;
+  --warning: 232 186 82;
+  --amber: 232 172 64;
+  --shadow-1: 0 0 0 0 transparent;
+  --shadow-2: 0 10px 28px rgb(0 0 0 / 0.38);
+  --shadow-3: 0 24px 56px rgb(0 0 0 / 0.5);
+  --shadow-focus: 0 0 0 3px rgb(148 136 255 / 0.45);
+  color-scheme: dark;
+}
+
+html,
+body {
+  background: rgb(var(--bg));
+  color: rgb(var(--ink));
+  min-height: 100%;
 }
 
 body {
-  color: rgb(var(--foreground-rgb));
-  background: linear-gradient(
-      to bottom,
-      rgb(var(--background-start-rgb)),
-      rgb(var(--background-end-rgb))
-    );
-  min-height: 100vh;
-  font-feature-settings: "rlig" 1, "calt" 1;
+  font-feature-settings: "ss01" 1, "cv11" 1;
+  text-rendering: optimizeLegibility;
 }
 
-input, select, textarea {
-  background-color: #111827;
-  color: #f9fafb;
+::selection {
+  background: rgb(var(--brand) / 0.28);
+}
+
+.focus-ring:focus-visible {
+  outline: none;
+  box-shadow: var(--shadow-focus);
+}
+
+.tabular {
+  font-variant-numeric: tabular-nums;
+}
+
+.pattern-slash {
+  background-image: repeating-linear-gradient(
+    -45deg,
+    rgb(var(--orange)) 0 3px,
+    rgb(var(--orange) / 0.45) 3px 6px
+  );
+}
+
+.pattern-refund {
+  background-color: rgb(var(--blue) / 0.35);
+  background-image: radial-gradient(rgb(var(--blue)) 1.1px, transparent 1.2px);
+  background-size: 6px 6px;
+}
+
+.skeleton {
+  background: linear-gradient(
+    90deg,
+    rgb(var(--surface-2)) 20%,
+    rgb(var(--line) / 0.9) 40%,
+    rgb(var(--surface-2)) 60%
+  );
+  background-size: 200% 100%;
+  animation: shimmer 1.4s ease infinite;
+}
+
+@keyframes shimmer {
+  0% { background-position: 100% 0; }
+  100% { background-position: -100% 0; }
+}
+
+@keyframes pulse-dot {
+  0%, 100% { transform: scale(1); opacity: 1; }
+  50% { transform: scale(0.72); opacity: 0.55; }
+}
+
+.pulse-dot {
+  animation: pulse-dot 1.6s ease-in-out infinite;
+}
+
+@keyframes tick-glow {
+  0% { box-shadow: 0 0 0 0 rgb(var(--mint) / 0.7); }
+  100% { box-shadow: 0 0 0 8px rgb(var(--mint) / 0); }
+}
+
+.tick-glow {
+  animation: tick-glow 700ms ease-out 1;
+}
+
+.range-thumb {
+  pointer-events: none;
+  position: absolute;
+  inset: 0;
+  width: 100%;
+  margin: 0;
+  background: transparent;
+  appearance: none;
+}
+
+.range-thumb::-webkit-slider-thumb {
+  pointer-events: auto;
+  appearance: none;
+  height: 16px;
+  width: 16px;
+  border-radius: 999px;
+  background: rgb(var(--brand));
+  border: 2px solid rgb(var(--surface));
+  box-shadow: 0 0 0 1px rgb(var(--line));
+  cursor: pointer;
+}
+
+.range-thumb::-moz-range-thumb {
+  pointer-events: auto;
+  height: 16px;
+  width: 16px;
+  border-radius: 999px;
+  background: rgb(var(--brand));
+  border: 2px solid rgb(var(--surface));
+  cursor: pointer;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  *,
+  *::before,
+  *::after {
+    animation-duration: 0.01ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 0.01ms !important;
+    scroll-behavior: auto !important;
+  }
+}
+
+@media print {
+  .no-print { display: none !important; }
+  body { background: white !important; }
+  .receipt {
+    box-shadow: none !important;
+    border: none !important;
+  }
 }

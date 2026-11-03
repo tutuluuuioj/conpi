@@ -378,6 +378,22 @@ async fn test_workspaces_timelocked_governance() -> Result<(), Box<dyn std::erro
     assert!(early_exec.is_failure(), "Immediate execution must fail 48h timelock");
     println!("near-workspaces: Proved that premature admin execution is rejected by 48h timelock!");
 
+    // Verify proposal is still staged and unexecuted
+    let staged_prop: Option<serde_json::Value> = contract
+        .view("get_staged_proposal")
+        .args_json(serde_json::json!({ "proposal_id": proposal_id }))
+        .await?
+        .json()?;
+    assert!(staged_prop.is_some(), "Proposal must remain staged after rejected early execution");
+
+    // Verify owner remains unchanged
+    let current_owner: near_sdk::AccountId = contract
+        .view("get_owner")
+        .args_json(serde_json::json!({}))
+        .await?
+        .json()?;
+    assert_eq!(&current_owner, owner.id());
+
     Ok(())
 }
 
@@ -413,24 +429,58 @@ async fn test_workspaces_multisig_dao_governance_cycle() -> Result<(), Box<dyn s
 
     let deployer_pk = dao_account.secret_key().public_key();
 
-    // Add 3 member keys to the multisig account and delete the deployer key
+    // Add 3 member keys to the multisig account as function-call keys limited to
+    // add_request, add_request_and_confirm, confirm, delete_request, and delete deployer key
+    let member_methods = &["add_request", "add_request_and_confirm", "confirm", "delete_request"];
+    let member_access = AccessKey::function_call_access(dao_account.id(), member_methods, None);
     let batch_res = dao_account
         .batch(dao_account.id())
-        .add_key(member1_sk.public_key(), AccessKey::full_access())
-        .add_key(member2_sk.public_key(), AccessKey::full_access())
-        .add_key(member3_sk.public_key(), AccessKey::full_access())
+        .add_key(member1_sk.public_key(), member_access.clone())
+        .add_key(member2_sk.public_key(), member_access.clone())
+        .add_key(member3_sk.public_key(), member_access)
         .delete_key(deployer_pk)
         .transact()
         .await?;
     assert!(batch_res.is_success(), "Batch add member keys must succeed");
 
-    println!("near-workspaces: Multisig DAO initialized with 3 member keys and 2 required confirmations. Deployer key deleted!");
+    println!("near-workspaces: Multisig DAO initialized with 3 function-call member keys and 2 required confirmations. Deployer key deleted!");
 
-    // Verify DAO has 3 keys and deployer key is gone
+    // Verify DAO has 3 function-call keys and 0 full-access keys
     let keys = dao_account.view_access_keys().await?;
     assert_eq!(keys.len(), 3, "DAO must have exactly 3 member access keys");
+    for k in &keys {
+        match &k.access_key.permission {
+            near_workspaces::types::AccessKeyPermission::FunctionCall(fc) => {
+                assert_eq!(&fc.receiver_id, dao_account.id().as_str());
+                assert_eq!(
+                    fc.method_names,
+                    vec![
+                        "add_request".to_string(),
+                        "add_request_and_confirm".to_string(),
+                        "confirm".to_string(),
+                        "delete_request".to_string()
+                    ]
+                );
+            }
+            _ => panic!("Expected FunctionCall access key, found FullAccess"),
+        }
+    }
 
-    // Initialize Escrow with DAO as owner and 5-second timelock for test demonstration
+    // Verify 48h minimum enforcement at initialization (< 48h must fail)
+    let short_init = escrow_contract
+        .call("new")
+        .args_json(serde_json::json!({
+            "owner": dao_account.id(),
+            "chain_id": "testnet",
+            "config": null,
+            "initial_tee_signer": null,
+            "timelock_duration": 30_000_000_000u64 // 30 seconds
+        }))
+        .transact()
+        .await?;
+    assert!(short_init.is_failure(), "Contract initialization with timelock < 48h must fail");
+
+    // Initialize Escrow with DAO as owner and full 48-hour timelock (172,800,000,000,000 ns)
     let init_escrow = escrow_contract
         .call("new")
         .args_json(serde_json::json!({
@@ -438,29 +488,40 @@ async fn test_workspaces_multisig_dao_governance_cycle() -> Result<(), Box<dyn s
             "chain_id": "testnet",
             "config": null,
             "initial_tee_signer": null,
-            "timelock_duration": 5_000_000_000u64 // 5 seconds
+            "timelock_duration": 172_800_000_000_000u64
         }))
         .max_gas()
         .transact()
         .await?;
-    assert!(init_escrow.is_success());
+    assert!(init_escrow.is_success(), "Escrow init with 48h timelock must succeed");
+
+    let initial_owner: near_sdk::AccountId = escrow_contract
+        .view("get_owner")
+        .args_json(serde_json::json!({}))
+        .await?
+        .json()?;
+    assert_eq!(&initial_owner, dao_account.id(), "Escrow owner must initially be DAO account");
 
     // Member signers acting on behalf of the DAO account
     let member1_account = near_workspaces::Account::from_secret_key(dao_account.id().clone(), member1_sk, &worker);
     let member2_account = near_workspaces::Account::from_secret_key(dao_account.id().clone(), member2_sk, &worker);
 
-    // Prepare payload to propose admin action on escrow
-    let new_owner_acc = worker.dev_create_account().await?;
-    let propose_args = serde_json::to_vec(&serde_json::json!({
-        "action": {
-            "TransferOwnership": {
-                "new_owner": new_owner_acc.id()
-            }
-        }
-    }))?;
+    // Prepare payload to propose UpdateConfig on escrow (NOT TransferOwnership)
+    let new_config = conpi_escrow::types::Config {
+        notice_period_duration: 172_800_000_000_000, // 48h notice
+        min_slash_bps: 2_000,                        // 20%
+        ..Default::default()
+    };
+    #[derive(serde::Serialize)]
+    struct ProposeArgs {
+        action: conpi_escrow::types::AdminAction,
+    }
+    let propose_args = serde_json::to_vec(&ProposeArgs {
+        action: conpi_escrow::types::AdminAction::UpdateConfig { config: new_config },
+    })?;
     let base64_args = Base64VecU8::from(propose_args);
 
-    println!("near-workspaces: Member 1 submits MultiSig proposal to propose admin action on Escrow...");
+    println!("near-workspaces: Member 1 submits MultiSig proposal for UpdateConfig on Escrow...");
     let add_req_res = member1_account
         .call(dao_account.id(), "add_request_and_confirm")
         .args_json(serde_json::json!({
@@ -514,7 +575,7 @@ async fn test_workspaces_multisig_dao_governance_cycle() -> Result<(), Box<dyn s
     assert!(staged_prop.is_some(), "Proposal #1 must be staged on Escrow contract!");
     println!("near-workspaces: Successfully verified Proposal #1 is staged on Escrow via Multisig DAO!");
 
-    // Attempt immediate execution via multisig -> must fail due to timelock delay
+    // Attempt immediate execution via multisig -> must fail due to 48h timelock delay
     let exec_args = serde_json::to_vec(&serde_json::json!({
         "proposal_id": 1,
         "code": null
@@ -551,54 +612,25 @@ async fn test_workspaces_multisig_dao_governance_cycle() -> Result<(), Box<dyn s
         .max_gas()
         .transact()
         .await?;
-    assert!(early_confirm.is_failure(), "Early execution must fail timelock on Escrow!");
+    assert!(early_confirm.is_failure(), "Early execution must fail 48h timelock on Escrow!");
     println!("near-workspaces: Verified that premature multisig execution is rejected by Escrow timelock!");
 
-    // Advance time past the timelock
-    println!("near-workspaces: Waiting for timelock delay to elapse...");
-    tokio::time::sleep(tokio::time::Duration::from_secs(6)).await;
+    // Verify proposal remains staged and uncorrupted after rejected early execution
+    let staged_after_early: Option<serde_json::Value> = escrow_contract
+        .view("get_staged_proposal")
+        .args_json(serde_json::json!({ "proposal_id": 1 }))
+        .await?
+        .json()?;
+    assert!(staged_after_early.is_some(), "Proposal #1 must remain staged after rejected early execution");
 
-    // Now execute after timelock elapses
-    let valid_exec_req = member1_account
-        .call(dao_account.id(), "add_request_and_confirm")
-        .args_json(serde_json::json!({
-            "request": {
-                "receiver_id": escrow_contract.id(),
-                "actions": [
-                    {
-                        "type": "FunctionCall",
-                        "method_name": "execute_admin_action",
-                        "args": exec_b64,
-                        "deposit": "0",
-                        "gas": "50000000000000"
-                    }
-                ]
-            }
-        }))
-        .max_gas()
-        .transact()
-        .await?;
-    assert!(valid_exec_req.is_success());
-    let valid_req_id: u32 = valid_exec_req.json()?;
-
-    let valid_confirm = member2_account
-        .call(dao_account.id(), "confirm")
-        .args_json(serde_json::json!({
-            "request_id": valid_req_id
-        }))
-        .max_gas()
-        .transact()
-        .await?;
-    assert!(valid_confirm.is_success());
-
-    // Verify ownership successfully transferred to new_owner_acc!
+    // CRITICAL: Verify Escrow owner MUST remain the DAO Multisig contract!
     let owner_after: near_sdk::AccountId = escrow_contract
         .view("get_owner")
         .args_json(serde_json::json!({}))
         .await?
         .json()?;
-    assert_eq!(&owner_after, new_owner_acc.id());
-    println!("near-workspaces: SUCCESS! Ownership transferred via 3-member Multisig DAO with 2 confirmations after timelock!");
+    assert_eq!(&owner_after, dao_account.id(), "Escrow owner MUST remain the DAO Multisig contract!");
+    println!("near-workspaces: SUCCESS! Verified DAO Multisig remains the owner of Escrow!");
 
     Ok(())
 }

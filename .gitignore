@@ -24,6 +24,8 @@ yarn-error.log*
 *.seed
 *secret*
 *private*
+*key*.json
+*keys*.json
 credentials/
 tee/credentials/
 **/credentials/

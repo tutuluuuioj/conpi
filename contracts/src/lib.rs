@@ -43,6 +43,30 @@ pub struct ConpiEscrow {
     pub state_version: u32,
 }
 
+/// Versioned representation of old contract state (V1) for safe schema migrations.
+#[near(serializers = [borsh])]
+pub struct ConpiEscrowV1 {
+    pub owner: AccountId,
+    pub chain_id: String,
+    pub paused: bool,
+    pub tee_signers: UnorderedMap<PublicKey, TeeSigner>,
+    pub deals: LookupMap<DealId, Deal>,
+    pub deal_creators: LookupMap<DealId, AccountId>,
+    pub pending_payouts: LookupMap<(AccountId, Option<AccountId>), Balance>,
+    pub next_deal_id: u64,
+    pub config: Config,
+    pub next_proposal_id: u64,
+    pub staged_proposals: UnorderedMap<u64, StagedAction>,
+    pub timelock_duration: Duration,
+    pub state_version: u32,
+}
+
+/// Versioned wrapper for historical contract state snapshots during migration.
+#[near(serializers = [borsh])]
+pub enum VersionedEscrowOldState {
+    V1(ConpiEscrowV1),
+}
+
 #[near]
 impl ConpiEscrow {
     #[init]
@@ -54,6 +78,11 @@ impl ConpiEscrow {
         timelock_duration: Option<u64>,
     ) -> Self {
         require!(!env::state_exists(), "Already initialized");
+        let timelock = timelock_duration.unwrap_or(172_800_000_000_000);
+        require!(
+            timelock >= 172_800_000_000_000,
+            "Timelock duration must be at least 48 hours (172,800,000,000,000 ns)"
+        );
         let mut contract = Self {
             owner,
             chain_id: chain_id.unwrap_or_else(|| "testnet".to_string()),
@@ -66,7 +95,7 @@ impl ConpiEscrow {
             config: config.unwrap_or_default(),
             next_proposal_id: 1,
             staged_proposals: UnorderedMap::new(b"s"),
-            timelock_duration: timelock_duration.unwrap_or(172_800_000_000_000), // 48-hour default timelock
+            timelock_duration: timelock,
             state_version: 1,
         };
 
@@ -173,6 +202,14 @@ impl ConpiEscrow {
             "48-hour timelock delay has not elapsed yet"
         );
 
+        if let AdminAction::Upgrade { code_hash } = &staged.action {
+            let code_bytes = code.as_ref().expect("WASM code bytes required for contract upgrade");
+            require!(
+                &env::sha256_array(code_bytes) == code_hash,
+                "Code hash mismatch with staged upgrade proposal"
+            );
+        }
+
         self.staged_proposals.remove(&proposal_id);
 
         match staged.action {
@@ -224,13 +261,8 @@ impl ConpiEscrow {
                 });
                 PromiseOrValue::Value(true)
             }
-            AdminAction::Upgrade { code_hash } => {
+            AdminAction::Upgrade { .. } => {
                 let code_bytes = code.expect("WASM code bytes required for contract upgrade");
-                require!(
-                    env::sha256_array(&code_bytes) == code_hash,
-                    "Code hash mismatch with staged upgrade proposal"
-                );
-
                 emit_event(ConpiEvent::GovernanceActionExecuted {
                     proposal_id,
                     action_type: "UPGRADE",
@@ -268,15 +300,31 @@ impl ConpiEscrow {
     }
 
     /// Migration entry point executed immediately after contract code deployment.
+    /// Deserializes a versioned old-state struct (ConpiEscrowV1) rather than the current struct,
+    /// enabling clean schema evolution across contract upgrades.
     #[private]
     #[init(ignore_state)]
     pub fn migrate() -> Self {
-        let prev: ConpiEscrow = env::state_read().expect("Old contract state not found");
-        require!(prev.state_version >= 1, "Unsupported contract state version for migration");
+        let old: ConpiEscrowV1 = env::state_read().expect("Old contract state not found");
+        require!(
+            old.state_version >= 1,
+            "Unsupported contract state version for migration"
+        );
         emit_event(ConpiEvent::ContractMigrated);
         Self {
-            state_version: prev.state_version + 1,
-            ..prev
+            owner: old.owner,
+            chain_id: old.chain_id,
+            paused: old.paused,
+            tee_signers: old.tee_signers,
+            deals: old.deals,
+            deal_creators: old.deal_creators,
+            pending_payouts: old.pending_payouts,
+            next_deal_id: old.next_deal_id,
+            config: old.config,
+            next_proposal_id: old.next_proposal_id,
+            staged_proposals: old.staged_proposals,
+            timelock_duration: old.timelock_duration,
+            state_version: old.state_version + 1,
         }
     }
 

@@ -2,12 +2,14 @@
 
 > **Platform:** NEAR Protocol Escrow Contract + Intel TDX Confidential VM (TEE)  
 > **Environment:** NEAR Testnet + Phala Network Intel TDX CVM  
-> **Deployed Testnet Contract:** [`dev-20261103013756-41402993500721.testnet`](https://testnet.nearblocks.io/address/dev-20261103013756-41402993500721.testnet)  
-> **DAO Multisig Owner:** [`dev-20261103013808-51314062425228.testnet`](https://testnet.nearblocks.io/address/dev-20261103013808-51314062425228.testnet) (Real Multisig Contract, 3 Members, 2-of-3 Quorum)  
-> **Escrow Access Keys:** `0` (Fully Autonomous Escrow Vault)  
-> **Reproducible Code Hash:** `7SgwD62yxEfoMwQ3WGvHFyh63u3JCAxb9yYaELt9qX7b` (Matches on-chain code_hash byte-for-byte)  
-> **WASM Binary:** [`contracts/res/conpi_escrow.wasm`](contracts/res/conpi_escrow.wasm) (SHA-256: `5fbacbc774f53fed482df7238fa100b5136ee640b3836f03fe597c4cc77bf0d6`)  
-> **Pinned Toolchain:** [`rust-toolchain.toml`](rust-toolchain.toml) (`channel = "stable"`, `wasm32-unknown-unknown`)  
+> **Deployed Testnet Contract:** [`dev-20261103021728-21839689153509.testnet`](https://testnet.nearblocks.io/address/dev-20261103021728-21839689153509.testnet)  
+> **DAO Multisig Owner:** [`dev-20261103021740-59711933581376.testnet`](https://testnet.nearblocks.io/address/dev-20261103021740-59711933581376.testnet) (Real Multisig Contract, 3 Members, 2-of-3 Quorum)  
+> **Escrow Access Keys:** `0` (Autonomous Escrow Vault, all keys deleted)  
+> **Multisig Access Keys:** 3 Function-Call Access Keys limited to `["add_request", "add_request_and_confirm", "confirm", "delete_request"]` (Deployer Full-Access Key Deleted)  
+> **Timelock Delay:** 48 Hours minimum (`172_800_000_000_000` ns enforced in contract constructor)  
+> **Reproducible Code Hash:** `E5YED19GaPXvpc8kiVn5kCXB21eWMA5SpCBDn7iV7nG` (Matches on-chain code_hash byte-for-byte)  
+> **WASM Binary:** [`contracts/res/conpi_escrow.wasm`](contracts/res/conpi_escrow.wasm) (SHA-256: `0359ae9ef66c6d6418f452ef592eb4ddd86ab2d6ff117e2fb0284c76f6c25209`)  
+> **Pinned Toolchain:** [`rust-toolchain.toml`](rust-toolchain.toml) (`channel = "1.99.1"`, `wasm32-unknown-unknown`)  
 > **Registered TEE Signer Pubkey:** `[Testnet Placeholder]` `ed25519:Hq4DqffDiM6pHXzwRXzLrjbPGUKkM2WMkpTZB13dZh8G`  
 > **Registered Measurement:** `[Testnet Placeholder MRTD]` `c7b60e6e7655074d2e772e737c385b08fb8e15d8628bb9fb3d0ff08b98263ef26e5a40733568c07f45778a4f91ef2c01`  
 > **Phase 2 TEE Specification:** [tee/attestation/README.md](tee/attestation/README.md)  
@@ -104,12 +106,12 @@ confi/
 │   │   ├── crypto.rs   # Ed25519 signature checks, Borsh canonicalizer, anti-replay
 │   │   ├── settlement.rs # Staged release math, pro-rata default & slashing
 │   │   ├── events.rs   # NEP-297 event standards for NEAR indexers
-│   │   └── tests.rs    # Unit & integration test suite (16 comprehensive tests)
+│   │   └── tests.rs    # Unit & integration test suite (19 comprehensive tests)
 │   └── tests/
 │       └── workspaces_tests.rs # near-workspaces sandbox & on-chain multisig simulation (4 tests)
-├── web/                # Parallel Next.js 14 Web Application
-│   ├── app/            # App router, Marketplace, Negotiation Chat, Live Meter
-│   └── components/     # UI components & wallet selector
+├── web/                # Next.js 14 application
+│   ├── app/            # Market, deals, meter, trust, governance, claims
+│   └── components/     # Shell, deal flow, and shared UI
 ├── tee-service/        # Phala Network Intel TDX CVM Service (Phase 2)
 └── shared/             # Shared TypeScript & Rust schema definitions
 ```
@@ -122,15 +124,15 @@ confi/
 ```bash
 cd contracts
 
-# Run all unit & math tests (16 tests)
+# Run all unit & math tests (19 tests)
 cargo test
 
 # Run near-workspaces integration tests (4 tests: multisig DAO, timelocked governance, pull-claim, lifecycle)
 cargo test --test workspaces_tests -- --nocapture
 
 # Compile reproducible WASM binary with embedded ABI
-cargo near build non-reproducible-wasm --locked
-# Output: target/near/conpi_escrow.wasm (295.7 KB, Hash: 7SgwD62yxEfoMwQ3WGvHFyh63u3JCAxb9yYaELt9qX7b)
+cargo near build reproducible-wasm --locked
+# Output: target/near/conpi_escrow.wasm (297.1 KB, Hash: E5YED19GaPXvpc8kiVn5kCXB21eWMA5SpCBDn7iV7nG)
 ```
 
 ### Web Application:
