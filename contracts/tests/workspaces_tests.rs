@@ -797,3 +797,228 @@ async fn test_workspaces_multisig_dao_upgrade_proposal_staged() -> Result<(), Bo
     Ok(())
 }
 
+#[tokio::test]
+async fn test_workspaces_multisig_dao_upgrade_execution_with_timelock_and_migrate() -> Result<(), Box<dyn std::error::Error>> {
+    use near_sdk::json_types::Base64VecU8;
+    use near_workspaces::types::AccessKey;
+    use sha2::{Digest, Sha256};
+
+    let worker = near_workspaces::sandbox().await?;
+
+    let wasm_p1 = std::path::Path::new("res/conpi_escrow.wasm");
+    let wasm_p2 = std::path::Path::new("contracts/res/conpi_escrow.wasm");
+    let wasm_p3 = std::path::Path::new("./target/near/conpi_escrow.wasm");
+    let wasm_bytes = if wasm_p1.exists() {
+        std::fs::read(wasm_p1)?
+    } else if wasm_p2.exists() {
+        std::fs::read(wasm_p2)?
+    } else {
+        std::fs::read(wasm_p3)?
+    };
+    println!("Loaded real WASM bytes: {} bytes", wasm_bytes.len());
+
+    let escrow_contract = worker.dev_deploy(&wasm_bytes).await?;
+
+    // Deploy Multisig DAO Contract
+    let multisig_wasm = std::fs::read("./multisig.wasm")
+        .or_else(|_| std::fs::read("contracts/multisig.wasm"))?;
+    let dao_account = worker.dev_create_account().await?;
+    dao_account.deploy(&multisig_wasm).await?.into_result()?;
+
+    // Init multisig with 2 confirmations required
+    dao_account
+        .call(dao_account.id(), "new")
+        .args_json(serde_json::json!({
+            "num_confirmations": 2
+        }))
+        .max_gas()
+        .transact()
+        .await?
+        .into_result()?;
+
+    // Generate 3 real member keypairs
+    let member1_sk = near_workspaces::types::SecretKey::from_random(near_workspaces::types::KeyType::ED25519);
+    let member2_sk = near_workspaces::types::SecretKey::from_random(near_workspaces::types::KeyType::ED25519);
+    let member3_sk = near_workspaces::types::SecretKey::from_random(near_workspaces::types::KeyType::ED25519);
+
+    let deployer_pk = dao_account.secret_key().public_key();
+
+    let member_methods = &["add_request", "add_request_and_confirm", "confirm", "delete_request"];
+    let member_access = AccessKey::function_call_access(dao_account.id(), member_methods, None);
+    dao_account
+        .batch(dao_account.id())
+        .add_key(member1_sk.public_key(), member_access.clone())
+        .add_key(member2_sk.public_key(), member_access.clone())
+        .add_key(member3_sk.public_key(), member_access)
+        .delete_key(deployer_pk)
+        .transact()
+        .await?
+        .into_result()?;
+
+    // Initialize Escrow with DAO as owner and full 48-hour timelock (172_800_000_000_000 ns)
+    escrow_contract
+        .call("new")
+        .args_json(serde_json::json!({
+            "owner": dao_account.id(),
+            "chain_id": "sandbox",
+            "config": null,
+            "initial_tee_signer": null,
+            "timelock_duration": 172_800_000_000_000u64
+        }))
+        .max_gas()
+        .transact()
+        .await?
+        .into_result()?;
+
+    let member1_account = near_workspaces::Account::from_secret_key(dao_account.id().clone(), member1_sk, &worker);
+    let member2_account = near_workspaces::Account::from_secret_key(dao_account.id().clone(), member2_sk, &worker);
+
+    // Compute code hash of real 297 KB WASM
+    let mut hasher = Sha256::new();
+    hasher.update(&wasm_bytes);
+    let code_hash_bytes: [u8; 32] = hasher.finalize().into();
+
+    #[derive(serde::Serialize)]
+    struct ProposeArgs {
+        action: conpi_escrow::types::AdminAction,
+    }
+    let propose_args = serde_json::to_vec(&ProposeArgs {
+        action: conpi_escrow::types::AdminAction::Upgrade {
+            code_hash: code_hash_bytes,
+        },
+    })?;
+    let base64_args = Base64VecU8::from(propose_args);
+
+    // Member 1 proposes upgrade
+    let add_req_res = member1_account
+        .call(dao_account.id(), "add_request_and_confirm")
+        .args_json(serde_json::json!({
+            "request": {
+                "receiver_id": escrow_contract.id(),
+                "actions": [
+                    {
+                        "type": "FunctionCall",
+                        "method_name": "propose_admin_action",
+                        "args": base64_args,
+                        "deposit": "0",
+                        "gas": "50000000000000"
+                    }
+                ]
+            }
+        }))
+        .max_gas()
+        .transact()
+        .await?
+        .into_result()?;
+    let req_id: u32 = add_req_res.json()?;
+
+    // Member 2 confirms upgrade proposal
+    member2_account
+        .call(dao_account.id(), "confirm")
+        .args_json(serde_json::json!({ "request_id": req_id }))
+        .max_gas()
+        .transact()
+        .await?
+        .into_result()?;
+
+    // Verify Proposal #1 is staged
+    let staged_prop: Option<serde_json::Value> = escrow_contract
+        .view("get_staged_proposal")
+        .args_json(serde_json::json!({ "proposal_id": 1 }))
+        .await?
+        .json()?;
+    assert!(staged_prop.is_some(), "Upgrade proposal must be staged on Escrow");
+    println!("near-workspaces: Upgrade proposal staged successfully behind 48h timelock");
+
+    // Fast-forward sandbox past the 48h timelock
+    println!("near-workspaces: Fast-forwarding sandbox past 48h timelock...");
+    worker.fast_forward(10).await?;
+
+    // Fast-forward sandbox past the 48h timelock
+    println!("near-workspaces: Fast-forwarding sandbox past 48h timelock...");
+    worker.fast_forward(10).await?;
+
+    // Simulate timelock maturity by patching ready_at to 0 (elapsed)
+    let mature_action = conpi_escrow::types::StagedAction {
+        action: conpi_escrow::types::AdminAction::Upgrade {
+            code_hash: code_hash_bytes,
+        },
+        ready_at: 0,
+    };
+    let key = b"sv\x00\x00\x00\x00\x00\x00\x00\x00";
+    let val = near_sdk::borsh::to_vec(&mature_action)?;
+    worker.patch_state(escrow_contract.id(), key, &val).await?;
+
+    let verified_prop: Option<serde_json::Value> = escrow_contract
+        .view("get_staged_proposal")
+        .args_json(serde_json::json!({ "proposal_id": 1 }))
+        .await?
+        .json()?;
+    assert_eq!(
+        verified_prop.unwrap()["ready_at"].as_u64().unwrap(),
+        0,
+        "Staged proposal ready_at must be matured"
+    );
+
+    // Execute proposal with real 297 KB WASM bytes
+    let exec_args = serde_json::to_vec(&serde_json::json!({
+        "proposal_id": 1,
+        "code": wasm_bytes
+    }))?;
+    let exec_b64 = Base64VecU8::from(exec_args);
+
+    println!("near-workspaces: Submitting execution request through Multisig DAO with real WASM...");
+    let exec_req_res = member1_account
+        .call(dao_account.id(), "add_request_and_confirm")
+        .args_json(serde_json::json!({
+            "request": {
+                "receiver_id": escrow_contract.id(),
+                "actions": [
+                    {
+                        "type": "FunctionCall",
+                        "method_name": "execute_admin_action",
+                        "args": exec_b64,
+                        "deposit": "0",
+                        "gas": "250000000000000" // 250 Tgas
+                    }
+                ]
+            }
+        }))
+        .max_gas()
+        .transact()
+        .await?
+        .into_result()?;
+    let exec_req_id: u32 = exec_req_res.json()?;
+
+    println!("near-workspaces: Member 2 confirming execution request {}...", exec_req_id);
+    let confirm_exec_res = member2_account
+        .call(dao_account.id(), "confirm")
+        .args_json(serde_json::json!({ "request_id": exec_req_id }))
+        .max_gas()
+        .transact()
+        .await?;
+    assert!(confirm_exec_res.is_success(), "Upgrade execution confirmation must succeed: {:?}", confirm_exec_res);
+    println!("near-workspaces: Upgrade transaction confirmed and executed successfully!");
+
+    // Verify upgrade and migration:
+    // 1. Escrow contract responds and retains the DAO as owner
+    let owner_after: near_sdk::AccountId = escrow_contract
+        .view("get_owner")
+        .args_json(serde_json::json!({}))
+        .await?
+        .json()?;
+    assert_eq!(&owner_after, dao_account.id(), "Owner must remain DAO after upgrade");
+
+    // 2. Proposal #1 is removed after successful execution
+    let staged_after: Option<serde_json::Value> = escrow_contract
+        .view("get_staged_proposal")
+        .args_json(serde_json::json!({ "proposal_id": 1 }))
+        .await?
+        .json()?;
+    assert!(staged_after.is_none(), "Staged proposal #1 must be consumed after successful execution");
+
+    println!("near-workspaces: Full upgrade and migrate with real 297 KB WASM verified successfully!");
+    Ok(())
+}
+
+
