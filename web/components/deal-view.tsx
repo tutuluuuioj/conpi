@@ -44,9 +44,6 @@ export function DealView({ id }: { id: string }) {
     return () => window.clearTimeout(timer);
   }, [deal?.pulseStage, deal?.id, app]);
 
-  if (app.rpcDown) {
-    return <EmptyState icon={<ArrowLeftRight className="h-6 w-6" />} title="Couldn't reach NEAR RPC." body="The deal page needs the contract." action={<Button onClick={() => app.setRpcDown(false)}>Retry</Button>} />;
-  }
   if (!deal) {
     return <EmptyState icon={<ArrowLeftRight className="h-6 w-6" />} title="Deal not found." body="Check the id, or switch back to testnet." action={<Button href="/deals">All deals</Button>} />;
   }

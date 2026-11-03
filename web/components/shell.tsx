@@ -21,6 +21,7 @@ import { assetAmount, middle } from "@/lib/format";
 import { pendingClaimTotal, unreadCount, useApp } from "@/lib/store";
 import type { WalletName } from "@/lib/types";
 import { Button, HashChip, Modal } from "./ui";
+import { AttestationBadge } from "./attestation-badge";
 
 const NAV = [
   { href: "/", label: "Market", icon: Store },
@@ -99,6 +100,7 @@ export function Shell({ children }: { children: React.ReactNode }) {
             ))}
           </nav>
           <div className="flex items-center gap-2">
+            <AttestationBadge />
             <span className="hidden items-center gap-1.5 rounded-full border border-amber/40 bg-amber/10 px-2.5 py-1 text-xs font-semibold text-amber sm:inline-flex">
               <span className="h-1.5 w-1.5 rounded-full bg-amber" />
               {NETWORK === "testnet" ? "Testnet" : "Mainnet"}

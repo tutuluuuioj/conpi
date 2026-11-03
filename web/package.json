@@ -9,10 +9,16 @@
     "lint": "next lint"
   },
   "dependencies": {
+    "@near-wallet-selector/core": "^10.1.4",
+    "@near-wallet-selector/here-wallet": "^10.1.4",
+    "@near-wallet-selector/meteor-wallet": "^10.1.4",
+    "@near-wallet-selector/modal-ui": "^10.1.4",
+    "@near-wallet-selector/my-near-wallet": "^10.1.4",
     "@noble/ciphers": "^2.4.0",
     "@noble/curves": "^2.4.0",
     "clsx": "^2.1.1",
     "lucide-react": "^0.460.0",
+    "near-api-js": "^6.5.1",
     "next": "^14.2.18",
     "react": "^18.3.1",
     "react-dom": "^18.3.1",

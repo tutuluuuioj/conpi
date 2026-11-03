@@ -165,9 +165,7 @@ export function MarketView() {
       <Card className="hidden lg:block">{controls}</Card>
       <Modal open={open} title="Filters" onClose={() => setOpen(false)} footer={<Button onClick={() => setOpen(false)}>Show results</Button>}>{controls}</Modal>
 
-      {app.rpcDown ? (
-        <EmptyState icon={<Store className="h-6 w-6" />} title="Couldn't load listings." body="The market request failed." action={<Button onClick={() => app.setRpcDown(false)}>Retry</Button>} />
-      ) : filtered.length === 0 ? (
+      {filtered.length === 0 ? (
         <EmptyState icon={<Store className="h-6 w-6" />} title="No listings match these filters." body="Widen the ratio or clear a provider." action={<div className="flex gap-2"><Button variant="secondary" onClick={() => router.replace("/")}>Reset filters</Button><Button href="/new">Create listing</Button></div>} />
       ) : (
         <>

@@ -67,8 +67,8 @@ export function CreateView() {
       title: "Sign listing",
       body: `Publish ${usd(credit)} of ${provider} credit at ${usd(price)} (${ratioOf(price, credit)}). You will deposit ${usd(escrow.sellerCollateral)} ${token} only after a buyer funds the deal. The provider key is not part of this signature.`,
       confirm: "Sign",
-      run: () => {
-        const result = app.createListing(listing);
+      run: async () => {
+        const result = await app.createListing(listing);
         if (result.ok) router.push("/");
         return result;
       },

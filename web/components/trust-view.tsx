@@ -1,95 +1,212 @@
 "use client";
 
 import { useEffect, useState } from "react";
-import { ShieldCheck } from "lucide-react";
+import { ShieldCheck, ShieldAlert, CheckCircle2, XCircle, RefreshCw, Loader2, Download } from "lucide-react";
 import { CODE_HASH, CONTRACT_ID, DAO_ID, MEMBERS, explorerAccount } from "@/lib/chain";
 import { useApp } from "@/lib/store";
-import { teeApi, TeeAttestation } from "@/lib/tee-api";
-import { Badge, Card, HashChip, Overline } from "./ui";
+import { verifyLiveAttestation, AttestationVerificationResult } from "@/lib/attestation-verifier";
+import { Badge, Card, HashChip, Overline, Button } from "./ui";
 
 export function TrustView() {
   const app = useApp();
-  const [attestation, setAttestation] = useState<TeeAttestation | null>(null);
+  const [result, setResult] = useState<AttestationVerificationResult | null>(null);
+  const [loading, setLoading] = useState(true);
+  const [reverifying, setReverifying] = useState(false);
+
+  const runVerification = async () => {
+    try {
+      setReverifying(true);
+      const res = await verifyLiveAttestation();
+      setResult(res);
+    } catch (err: any) {
+      console.warn("Live attestation verification error:", err);
+    } finally {
+      setLoading(false);
+      setReverifying(false);
+    }
+  };
 
   useEffect(() => {
-    teeApi.getAttestation()
-      .then((data) => {
-        setAttestation(data);
-      })
-      .catch((err) => {
-        console.warn("TEE attestation query:", err);
-      });
+    runVerification();
   }, []);
 
-  const activeSignerKey = attestation?.signerPublicKeyNear || "Querying TEE enclave remote attestation...";
-  const activeMrtd = attestation?.mrtd || "Querying measurement from enclave...";
-  const isEnclave = attestation?.inEnclave ?? false;
+  const isVerified = result?.verified === true;
+  const activeSigner = result?.signerPublicKeyNear || "Querying TEE enclave...";
+  const activeMrtd = result?.mrtd || "Querying MRTD measurement...";
+  const activeCompose = result?.composeHash || "Querying compose hash...";
+  const activeNonce = result?.nonce || "None";
+  const activeReportData = result?.reportDataHex || "None";
+  const expectedReportData = result?.expectedReportDataHex || "None";
 
   return (
     <div className="space-y-6">
-      <div>
-        <h1 className="text-2xl font-semibold tracking-tight md:text-[32px] md:leading-10">Trust & Remote Attestation</h1>
-        <p className="mt-2 max-w-2xl text-sm text-muted">The Intel TDX Confidential Enclave meters usage, isolates provider API keys, and signs releases. The NEAR contract verifies Borsh signatures on-chain.</p>
+      <div className="flex flex-wrap items-center justify-between gap-4">
+        <div>
+          <h1 className="text-2xl font-semibold tracking-tight md:text-[32px] md:leading-10">Trust & Remote Attestation</h1>
+          <p className="mt-2 max-w-2xl text-sm text-muted">
+            The Intel TDX Confidential VM isolates provider API keys, meters usage, and signs on-chain settlements. Remote attestation cryptographically proves the volatile runtime state.
+          </p>
+        </div>
+        <Button
+          variant="secondary"
+          disabled={reverifying}
+          icon={reverifying ? <Loader2 className="h-4 w-4 animate-spin" /> : <RefreshCw className="h-4 w-4" />}
+          onClick={runVerification}
+        >
+          {reverifying ? "Verifying fresh nonce..." : "Re-verify Attestation"}
+        </Button>
       </div>
+
+      {/* Main Status Card */}
       <Card>
         <div className="flex flex-wrap items-center justify-between gap-3">
           <div className="flex items-center gap-2">
-            <ShieldCheck className="h-5 w-5 text-brand" />
-            <h2 className="text-lg font-semibold">Phala Intel TDX Enclave (dstack)</h2>
+            {isVerified ? (
+              <ShieldCheck className="h-6 w-6 text-mint" />
+            ) : (
+              <ShieldAlert className="h-6 w-6 text-danger" />
+            )}
+            <div>
+              <h2 className="text-lg font-semibold">Phala Intel TDX Remote Attestation</h2>
+              <p className="text-xs text-muted">Enclave instance bound with fresh nonce & SHA-256 report_data</p>
+            </div>
           </div>
-          <Badge tone={isEnclave ? "success" : "brand"}>
-            {isEnclave ? "Hardware Intel TDX Verified" : "Phala TEE Daemon Live (Port 8080)"}
+          <Badge tone={isVerified ? "mint" : "danger"}>
+            {loading ? "Verifying..." : isVerified ? "Cryptographically Verified (100%)" : "Verification Failed"}
           </Badge>
         </div>
-        <p className="mt-3 text-sm text-muted">Confidential Virtual Machine with runtime remote attestation. All keys are derived inside volatile enclave memory.</p>
-        <dl className="mt-4 grid gap-4 text-sm md:grid-cols-2">
-          <div>
-            <dt className="text-muted">Enclave Engine</dt>
-            <dd className="mt-1 inline-flex items-center gap-2 font-medium">
-              <span className="h-2 w-2 rounded-full bg-success" />
-              {attestation?.provider || "Phala dstack CVM (Node.js/Fastify)"}
-            </dd>
+
+        {/* 7 Verification Checks Grid */}
+        <div className="mt-6 rounded-lg border border-line bg-surface-2/60 p-4">
+          <h3 className="text-xs font-semibold uppercase tracking-wider text-muted">Cryptographic Proof Checklist</h3>
+          <div className="mt-3 grid gap-3 sm:grid-cols-2">
+            <div className="flex items-start gap-2 text-sm">
+              {result?.checks.nonceFresh ? (
+                <CheckCircle2 className="h-4 w-4 text-mint shrink-0 mt-0.5" />
+              ) : (
+                <XCircle className="h-4 w-4 text-danger shrink-0 mt-0.5" />
+              )}
+              <div>
+                <span className="font-medium text-ink">1. Fresh Nonce Generated</span>
+                <p className="text-xs font-mono text-muted truncate max-w-[280px]">nonce: {activeNonce}</p>
+              </div>
+            </div>
+
+            <div className="flex items-start gap-2 text-sm">
+              {result?.checks.reportDataMatchesHash ? (
+                <CheckCircle2 className="h-4 w-4 text-mint shrink-0 mt-0.5" />
+              ) : (
+                <XCircle className="h-4 w-4 text-danger shrink-0 mt-0.5" />
+              )}
+              <div>
+                <span className="font-medium text-ink">2. sha256(ed25519 ‖ x25519 ‖ nonce)</span>
+                <p className="text-xs text-muted">Binds ephemeral signer + encryption keys</p>
+              </div>
+            </div>
+
+            <div className="flex items-start gap-2 text-sm">
+              {result?.checks.quoteReportDataMatches ? (
+                <CheckCircle2 className="h-4 w-4 text-mint shrink-0 mt-0.5" />
+              ) : (
+                <XCircle className="h-4 w-4 text-danger shrink-0 mt-0.5" />
+              )}
+              <div>
+                <span className="font-medium text-ink">3. Raw TDX Quote Report Data</span>
+                <p className="text-xs text-muted">32-byte raw binary injection at offset 568</p>
+              </div>
+            </div>
+
+            <div className="flex items-start gap-2 text-sm">
+              {result?.checks.eventLogComposeHashMatches ? (
+                <CheckCircle2 className="h-4 w-4 text-mint shrink-0 mt-0.5" />
+              ) : (
+                <XCircle className="h-4 w-4 text-danger shrink-0 mt-0.5" />
+              )}
+              <div>
+                <span className="font-medium text-ink">4. RTMR3 Event Log Compose Hash</span>
+                <p className="text-xs font-mono text-muted truncate max-w-[280px]">{activeCompose.slice(0, 16)}...</p>
+              </div>
+            </div>
+
+            <div className="flex items-start gap-2 text-sm">
+              {result?.checks.onChainSignerRegistered ? (
+                <CheckCircle2 className="h-4 w-4 text-mint shrink-0 mt-0.5" />
+              ) : (
+                <XCircle className="h-4 w-4 text-danger shrink-0 mt-0.5" />
+              )}
+              <div>
+                <span className="font-medium text-ink">5. Registered on Escrow Contract</span>
+                <p className="text-xs text-muted">Verified via get_tee_signer RPC view</p>
+              </div>
+            </div>
+
+            <div className="flex items-start gap-2 text-sm">
+              {result?.checks.onChainSignerActive ? (
+                <CheckCircle2 className="h-4 w-4 text-mint shrink-0 mt-0.5" />
+              ) : (
+                <XCircle className="h-4 w-4 text-danger shrink-0 mt-0.5" />
+              )}
+              <div>
+                <span className="font-medium text-ink">6. Signer Active & Authorized</span>
+                <p className="text-xs text-muted">Active: true on NEAR state</p>
+              </div>
+            </div>
+
+            <div className="flex items-start gap-2 text-sm sm:col-span-2">
+              {result?.checks.onChainMeasurementMatches ? (
+                <CheckCircle2 className="h-4 w-4 text-mint shrink-0 mt-0.5" />
+              ) : (
+                <XCircle className="h-4 w-4 text-danger shrink-0 mt-0.5" />
+              )}
+              <div>
+                <span className="font-medium text-ink">7. On-Chain Measurement Match (MRTD + RTMR3/Compose)</span>
+                <p className="text-xs text-muted">Multisig DAO governance registered exact MRTD and Compose Hash</p>
+              </div>
+            </div>
           </div>
+        </div>
+
+        {/* Enclave Keys & Hashes */}
+        <dl className="mt-6 grid gap-4 text-sm md:grid-cols-2">
           <div>
             <dt className="text-muted">In-Enclave Ed25519 Signer Public Key</dt>
-            <dd className="mt-2"><HashChip value={activeSignerKey} onCopy={app.copy} /></dd>
+            <dd className="mt-2"><HashChip value={activeSigner} onCopy={app.copy} /></dd>
           </div>
           <div>
-            <dt className="text-muted">In-Enclave X25519 Encryption Key</dt>
-            <dd className="mt-2">
-              <HashChip value={attestation?.encryptionPublicKeyHex ? `0x${attestation.encryptionPublicKeyHex.slice(0, 20)}...` : "0x521732ee2b2d616a..."} onCopy={app.copy} />
-            </dd>
+            <dt className="text-muted">Measured Compose Hash (IMR 3)</dt>
+            <dd className="mt-2"><HashChip value={activeCompose} onCopy={app.copy} /></dd>
           </div>
           <div>
             <dt className="text-muted">Hardware Report Data (SHA-256)</dt>
-            <dd className="mt-2 break-all font-mono text-[12px] text-muted">
-              {attestation?.reportDataHex || "f243734baca4acbe3e394477d2cc3a59357d4c213e2dbb694bc66c370284321c"}
-            </dd>
+            <dd className="mt-2 break-all font-mono text-[12px] text-muted">{activeReportData}</dd>
+          </div>
+          <div>
+            <dt className="text-muted">Expected Computed SHA-256</dt>
+            <dd className="mt-2 break-all font-mono text-[12px] text-muted">{expectedReportData}</dd>
           </div>
           <div className="md:col-span-2">
             <dt className="text-muted">Measurement (MRTD)</dt>
             <dd className="mt-2 break-all font-mono text-[13px]">{activeMrtd}</dd>
-            <button type="button" className="mt-2 text-sm font-semibold text-brand" onClick={() => app.copy(activeMrtd)}>Copy measurement</button>
           </div>
         </dl>
       </Card>
+
+      {/* Contract & DAO cards */}
       <div className="grid gap-4 lg:grid-cols-2">
         <Card>
-          <Overline>TDX Attestation Quote</Overline>
-          <p className="mt-3 text-sm">
-            {isEnclave
-              ? "Hardware quote generated by Intel SGX/TDX Quote Generation Service (QGS) and bound to the volatile ephemeral keys."
-              : "Live enclave daemon responding at http://localhost:8080/v1/attestation with ephemeral Ed25519 signer and X25519 vault keys."}
+          <Overline>Remote Attestation Quote Download</Overline>
+          <p className="mt-3 text-sm text-muted">
+            Raw Intel TDX Quote generated by the Intel TDX Quote Generation Service (QGS). The quote is bound directly to the hardware report_data.
           </p>
           <a
-            className="mt-3 inline-block text-sm font-semibold text-brand"
-            href={`data:application/json,${encodeURIComponent(JSON.stringify(attestation || { tee: "Phala Intel TDX", mrtd: activeMrtd }, null, 2))}`}
-            download="conpi-attestation-quote.json"
+            className="mt-4 inline-flex items-center gap-2 rounded-md bg-surface-2 px-3 py-2 text-sm font-semibold text-brand hover:bg-surface-2/80"
+            href={`data:application/json,${encodeURIComponent(JSON.stringify(result || {}, null, 2))}`}
+            download="conpi-hardware-attestation.json"
           >
-            Download raw attestation JSON
+            <Download className="h-4 w-4" /> Download Attestation Verification Report
           </a>
-          <p className="mt-2 text-xs text-muted">Borsh SignedPayload matches the escrow contract verification domain <span className="font-mono text-ink">conpi:v1</span>.</p>
         </Card>
+
         <Card id="verify">
           <Overline>Escrow Contract (NEAR Testnet)</Overline>
           <div className="mt-3 space-y-3">
@@ -99,19 +216,18 @@ export function TrustView() {
               <div className="mt-1"><HashChip value={CODE_HASH} href={explorerAccount(CONTRACT_ID)} onCopy={app.copy} /></div>
             </div>
           </div>
-          <ol className="mt-4 list-decimal space-y-1 pl-4 text-sm text-muted">
-            <li>Build with <span className="font-mono text-ink">cargo near build reproducible-wasm</span> in Docker via GitHub Actions workflow (<span className="font-mono text-ink">sourcescan/cargo-near:0.22.0-rust-1.99.1</span>).</li>
-            <li>Compare the resulting wasm SHA-256 with the code hash above.</li>
-            <li>Confirm the signer key on this page matches the key verified on-chain.</li>
-          </ol>
         </Card>
       </div>
+
       <Card>
-        <Overline>Owner</Overline>
-        <p className="mt-2 text-sm">DAO {DAO_ID}. Threshold 2 of 3. Timelock 5 minutes.</p>
+        <Overline>Multisig DAO Governance Owner</Overline>
+        <p className="mt-2 text-sm">Account: {DAO_ID} · 2-of-3 Quorum · 5-minute Timelock</p>
         <ul className="mt-3 divide-y divide-line text-sm">
           {MEMBERS.map((member) => (
-            <li key={member.account} className="flex justify-between py-2"><span className="font-mono">{member.account}</span><span className="text-muted">{member.role}</span></li>
+            <li key={member.account} className="flex justify-between py-2">
+              <span className="font-mono">{member.account}</span>
+              <span className="text-muted">{member.role}</span>
+            </li>
           ))}
         </ul>
       </Card>

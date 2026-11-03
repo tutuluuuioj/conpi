@@ -22,9 +22,7 @@ export function MeterView() {
         <h1 className="text-2xl font-semibold tracking-tight md:text-[32px] md:leading-10">Meter</h1>
         <p className="mt-2 text-sm text-muted">Usage across live deals, priced from the locked table.</p>
       </div>
-      {app.rpcDown ? (
-        <EmptyState icon={<Gauge className="h-6 w-6" />} title="TEE not reporting." body="Last checkpoint 14:20." action={<Button onClick={() => app.setRpcDown(false)}>Retry</Button>} />
-      ) : live.length === 0 ? (
+      {live.length === 0 ? (
         <EmptyState icon={<Gauge className="h-6 w-6" />} title="No live deals." body="Your usage shows up here once a deal is active." action={<Button href="/">Browse the market</Button>} />
       ) : (
         <>
@@ -88,7 +86,6 @@ export function MeterView() {
           <Button variant="danger" disabled={!deal || deal.status !== "Active"} onClick={() => deal && app.simulateRevoke(deal.id)}>Simulate seller revoke</Button>
           <Button variant="secondary" disabled={!deal} onClick={() => deal && app.simulateCounterparty(deal.id)}>Simulate counterparty</Button>
           <Button variant="secondary" disabled={!deal} onClick={() => deal && app.setHeartbeat(deal.id, deal.heartbeat === "live" ? "stale" : "live")}>{deal?.heartbeat === "stale" ? "Restore heartbeat" : "Drop heartbeat"}</Button>
-          <Button variant="ghost" onClick={() => app.setRpcDown(!app.rpcDown)}>{app.rpcDown ? "Restore RPC" : "Simulate RPC outage"}</Button>
         </div>
       </Card>
     </div>

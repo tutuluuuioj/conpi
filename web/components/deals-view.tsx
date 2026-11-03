@@ -8,9 +8,6 @@ import { Button, Card, EmptyState, Meter, StatusBadge } from "./ui";
 
 export function DealsView() {
   const app = useApp();
-  if (app.rpcDown) {
-    return <EmptyState icon={<ArrowLeftRight className="h-6 w-6" />} title="Couldn't reach NEAR RPC." body="Retrying in 5s is unnecessary. The node is marked down from testnet tools." action={<Button onClick={() => app.setRpcDown(false)}>Retry</Button>} />;
-  }
   const deals = app.deals.filter((deal) => !app.account || deal.buyer === app.account || deal.seller === app.account);
   if (!deals.length) {
     return <EmptyState icon={<ArrowLeftRight className="h-6 w-6" />} title="You have no deals yet." body="Browse the market and open a ticket." action={<Button href="/">Browse the market</Button>} />;

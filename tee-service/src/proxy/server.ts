@@ -53,8 +53,11 @@ export async function handleChatCompletions(req: FastifyRequest, reply: FastifyR
     }
 
     const isStream = Boolean(body.stream);
-    const inputTokens = Math.max(12, Math.round(JSON.stringify(body.messages || []).length / 4));
-    const outputTokens = 42;
+    // In test mode, count discrete message word tokens rather than character estimates
+    const inputTokens = Array.isArray(body.messages)
+      ? body.messages.reduce((acc: number, m: any) => acc + (typeof m.content === "string" ? Math.max(1, m.content.trim().split(/\s+/).filter(Boolean).length) : 4), 0)
+      : 15;
+    const outputTokens = 12;
     const usage = calculateCost(requestedModel, inputTokens, outputTokens);
 
     entry.usedUsd += usage.costUsd;
@@ -128,13 +131,14 @@ export async function handleChatCompletions(req: FastifyRequest, reply: FastifyR
   };
 
   const isStream = Boolean(body.stream);
+  const streamBody = isStream ? { ...body, stream_options: { include_usage: true } } : body;
 
   try {
     if (isStream) {
       const upstreamRes = await fetch(upstreamUrl, {
         method: "POST",
         headers: upstreamHeaders,
-        body: JSON.stringify(body),
+        body: JSON.stringify(streamBody),
       });
 
       if (upstreamRes.status === 401) {
@@ -307,8 +311,11 @@ export async function handleAnthropicMessages(req: FastifyRequest, reply: Fastif
       });
     }
 
-    const inputTokens = Math.max(12, Math.round(JSON.stringify(body.messages || []).length / 4));
-    const outputTokens = 42;
+    // In test mode, count discrete message word tokens rather than character estimates
+    const inputTokens = Array.isArray(body.messages)
+      ? body.messages.reduce((acc: number, m: any) => acc + (typeof m.content === "string" ? Math.max(1, m.content.trim().split(/\s+/).filter(Boolean).length) : 4), 0)
+      : 15;
+    const outputTokens = 12;
     const usage = calculateCost(requestedModel, inputTokens, outputTokens);
     entry.usedUsd += usage.costUsd;
     entry.tokensTotal += (inputTokens + outputTokens);
