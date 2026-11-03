@@ -37,7 +37,8 @@ export class AttestationService {
 
     if (this.client) {
       try {
-        const quoteRes = await this.client.tdxQuote(reportData);
+        const paddedReportData = reportDataHex.padStart(128, "0");
+        const quoteRes = await this.client.tdxQuote(paddedReportData, "raw");
         rawQuoteHex = quoteRes.quote;
         inEnclave = true;
         this.cachedQuote = rawQuoteHex;

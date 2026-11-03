@@ -40,6 +40,11 @@ export async function handleChatCompletions(req: FastifyRequest, reply: FastifyR
     entry.usedUsd += usage.costUsd;
     entry.tokensTotal += (inputTokens + outputTokens);
 
+    const stagePayload = meterEngine.checkAndEmitStage(entry, entry.termsHashHex);
+    if (stagePayload) {
+      entry.signedPayloads.push(stagePayload);
+    }
+
     if (isStream) {
       reply.raw.setHeader("Content-Type", "text/event-stream");
       reply.raw.setHeader("Cache-Control", "no-cache");
@@ -108,8 +113,11 @@ export async function handleChatCompletions(req: FastifyRequest, reply: FastifyR
       // Key was revoked mid-deal by seller!
       console.warn(`[Proxy] Detected seller revoked key on deal ${entry.dealId}`);
       entry.active = false;
+      const defaultSig = meterEngine.emitDefault(entry, entry.termsHashHex, DefaultReason.InvalidKey);
+      entry.signedPayloads.push(defaultSig);
       return reply.status(502).send({
         error: { message: "Seller API key was revoked or invalid. Settlement default initiated.", code: "seller_key_revoked" },
+        defaultPayload: defaultSig,
       });
     }
 
@@ -118,8 +126,11 @@ export async function handleChatCompletions(req: FastifyRequest, reply: FastifyR
       if (text.includes("insufficient_quota")) {
         console.warn(`[Proxy] Detected quota depleted on deal ${entry.dealId}`);
         entry.active = false;
+        const defaultSig = meterEngine.emitDefault(entry, entry.termsHashHex, DefaultReason.InsufficientQuota);
+        entry.signedPayloads.push(defaultSig);
         return reply.status(502).send({
           error: { message: "Seller account quota exhausted. Settlement default initiated.", code: "insufficient_quota" },
+          defaultPayload: defaultSig,
         });
       }
       return reply.status(429).send({ error: { message: "Upstream rate limit exceeded. Retry later.", code: "rate_limit_exceeded" } });
@@ -134,6 +145,11 @@ export async function handleChatCompletions(req: FastifyRequest, reply: FastifyR
       );
       entry.usedUsd += usage.costUsd;
       entry.tokensTotal += (data.usage.total_tokens || 0);
+
+      const stagePayload = meterEngine.checkAndEmitStage(entry, entry.termsHashHex);
+      if (stagePayload) {
+        entry.signedPayloads.push(stagePayload);
+      }
     }
     return reply.status(upstreamRes.status).send(data);
   } catch (err: any) {

@@ -33,12 +33,14 @@ export interface VaultEntry {
   model: string;
   models: string[];
   proxyKey: string;
+  termsHashHex: string;
   creditUsd: number;
   priceUsd: number;
   usedUsd: number;
   tokensTotal: number;
   active: boolean;
   registeredAt: string;
+  signedPayloads: Array<{ payload: any; signatureHex: string }>;
 }
 
 class KeyVault {
@@ -101,12 +103,14 @@ class KeyVault {
       model,
       models,
       proxyKey,
+      termsHashHex,
       creditUsd,
       priceUsd,
       usedUsd: 0,
       tokensTotal: 0,
       active: true,
       registeredAt: new Date().toISOString(),
+      signedPayloads: [],
     };
 
     this.entries.set(dealId, entry);
@@ -133,6 +137,11 @@ class KeyVault {
     const payloadBytes = serializeSignedPayload(activatePayload);
     const signature = enclaveKeys.sign(payloadBytes);
     const activateSignatureHex = Buffer.from(signature).toString("hex");
+
+    entry.signedPayloads.push({
+      payload: activatePayload,
+      signatureHex: activateSignatureHex,
+    });
 
     return {
       ok: true,
@@ -195,10 +204,25 @@ class KeyVault {
           return { ok: false, modelAvailable: false, balanceCoversCredit: false, error: "Prepaid quota exhausted (insufficient_quota)" };
         }
       }
+      if (!res.ok) {
+        return { ok: false, modelAvailable: false, balanceCoversCredit: false, error: `Provider error HTTP ${res.status}` };
+      }
+
+      // Verify requested model is present in account
+      const data: any = await res.json().catch(() => null);
+      if (data && Array.isArray(data.data)) {
+        const modelsList = data.data.map((m: any) => m.id || m);
+        const targetModel = model.toLowerCase();
+        const found = modelsList.some((m: string) => typeof m === "string" && (m.toLowerCase() === targetModel || m.toLowerCase().includes(targetModel)));
+        if (!found) {
+          return { ok: false, modelAvailable: false, balanceCoversCredit: false, error: `Model "${model}" not available for this API key` };
+        }
+      }
+
       return { ok: true, modelAvailable: true, balanceCoversCredit: true };
     } catch (err: any) {
-      console.warn(`[Preflight] Network check warning: ${err.message}. Defaulting to verified.`);
-      return { ok: true, modelAvailable: true, balanceCoversCredit: true };
+      console.error(`[Preflight] Network check failed:`, err.message);
+      return { ok: false, modelAvailable: false, balanceCoversCredit: false, error: `Preflight network error: ${err.message}` };
     }
   }
 }

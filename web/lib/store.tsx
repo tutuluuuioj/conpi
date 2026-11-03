@@ -400,14 +400,10 @@ export function Providers({ children }: { children: React.ReactNode }) {
         // Query TEE attestation to retrieve active in-enclave X25519 public key
         teeApi.getAttestation()
           .then((attestation) => {
-            let encryptedEnvelope = undefined;
-            if (attestation.encryptionPublicKeyHex) {
-              try {
-                encryptedEnvelope = encryptApiKeyToEnclave(rawApiKey, attestation.encryptionPublicKeyHex);
-              } catch (err) {
-                console.warn("Client envelope encryption warning:", err);
-              }
+            if (!attestation.encryptionPublicKeyHex) {
+              throw new Error("Enclave X25519 public key unavailable from attestation service");
             }
+            const encryptedEnvelope = encryptApiKeyToEnclave(rawApiKey, attestation.encryptionPublicKeyHex);
             return teeApi.submitKey(Number(dealId), {
               provider: deal?.provider || "OpenAI",
               model: deal?.model || "gpt-4o",
@@ -416,7 +412,6 @@ export function Providers({ children }: { children: React.ReactNode }) {
               priceUsd: deal?.price || 100,
               termsHashHex: cleanHash,
               encryptedEnvelope,
-              plainApiKey: encryptedEnvelope ? undefined : rawApiKey,
             });
           })
           .then((res) => {

@@ -9,12 +9,11 @@ export enum PayloadKind {
 export enum DefaultReason {
   InvalidKey = 0,
   InsufficientQuota = 1,
-  ProviderBan = 2,
-  SellerRevokedKey = 3,
-  LivenessTimeout = 4,
-  RateLimitExhaustion = 5,
-  UsageDeadlinePassed = 6,
-  BuyerBreach = 7,
+  KeyNotSubmitted = 2,
+  ValidationFailed = 3,
+  ProviderBan = 4,
+  SellerSelfDrain = 5,
+  BuyerBreach = 6,
 }
 
 export interface SignedPayloadDto {

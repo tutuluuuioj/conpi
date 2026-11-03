@@ -46,8 +46,8 @@ export class NearRelayer {
     return this.callView("get_deal", { deal_id: dealId });
   }
 
-  public async getTeeSigners(): Promise<any> {
-    return this.callView("get_tee_signers", {});
+  public async getTeeSigner(publicKey: string): Promise<any> {
+    return this.callView("get_tee_signer", { public_key: publicKey });
   }
 
   public async getConfig(): Promise<any> {

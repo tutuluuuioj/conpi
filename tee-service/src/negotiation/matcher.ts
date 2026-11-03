@@ -99,12 +99,13 @@ class NegotiationService {
         ticket.matched = true;
         ticket.diffFields = [];
 
-        // Convert USD amounts to yoctoNEAR or token smallest units
-        // For testing / standard 1 USD = 1 NEAR or NEP-141 base
-        // In NEAR: 1 NEAR = 10^24 yoctoNEAR
-        const ONE_NEAR_YOCTO = 1_000_000_000_000_000_000_000_000n;
-        const priceYocto = BigInt(Math.round(terms.priceUsd * 100)) * (ONE_NEAR_YOCTO / 100n);
-        const creditYocto = BigInt(Math.round(terms.creditAmountUsd * 100)) * (ONE_NEAR_YOCTO / 100n);
+        // Convert USD amounts to smallest token units
+        // NEAR: 24 decimals (10^24 yoctoNEAR)
+        // NEP-141 USDC/USDT: 6 decimals (10^6)
+        const decimals = (terms.token === null || terms.token === "NEAR") ? 24n : 6n;
+        const multiplier = 10n ** decimals;
+        const priceYocto = (BigInt(Math.round(terms.priceUsd * 100)) * multiplier) / 100n;
+        const creditYocto = (BigInt(Math.round(terms.creditAmountUsd * 100)) * multiplier) / 100n;
         const buyerCollateralYocto = (priceYocto * BigInt(terms.buyerCollateralPct)) / 100n;
         const sellerCollateralYocto = (priceYocto * BigInt(terms.sellerCollateralPct)) / 100n;
 
@@ -149,7 +150,13 @@ class NegotiationService {
     if (a.buyerCollateralPct !== b.buyerCollateralPct) diffs.push("buyerCollateralPct");
     if (a.sellerCollateralPct !== b.sellerCollateralPct) diffs.push("sellerCollateralPct");
     if (a.token !== b.token) diffs.push("token");
+    if (a.depositDurationSec !== b.depositDurationSec) diffs.push("depositDurationSec");
+    if (a.keyDurationSec !== b.keyDurationSec) diffs.push("keyDurationSec");
+    if (a.teeLivenessTimeoutSec !== b.teeLivenessTimeoutSec) diffs.push("teeLivenessTimeoutSec");
+    if (a.slashBpsProviderBan !== b.slashBpsProviderBan) diffs.push("slashBpsProviderBan");
     if (a.slashBpsRevoke !== b.slashBpsRevoke) diffs.push("slashBpsRevoke");
+    if (a.slashBpsBuyerBreach !== b.slashBpsBuyerBreach) diffs.push("slashBpsBuyerBreach");
+    if (JSON.stringify(a.models.slice().sort()) !== JSON.stringify(b.models.slice().sort())) diffs.push("models");
     return diffs;
   }
 }

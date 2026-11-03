@@ -122,6 +122,37 @@ async function bootstrap() {
     };
   });
 
+  // 6. Signed Payloads & Attestation Retrieval
+  app.get("/v1/deals/:id/payloads", async (req, reply) => {
+    const { id } = req.params as { id: string };
+    const dealId = parseInt(id, 10);
+    const entry = keyVault.getByDealId(dealId);
+    if (!entry) {
+      return reply.status(404).send({ error: "Deal not found in key vault" });
+    }
+    return {
+      dealId,
+      termsHashHex: entry.termsHashHex,
+      count: entry.signedPayloads.length,
+      signedPayloads: entry.signedPayloads.map((item) => ({
+        payload: {
+          domain: item.payload.domain,
+          contractId: item.payload.contractId,
+          chainId: item.payload.chainId,
+          dealId: Number(item.payload.dealId),
+          termsHashHex: Buffer.from(item.payload.termsHash).toString("hex"),
+          kind: item.payload.kind,
+          stage: item.payload.stage,
+          meteredValueYocto: item.payload.meteredValueYocto.toString(),
+          reason: item.payload.reason !== null && item.payload.reason !== undefined ? item.payload.reason : null,
+          nonce: item.payload.nonce.toString(),
+          issuedAtNs: item.payload.issuedAtNs.toString(),
+        },
+        signatureHex: item.signatureHex,
+      })),
+    };
+  });
+
   app.get("/v1/deals/:id/stream", async (req, reply) => {
     const { id } = req.params as { id: string };
     const dealId = parseInt(id, 10);
