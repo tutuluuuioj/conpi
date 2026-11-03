@@ -13,7 +13,7 @@
     "@fastify/cors": "^9.0.1",
     "@noble/curves": "^1.8.0",
     "@noble/hashes": "^1.7.0",
-    "@phala/dstack-sdk": "^0.1.5",
+    "@phala/dstack-sdk": "^0.5.8",
     "@types/bs58": "^4.0.4",
     "borsh": "^2.0.0",
     "bs58": "^6.0.0",

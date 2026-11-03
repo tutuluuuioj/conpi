@@ -1,6 +1,7 @@
 import Fastify from "fastify";
 import cors from "@fastify/cors";
 import { CONFIG } from "./config.js";
+import { enclaveKeys } from "./crypto/keys.js";
 import { attestationService } from "./attestation/tdx.js";
 import { negotiationService } from "./negotiation/matcher.js";
 import { keyVault } from "./vault/preflight.js";
@@ -10,6 +11,9 @@ import { nearRelayer } from "./chain/relayer.js";
 const app = Fastify({ logger: true });
 
 async function bootstrap() {
+  await enclaveKeys.init();
+  await attestationService.init();
+
   await app.register(cors, {
     origin: "*",
     methods: ["GET", "POST", "PUT", "DELETE", "OPTIONS"],
@@ -26,12 +30,14 @@ async function bootstrap() {
   });
 
   // 1. Attestation & In-Enclave Public Keys
-  app.get("/v1/attestation", async () => {
-    return attestationService.getAttestation();
+  app.get("/v1/attestation", async (req) => {
+    const nonce = (req.query as any)?.nonce || (req.headers["x-nonce"] as string) || undefined;
+    return attestationService.getAttestation(nonce);
   });
 
   app.get("/v1/quote", async (req, reply) => {
-    const rawQuote = await attestationService.getRawQuote();
+    const nonce = (req.query as any)?.nonce || (req.headers["x-nonce"] as string) || undefined;
+    const rawQuote = await attestationService.getRawQuote(nonce);
     if (!rawQuote) {
       return reply.status(404).send({ error: "No hardware quote available in this environment" });
     }

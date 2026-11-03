@@ -1,3 +1,4 @@
+process.env.NODE_ENV = "test";
 import { enclaveKeys } from "../src/crypto/keys.js";
 import { computeTermsHash, buildTermsMessage } from "../src/crypto/terms.js";
 import { serializeSignedPayload, PayloadKind } from "../src/crypto/borsh.js";
@@ -8,6 +9,7 @@ import { calculateCost, meterEngine } from "../src/proxy/meter.js";
 
 async function runTests() {
   console.log("=== RUNNING CONPI TEE SERVICE UNIT TESTS ===");
+  await enclaveKeys.init();
 
   // 1. Keys Test
   console.log("\n[Test 1] Testing Enclave Key Generation & Signing...");

@@ -170,7 +170,7 @@ export async function handleChatCompletions(req: FastifyRequest, reply: FastifyR
       reply.raw.setHeader("Cache-Control", "no-cache");
       reply.raw.setHeader("Connection", "keep-alive");
 
-      let promptTokens = Math.max(12, Math.round(JSON.stringify(body.messages || []).length / 4));
+      let promptTokens = 0;
       let completionTokens = 0;
 
       if (upstreamRes.body) {
@@ -193,8 +193,8 @@ export async function handleChatCompletions(req: FastifyRequest, reply: FastifyR
               try {
                 const parsed = JSON.parse(line.slice(6));
                 if (parsed.usage) {
-                  promptTokens = parsed.usage.prompt_tokens || promptTokens;
-                  completionTokens = parsed.usage.completion_tokens || completionTokens;
+                  promptTokens = parsed.usage.prompt_tokens ?? promptTokens;
+                  completionTokens = parsed.usage.completion_tokens ?? completionTokens;
                 } else if (parsed.choices && parsed.choices[0]?.delta?.content) {
                   completionTokens += 1;
                 }
@@ -204,9 +204,9 @@ export async function handleChatCompletions(req: FastifyRequest, reply: FastifyR
         }
       }
 
-      const usage = calculateCost(requestedModel, promptTokens, completionTokens || 10);
+      const usage = calculateCost(requestedModel, promptTokens, completionTokens);
       entry.usedUsd += usage.costUsd;
-      entry.tokensTotal += (promptTokens + (completionTokens || 10));
+      entry.tokensTotal += (promptTokens + completionTokens);
 
       const stagePayload = meterEngine.checkAndEmitStage(entry, entry.termsHashHex);
       if (stagePayload) {
@@ -434,8 +434,8 @@ export async function handleAnthropicMessages(req: FastifyRequest, reply: Fastif
     }
 
     const data: any = await upstreamRes.json();
-    const promptTokens = data.usage?.prompt_tokens || openAiMessages.reduce((acc, m) => acc + m.content.length / 4, 0);
-    const completionTokens = data.usage?.completion_tokens || 20;
+    const promptTokens = data.usage?.prompt_tokens ?? 0;
+    const completionTokens = data.usage?.completion_tokens ?? 0;
 
     const usage = calculateCost(requestedModel, promptTokens, completionTokens);
     entry.usedUsd += usage.costUsd;
