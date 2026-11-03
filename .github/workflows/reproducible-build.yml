@@ -1,0 +1,53 @@
+name: Reproducible Contract Build
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+jobs:
+  build:
+    name: Verifiable NEP-330 Build
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Verify Docker is running
+        run: |
+          docker --version
+          docker info
+
+      - name: Install cargo-near
+        run: |
+          curl -fsSL https://github.com/near/cargo-near/releases/download/cargo-near-v0.22.0/cargo-near-x86_64-unknown-linux-gnu.tar.gz | tar -xz
+          sudo mv cargo-near-x86_64-unknown-linux-gnu/cargo-near /usr/local/bin/
+          cargo near --version
+
+      - name: Run Reproducible Build
+        run: |
+          cd contracts
+          cargo near build reproducible-wasm
+
+      - name: Inspect & Checksum WASM
+        run: |
+          WASM="contracts/target/near/conpi_escrow.wasm"
+          ls -la "$WASM"
+          sha256sum "$WASM" | tee contracts/target/near/conpi_escrow.wasm.sha256
+          
+          echo "=== SHA-256 (Hex) ==="
+          cat contracts/target/near/conpi_escrow.wasm.sha256
+          
+          echo "=== NEP-330 Metadata Strings ==="
+          strings "$WASM" | grep -A 2 "nep330" || true
+
+      - name: Upload Verifiable WASM Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: conpi-escrow-verifiable-wasm
+          path: |
+            contracts/target/near/conpi_escrow.wasm
+            contracts/target/near/conpi_escrow.wasm.sha256
+          if-no-files-found: error
