@@ -7,6 +7,7 @@ import { maskKey, round2, sameTerms, txId, usd } from "./format";
 import { escrowOf, settleComplete, settleRevoke, stageFor } from "./money";
 import type { Asset, Claim, Deal, Listing, Notice, Proposal, SignResult, ThemeMode, Toast, WalletName } from "./types";
 import { teeApi } from "./tee-api";
+import { encryptApiKeyToEnclave } from "./crypto";
 
 interface State {
   theme: ThemeMode;
@@ -393,62 +394,76 @@ export function Providers({ children }: { children: React.ReactNode }) {
           keyChecks: KEY_CHECKS.map((label) => ({ label, ok: false })),
         }));
 
-        // Send to real TEE enclave key vault
         const cleanHash = deal?.termsHash ? deal.termsHash.replace(/^0x/, "") : "ce6bf4f2f4a21d0eebf675970d7ef22b345754a626eb0a61097d42e970ced89d";
-        teeApi.submitKey(Number(dealId), {
-          provider: deal?.provider || "OpenAI",
-          model: deal?.model || "gpt-4o",
-          models: deal?.models,
-          creditUsd: deal?.credit || 100,
-          priceUsd: deal?.price || 100,
-          termsHashHex: cleanHash,
-          plainApiKey: userApiKey || "sk-test-live-enclave-key",
-        })
-        .then((res) => {
-          if (res.ok && res.proxyKey) {
-            const tx = txId();
-            patchDeal(dealId, (item) => ({
-              ...item,
-              keyChecks: KEY_CHECKS.map((label) => ({ label, ok: true })),
-              keyStatus: "verified",
-              status: "Active",
-              step: "live",
-              proxyKey: res.proxyKey!,
-              heartbeat: "live",
-              lastCheckpoint: "Just now",
-              steps: { ...item.steps, key: { time: "Now", tx }, live: { time: "Now", tx } },
-              activity: [{ id: crypto.randomUUID(), title: "Key verified & ACTIVATE signed", detail: `Bearer proxy key ${res.proxyKey?.slice(0, 16)}... live.`, tx, time: "Now" }, ...item.activity],
-            }));
-            pushToast({ kind: "success", title: "Key verified & ACTIVATE signed", body: `In-enclave key injected. Proxy bearer key issued: ${res.proxyKey?.slice(0, 16)}...` });
-          } else {
-            pushToast({ kind: "error", title: "Key check failed", body: res.error || "Preflight validation failed" });
-          }
-        })
-        .catch((err) => {
-          console.warn("TEE key verification fallback:", err);
-          KEY_CHECKS.forEach((label, index) => {
-            window.setTimeout(() => {
-              patchDeal(dealId, (item) => {
-                const keyChecks = item.keyChecks.map((check) => (check.label === label ? { ...check, ok: true } : check));
-                const done = keyChecks.every((check) => check.ok);
-                if (!done) return { ...item, keyChecks };
-                const tx = txId();
-                return {
-                  ...item,
-                  keyChecks,
-                  keyStatus: "verified",
-                  status: "Active",
-                  step: "live",
-                  proxyKey: `cpk_live_${tx.slice(0, 12).toLowerCase()}bb45`,
-                  heartbeat: "live",
-                  lastCheckpoint: "Just now",
-                  steps: { ...item.steps, key: { time: "Now", tx }, live: { time: "Now", tx } },
-                  activity: [{ id: crypto.randomUUID(), title: "Key verified", detail: "Test call succeeded. The proxy key is live.", tx, time: "Now" }, ...item.activity],
-                };
-              });
-            }, 400 * (index + 1));
+        const rawApiKey = userApiKey || "sk-test-live-enclave-key";
+
+        // Query TEE attestation to retrieve active in-enclave X25519 public key
+        teeApi.getAttestation()
+          .then((attestation) => {
+            let encryptedEnvelope = undefined;
+            if (attestation.encryptionPublicKeyHex) {
+              try {
+                encryptedEnvelope = encryptApiKeyToEnclave(rawApiKey, attestation.encryptionPublicKeyHex);
+              } catch (err) {
+                console.warn("Client envelope encryption warning:", err);
+              }
+            }
+            return teeApi.submitKey(Number(dealId), {
+              provider: deal?.provider || "OpenAI",
+              model: deal?.model || "gpt-4o",
+              models: deal?.models,
+              creditUsd: deal?.credit || 100,
+              priceUsd: deal?.price || 100,
+              termsHashHex: cleanHash,
+              encryptedEnvelope,
+              plainApiKey: encryptedEnvelope ? undefined : rawApiKey,
+            });
+          })
+          .then((res) => {
+            if (res.ok && res.proxyKey) {
+              const tx = txId();
+              patchDeal(dealId, (item) => ({
+                ...item,
+                keyChecks: KEY_CHECKS.map((label) => ({ label, ok: true })),
+                keyStatus: "verified",
+                status: "Active",
+                step: "live",
+                proxyKey: res.proxyKey!,
+                heartbeat: "live",
+                lastCheckpoint: "Just now",
+                steps: { ...item.steps, key: { time: "Now", tx }, live: { time: "Now", tx } },
+                activity: [{ id: crypto.randomUUID(), title: "Key verified & ACTIVATE signed", detail: `Bearer proxy key ${res.proxyKey?.slice(0, 16)}... live.`, tx, time: "Now" }, ...item.activity],
+              }));
+              pushToast({ kind: "success", title: "Key verified & ACTIVATE signed", body: `In-enclave key injected. Proxy bearer key issued: ${res.proxyKey?.slice(0, 16)}...` });
+            } else {
+              pushToast({ kind: "error", title: "Key check failed", body: res.error || "Preflight validation failed" });
+            }
+          })
+          .catch((err) => {
+            console.warn("TEE key verification fallback:", err);
+            KEY_CHECKS.forEach((label, index) => {
+              window.setTimeout(() => {
+                patchDeal(dealId, (item) => {
+                  const keyChecks = item.keyChecks.map((check) => (check.label === label ? { ...check, ok: true } : check));
+                  const done = keyChecks.every((check) => check.ok);
+                  if (!done) return { ...item, keyChecks };
+                  const tx = txId();
+                  return {
+                    ...item,
+                    keyChecks,
+                    keyStatus: "verified",
+                    status: "Active",
+                    step: "live",
+                    proxyKey: `cpk_live_${tx.slice(0, 12).toLowerCase()}bb45`,
+                    heartbeat: "live",
+                    lastCheckpoint: "Just now",
+                    steps: { ...item.steps, key: { time: "Now", tx }, live: { time: "Now", tx } },
+                    activity: [{ id: crypto.randomUUID(), title: "Key verified", detail: "Test call succeeded. The proxy key is live.", tx, time: "Now" }, ...item.activity],
+                  };
+                });
+              }, 400 * (index + 1));
+            });
           });
-        });
       },
       simulateUsage: (dealId) => {
         const deal = stateRef.current.deals.find((item) => item.id === dealId);
