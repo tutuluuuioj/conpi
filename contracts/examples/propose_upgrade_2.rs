@@ -63,10 +63,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("Member 2 Key:      {}", member2_sk.public_key());
 
     // Locate the verifiable WASM binary
-    let wasm_p1 = Path::new("contracts/target/near/conpi_escrow.wasm");
-    let wasm_p2 = Path::new("target/near/conpi_escrow.wasm");
-    let wasm_p3 = Path::new("contracts/res/conpi_escrow.wasm");
-    let wasm_p4 = Path::new("res/conpi_escrow.wasm");
+    let wasm_p1 = Path::new("contracts/res/conpi_escrow.wasm");
+    let wasm_p2 = Path::new("res/conpi_escrow.wasm");
+    let wasm_p3 = Path::new("contracts/target/near/conpi_escrow.wasm");
+    let wasm_p4 = Path::new("target/near/conpi_escrow.wasm");
     let wasm_path = if wasm_p1.exists() {
         wasm_p1
     } else if wasm_p2.exists() {
@@ -76,7 +76,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     } else if wasm_p4.exists() {
         wasm_p4
     } else {
-        eprintln!("Error: conpi_escrow.wasm not found in target/near/ or res/");
+        eprintln!("Error: conpi_escrow.wasm not found in res/ or target/near/");
         std::process::exit(1);
     };
 

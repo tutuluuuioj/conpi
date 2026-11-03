@@ -634,3 +634,166 @@ async fn test_workspaces_multisig_dao_governance_cycle() -> Result<(), Box<dyn s
 
     Ok(())
 }
+
+#[tokio::test]
+async fn test_workspaces_multisig_dao_upgrade_proposal_staged() -> Result<(), Box<dyn std::error::Error>> {
+    use near_sdk::json_types::Base64VecU8;
+    use near_workspaces::types::AccessKey;
+    use sha2::{Digest, Sha256};
+
+    let worker = near_workspaces::sandbox().await?;
+    let wasm = std::fs::read(WASM_PATH)?;
+    let escrow_contract = worker.dev_deploy(&wasm).await?;
+
+    // Deploy Multisig DAO Contract
+    let multisig_wasm = std::fs::read("./multisig.wasm")?;
+    let dao_account = worker.dev_create_account().await?;
+    dao_account.deploy(&multisig_wasm).await?.into_result()?;
+
+    // Init multisig with 2 confirmations required
+    dao_account
+        .call(dao_account.id(), "new")
+        .args_json(serde_json::json!({
+            "num_confirmations": 2
+        }))
+        .max_gas()
+        .transact()
+        .await?
+        .into_result()?;
+
+    // Generate 3 real member keypairs
+    let member1_sk = near_workspaces::types::SecretKey::from_random(near_workspaces::types::KeyType::ED25519);
+    let member2_sk = near_workspaces::types::SecretKey::from_random(near_workspaces::types::KeyType::ED25519);
+    let member3_sk = near_workspaces::types::SecretKey::from_random(near_workspaces::types::KeyType::ED25519);
+
+    let deployer_pk = dao_account.secret_key().public_key();
+
+    let member_methods = &["add_request", "add_request_and_confirm", "confirm", "delete_request"];
+    let member_access = AccessKey::function_call_access(dao_account.id(), member_methods, None);
+    dao_account
+        .batch(dao_account.id())
+        .add_key(member1_sk.public_key(), member_access.clone())
+        .add_key(member2_sk.public_key(), member_access.clone())
+        .add_key(member3_sk.public_key(), member_access)
+        .delete_key(deployer_pk)
+        .transact()
+        .await?
+        .into_result()?;
+
+    // Initialize Escrow with DAO as owner and full 48-hour timelock
+    escrow_contract
+        .call("new")
+        .args_json(serde_json::json!({
+            "owner": dao_account.id(),
+            "chain_id": "testnet",
+            "config": null,
+            "initial_tee_signer": null,
+            "timelock_duration": 172_800_000_000_000u64
+        }))
+        .max_gas()
+        .transact()
+        .await?
+        .into_result()?;
+
+    let member1_account = near_workspaces::Account::from_secret_key(dao_account.id().clone(), member1_sk, &worker);
+    let member2_account = near_workspaces::Account::from_secret_key(dao_account.id().clone(), member2_sk, &worker);
+
+    // Compute code hash of mock upgrade code
+    let mock_upgrade_wasm = b"mock_verifiable_upgrade_wasm".to_vec();
+    let mut hasher = Sha256::new();
+    hasher.update(&mock_upgrade_wasm);
+    let code_hash_bytes: [u8; 32] = hasher.finalize().into();
+
+    #[derive(serde::Serialize)]
+    struct ProposeArgs {
+        action: conpi_escrow::types::AdminAction,
+    }
+    let propose_args = serde_json::to_vec(&ProposeArgs {
+        action: conpi_escrow::types::AdminAction::Upgrade {
+            code_hash: code_hash_bytes,
+        },
+    })?;
+    let base64_args = Base64VecU8::from(propose_args);
+
+    let add_req_res = member1_account
+        .call(dao_account.id(), "add_request_and_confirm")
+        .args_json(serde_json::json!({
+            "request": {
+                "receiver_id": escrow_contract.id(),
+                "actions": [
+                    {
+                        "type": "FunctionCall",
+                        "method_name": "propose_admin_action",
+                        "args": base64_args,
+                        "deposit": "0",
+                        "gas": "50000000000000"
+                    }
+                ]
+            }
+        }))
+        .max_gas()
+        .transact()
+        .await?;
+    assert!(add_req_res.is_success());
+    let req_id: u32 = add_req_res.json()?;
+
+    // Quorum reached by Member 2 confirmation
+    let confirm_res = member2_account
+        .call(dao_account.id(), "confirm")
+        .args_json(serde_json::json!({ "request_id": req_id }))
+        .max_gas()
+        .transact()
+        .await?;
+    assert!(confirm_res.is_success());
+
+    // Verify Proposal #1 is staged with Upgrade action
+    let staged_prop: Option<serde_json::Value> = escrow_contract
+        .view("get_staged_proposal")
+        .args_json(serde_json::json!({ "proposal_id": 1 }))
+        .await?
+        .json()?;
+    assert!(staged_prop.is_some(), "Upgrade proposal must be staged on Escrow contract");
+    let staged = staged_prop.unwrap();
+    assert!(staged["action"].get("Upgrade").is_some(), "Staged action must be Upgrade");
+
+    // Attempt early execution via multisig -> must fail due to 48h timelock
+    let exec_args = serde_json::to_vec(&serde_json::json!({
+        "proposal_id": 1,
+        "code": mock_upgrade_wasm
+    }))?;
+    let exec_b64 = Base64VecU8::from(exec_args);
+
+    let early_exec_req = member1_account
+        .call(dao_account.id(), "add_request_and_confirm")
+        .args_json(serde_json::json!({
+            "request": {
+                "receiver_id": escrow_contract.id(),
+                "actions": [
+                    {
+                        "type": "FunctionCall",
+                        "method_name": "execute_admin_action",
+                        "args": exec_b64,
+                        "deposit": "0",
+                        "gas": "250000000000000"
+                    }
+                ]
+            }
+        }))
+        .max_gas()
+        .transact()
+        .await?;
+    assert!(early_exec_req.is_success());
+    let early_req_id: u32 = early_exec_req.json()?;
+
+    let early_confirm = member2_account
+        .call(dao_account.id(), "confirm")
+        .args_json(serde_json::json!({ "request_id": early_req_id }))
+        .max_gas()
+        .transact()
+        .await?;
+    assert!(early_confirm.is_failure(), "Early execution of upgrade must fail 48h timelock");
+    println!("near-workspaces: Verified upgrade proposal staged and premature execution rejected by timelock!");
+
+    Ok(())
+}
+
