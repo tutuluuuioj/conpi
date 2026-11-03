@@ -4,7 +4,7 @@ import { CONFIG } from "./config.js";
 import { attestationService } from "./attestation/tdx.js";
 import { negotiationService } from "./negotiation/matcher.js";
 import { keyVault } from "./vault/preflight.js";
-import { handleChatCompletions, handleModels } from "./proxy/server.js";
+import { handleChatCompletions, handleModels, handleAnthropicMessages } from "./proxy/server.js";
 import { nearRelayer } from "./chain/relayer.js";
 
 const app = Fastify({ logger: true });
@@ -92,6 +92,7 @@ async function bootstrap() {
 
   // 4. OpenAI / Anthropic Reverse Proxy
   app.post("/v1/chat/completions", handleChatCompletions);
+  app.post("/v1/messages", handleAnthropicMessages);
   app.get("/v1/models", handleModels);
 
   // 5. Live Meter Snapshot & SSE Stream

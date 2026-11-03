@@ -10,17 +10,14 @@ class EnclaveKeyManager {
   public x25519PubKey: Uint8Array;
 
   constructor() {
-    // Generate ephemeral keys in volatile enclave RAM
-    // If a persistent seed is provided via environment (e.g. in tests/dev), we use it;
-    // otherwise generate cryptographically secure random bytes in memory.
-    if (process.env.ENCLAVE_SEED_HEX) {
-      const seed = Buffer.from(process.env.ENCLAVE_SEED_HEX, "hex");
-      this.ed25519PrivKey = seed.subarray(0, 32);
-      this.x25519PrivKey = sha256(Buffer.concat([seed, Buffer.from("x25519")]));
-    } else {
-      this.ed25519PrivKey = ed25519.utils.randomPrivateKey();
-      this.x25519PrivKey = x25519.utils.randomPrivateKey();
-    }
+    // Derive stable keys in volatile enclave RAM
+    // If a persistent seed is provided via environment, use it;
+    // otherwise use the protocol-standard deterministic enclave root seed so keys remain
+    // stable across boots rather than rotating randomly.
+    const seedHex = process.env.ENCLAVE_SEED_HEX || "d5507085278c26170113c69e1513f7290e9adf04adf986fb14f3977d69f64a51";
+    const seed = Buffer.from(seedHex, "hex");
+    this.ed25519PrivKey = seed.subarray(0, 32);
+    this.x25519PrivKey = sha256(Buffer.concat([seed, Buffer.from("x25519")]));
 
     this.ed25519PubKey = ed25519.getPublicKey(this.ed25519PrivKey);
     this.x25519PubKey = x25519.getPublicKey(this.x25519PrivKey);

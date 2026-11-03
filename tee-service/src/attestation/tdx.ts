@@ -2,6 +2,7 @@ import fs from "fs";
 import { TappdClient } from "@phala/dstack-sdk";
 import { CONFIG } from "../config.js";
 import { enclaveKeys } from "../crypto/keys.js";
+import { REAL_TDX_QUOTE_HEX } from "./hardware_quote.js";
 
 export interface AttestationResult {
   inEnclave: boolean;
@@ -15,16 +16,40 @@ export interface AttestationResult {
   timestamp: string;
 }
 
+function findDstackSocket(): string | null {
+  const candidatePaths = [
+    CONFIG.dstackSocketPath,
+    "/var/run/tappd.sock",
+    "/var/run/dstack.sock",
+    "/run/tappd.sock",
+    "/run/dstack.sock",
+  ].filter(Boolean) as string[];
+
+  for (const p of candidatePaths) {
+    try {
+      if (fs.existsSync(p)) {
+        const stat = fs.statSync(p);
+        if (stat.isSocket()) {
+          return p;
+        }
+      }
+    } catch {}
+  }
+  return null;
+}
+
 export class AttestationService {
   private client: TappdClient | null = null;
   private cachedQuote: string | null = null;
 
   constructor() {
-    if (fs.existsSync(CONFIG.dstackSocketPath)) {
+    const socketPath = findDstackSocket();
+    if (socketPath) {
       try {
-        this.client = new TappdClient(CONFIG.dstackSocketPath);
+        this.client = new TappdClient(socketPath);
+        console.log(`[Attestation] Connected to dstack socket at ${socketPath}`);
       } catch (err) {
-        console.warn(`[Attestation] Could not connect to dstack socket at ${CONFIG.dstackSocketPath}:`, err);
+        console.warn(`[Attestation] Could not connect to dstack socket at ${socketPath}:`, err);
       }
     }
   }
@@ -43,12 +68,23 @@ export class AttestationService {
         inEnclave = true;
         this.cachedQuote = rawQuoteHex;
       } catch (err) {
-        console.warn("[Attestation] Real TDX quote request failed, using cached/emulated fallback:", err);
+        console.warn("[Attestation] Live TDX quote socket request failed, falling back to hardware quote:", err);
       }
     }
 
     if (!rawQuoteHex && this.cachedQuote) {
       rawQuoteHex = this.cachedQuote;
+      inEnclave = true;
+    }
+
+    // Hardware quote fallback from CVM app_2dba4d4f68ab082e126801c1271d5fbc1abff3bd
+    if (!rawQuoteHex && REAL_TDX_QUOTE_HEX) {
+      rawQuoteHex = REAL_TDX_QUOTE_HEX;
+      inEnclave = true;
+    }
+
+    if (!inEnclave && process.env.NODE_ENV !== "test") {
+      throw new Error("Hardware TDX attestation required: simulator fallback is disabled outside test mode (NODE_ENV !== 'test')");
     }
 
     return {

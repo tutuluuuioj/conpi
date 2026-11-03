@@ -1,4 +1,4 @@
-import { BASE_URL, CONFIG, PROXY_KEY, TERMS_HASH, TX } from "./chain";
+import { BASE_URL, CONFIG, TERMS_HASH, TX } from "./chain";
 import type { Claim, Deal, Listing, Notice, Proposal, Terms } from "./types";
 
 export const MODELS = [
@@ -237,7 +237,7 @@ export const DEALS: Deal[] = [
       { label: "Model available", ok: true },
       { label: "Balance covers the credit", ok: true },
     ],
-    proxyKey: PROXY_KEY,
+    proxyKey: "",
     proxyRevoked: false,
     baseUrl: BASE_URL,
     usedUsd: 32,

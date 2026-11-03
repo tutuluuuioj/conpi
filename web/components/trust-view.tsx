@@ -2,7 +2,7 @@
 
 import { useEffect, useState } from "react";
 import { ShieldCheck } from "lucide-react";
-import { CODE_HASH, CONTRACT_ID, DAO_ID, MEMBERS, MRTD, TEE_SIGNER, explorerAccount } from "@/lib/chain";
+import { CODE_HASH, CONTRACT_ID, DAO_ID, MEMBERS, explorerAccount } from "@/lib/chain";
 import { useApp } from "@/lib/store";
 import { teeApi, TeeAttestation } from "@/lib/tee-api";
 import { Badge, Card, HashChip, Overline } from "./ui";
@@ -21,8 +21,8 @@ export function TrustView() {
       });
   }, []);
 
-  const activeSignerKey = attestation?.signerPublicKeyNear || TEE_SIGNER;
-  const activeMrtd = attestation?.mrtd || MRTD;
+  const activeSignerKey = attestation?.signerPublicKeyNear || "Querying TEE enclave remote attestation...";
+  const activeMrtd = attestation?.mrtd || "Querying measurement from enclave...";
   const isEnclave = attestation?.inEnclave ?? false;
 
   return (

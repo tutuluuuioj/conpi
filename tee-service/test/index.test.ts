@@ -158,8 +158,34 @@ async function runTests() {
 
   console.log("PASS: Precision token meter & milestone stages verified.");
 
+  // 7. Mock Key Rejection Outside Test Mode
+  console.log("\n[Test 7] Testing Mock Key Rejection Outside Test Mode...");
+  const oldEnv = process.env.NODE_ENV;
+  try {
+    process.env.NODE_ENV = "production";
+    const prodKeyResult = await keyVault.validateAndInjectKey(
+      2,
+      "OpenAI",
+      "gpt-4o",
+      ["gpt-4o"],
+      100,
+      80,
+      "00".repeat(32),
+      undefined,
+      "mock_sk_forbidden_prod"
+    );
+    console.log("  Mock key in production ok:", prodKeyResult.ok);
+    console.log("  Error message:", prodKeyResult.error);
+    if (prodKeyResult.ok || !prodKeyResult.error?.includes("rejected outside test mode")) {
+      throw new Error("Expected mock key to be rejected in production!");
+    }
+    console.log("PASS: Mock keys properly rejected outside test mode.");
+  } finally {
+    process.env.NODE_ENV = oldEnv;
+  }
+
   console.log("\n=======================================================");
-  console.log("  ALL CONPI TEE SERVICE UNIT TESTS PASSED (6/6)!       ");
+  console.log("  ALL CONPI TEE SERVICE UNIT TESTS PASSED (7/7)!       ");
   console.log("=======================================================");
 }
 

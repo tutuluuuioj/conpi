@@ -1,10 +1,20 @@
 import { CONFIG } from "../config.js";
+import { connect, keyStores, KeyPair } from "near-api-js";
 
 export class NearRelayer {
   private rpcUrl: string;
+  private relayerAccountId: string | null;
+  private relayerPrivateKey: string | null;
 
   constructor() {
     this.rpcUrl = CONFIG.nodeUrl;
+    this.relayerAccountId = process.env.RELAYER_ACCOUNT_ID || null;
+    this.relayerPrivateKey = process.env.RELAYER_PRIVATE_KEY || null;
+  }
+
+  public setRelayerCredentials(accountId: string, privateKey: string) {
+    this.relayerAccountId = accountId;
+    this.relayerPrivateKey = privateKey;
   }
 
   public async callView(methodName: string, args: Record<string, any> = {}): Promise<any> {
@@ -40,6 +50,135 @@ export class NearRelayer {
       }
     }
     return null;
+  }
+
+  public async submitFunctionCall(
+    methodName: string,
+    args: Record<string, any>,
+    gasYocto: string = "100000000000000",
+    attachedDeposit: string = "0"
+  ): Promise<{ transactionHash: string; status: any }> {
+    if (!this.relayerAccountId || !this.relayerPrivateKey) {
+      throw new Error("Relayer account credentials not configured (RELAYER_ACCOUNT_ID and RELAYER_PRIVATE_KEY)");
+    }
+
+    const keyStore = new keyStores.InMemoryKeyStore();
+    const keyPair = KeyPair.fromString(this.relayerPrivateKey as any);
+    await keyStore.setKey(CONFIG.networkId, this.relayerAccountId, keyPair);
+
+    const near = await connect({
+      networkId: CONFIG.networkId,
+      nodeUrl: this.rpcUrl,
+      keyStore,
+    });
+
+    const account = await near.account(this.relayerAccountId);
+    const result = await (account as any).functionCall({
+      contractId: CONFIG.contractId,
+      methodName,
+      args,
+      gas: BigInt(gasYocto),
+      attachedDeposit: BigInt(attachedDeposit),
+    });
+
+    return {
+      transactionHash: result.transaction.hash,
+      status: result.status,
+    };
+  }
+
+  public async submitActivate(dealId: number, payloadDto: any, signatureHex: string) {
+    const termsHashBytes = Array.from(
+      Buffer.isBuffer(payloadDto.termsHash) ? payloadDto.termsHash : Buffer.from(payloadDto.termsHashHex, "hex")
+    );
+    const sigBytes = Array.from(Buffer.from(signatureHex, "hex"));
+
+    const payload = {
+      domain: payloadDto.domain,
+      contract_id: payloadDto.contractId,
+      chain_id: payloadDto.chainId,
+      deal_id: Number(dealId),
+      terms_hash: termsHashBytes,
+      kind: "Activate",
+      stage: Number(payloadDto.stage || 0),
+      metered_value: payloadDto.meteredValueYocto ? payloadDto.meteredValueYocto.toString() : "0",
+      reason: null,
+      nonce: Number(payloadDto.nonce),
+      issued_at: Number(payloadDto.issuedAtNs),
+    };
+
+    return this.submitFunctionCall("activate", {
+      deal_id: dealId,
+      payload,
+      sig: sigBytes,
+    });
+  }
+
+  public async submitReleaseStage(dealId: number, stage: number, payloadDto: any, signatureHex: string) {
+    const termsHashBytes = Array.from(
+      Buffer.isBuffer(payloadDto.termsHash) ? payloadDto.termsHash : Buffer.from(payloadDto.termsHashHex, "hex")
+    );
+    const sigBytes = Array.from(Buffer.from(signatureHex, "hex"));
+
+    const payload = {
+      domain: payloadDto.domain,
+      contract_id: payloadDto.contractId,
+      chain_id: payloadDto.chainId,
+      deal_id: Number(dealId),
+      terms_hash: termsHashBytes,
+      kind: "Stage",
+      stage: Number(stage),
+      metered_value: payloadDto.meteredValueYocto ? payloadDto.meteredValueYocto.toString() : "0",
+      reason: null,
+      nonce: Number(payloadDto.nonce),
+      issued_at: Number(payloadDto.issuedAtNs),
+    };
+
+    return this.submitFunctionCall("release_stage", {
+      deal_id: dealId,
+      stage,
+      payload,
+      sig: sigBytes,
+    });
+  }
+
+  public async submitSettleDefault(dealId: number, payloadDto: any, signatureHex: string) {
+    const termsHashBytes = Array.from(
+      Buffer.isBuffer(payloadDto.termsHash) ? payloadDto.termsHash : Buffer.from(payloadDto.termsHashHex, "hex")
+    );
+    const sigBytes = Array.from(Buffer.from(signatureHex, "hex"));
+
+    // Reason name mapping
+    const reasonNames: Record<number, string> = {
+      0: "InvalidKey",
+      1: "InsufficientQuota",
+      2: "KeyNotSubmitted",
+      3: "ValidationFailed",
+      4: "ProviderBan",
+      5: "SellerSelfDrain",
+      6: "BuyerBreach",
+    };
+    const reasonStr = typeof payloadDto.reason === "number" ? reasonNames[payloadDto.reason] || "InvalidKey" : payloadDto.reason || "InvalidKey";
+
+    const payload = {
+      domain: payloadDto.domain,
+      contract_id: payloadDto.contractId,
+      chain_id: payloadDto.chainId,
+      deal_id: Number(dealId),
+      terms_hash: termsHashBytes,
+      kind: "Default",
+      stage: Number(payloadDto.stage || 0),
+      metered_value: payloadDto.meteredValueYocto ? payloadDto.meteredValueYocto.toString() : "0",
+      reason: reasonStr,
+      nonce: Number(payloadDto.nonce),
+      issued_at: Number(payloadDto.issuedAtNs),
+    };
+
+    return this.submitFunctionCall("settle_default", {
+      deal_id: dealId,
+      payload,
+      sig: sigBytes,
+    });
   }
 
   public async getDeal(dealId: number): Promise<any> {

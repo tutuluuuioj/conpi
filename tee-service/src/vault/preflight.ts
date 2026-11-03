@@ -170,31 +170,47 @@ class KeyVault {
     apiKey: string,
     model: string
   ): Promise<{ ok: boolean; modelAvailable: boolean; balanceCoversCredit: boolean; error?: string }> {
-    // If it's a test/mock key in local environment, accept immediately
+    // Mock and test shortcuts are strictly disabled outside test mode
     if (apiKey.startsWith("mock_") || apiKey.startsWith("test_") || apiKey.startsWith("sk-test")) {
+      if (process.env.NODE_ENV !== "test") {
+        return {
+          ok: false,
+          modelAvailable: false,
+          balanceCoversCredit: false,
+          error: "Mock and test API keys are rejected outside test mode (NODE_ENV !== 'test')",
+        };
+      }
       return { ok: true, modelAvailable: true, balanceCoversCredit: true };
     }
 
-    let url = "https://api.openai.com/v1/models";
+    let baseUrl = "https://api.openai.com/v1";
     let headers: Record<string, string> = {
       Authorization: `Bearer ${apiKey}`,
     };
 
-    if (provider === "Anthropic") {
-      url = "https://api.anthropic.com/v1/models";
+    const provLower = provider.toLowerCase();
+    const isRedPill = apiKey.startsWith("sk-rp-") || provLower === "redpill" || provLower === "phala";
+    const isAnthropic = provLower === "anthropic";
+    const isOpenRouter = provLower === "openrouter";
+
+    if (isRedPill) {
+      baseUrl = "https://api.redpill.ai/v1";
+      headers = { Authorization: `Bearer ${apiKey}` };
+    } else if (isAnthropic) {
+      baseUrl = "https://api.anthropic.com/v1";
       headers = {
         "x-api-key": apiKey,
         "anthropic-version": "2023-06-01",
       };
-    } else if (provider === "OpenRouter") {
-      url = "https://openrouter.ai/api/v1/models";
-      headers = {
-        Authorization: `Bearer ${apiKey}`,
-      };
+    } else if (isOpenRouter) {
+      baseUrl = "https://openrouter.ai/api/v1";
+      headers = { Authorization: `Bearer ${apiKey}` };
     }
 
     try {
-      const res = await fetch(url, { headers, method: "GET" });
+      // 1. Check models and ensure exact model match (no substring matching)
+      const modelsUrl = `${baseUrl}/models`;
+      const res = await fetch(modelsUrl, { headers, method: "GET" });
       if (res.status === 401 || res.status === 403) {
         return { ok: false, modelAvailable: false, balanceCoversCredit: false, error: "Invalid provider API key (HTTP 401/403)" };
       }
@@ -208,14 +224,55 @@ class KeyVault {
         return { ok: false, modelAvailable: false, balanceCoversCredit: false, error: `Provider error HTTP ${res.status}` };
       }
 
-      // Verify requested model is present in account
+      // Verify requested model is present in account via strict exact match
       const data: any = await res.json().catch(() => null);
       if (data && Array.isArray(data.data)) {
-        const modelsList = data.data.map((m: any) => m.id || m);
-        const targetModel = model.toLowerCase();
-        const found = modelsList.some((m: string) => typeof m === "string" && (m.toLowerCase() === targetModel || m.toLowerCase().includes(targetModel)));
+        const modelsList: string[] = data.data.map((m: any) => (typeof m === "string" ? m : m.id || ""));
+        const targetModel = model.trim().toLowerCase();
+        const found = modelsList.some((m: string) => typeof m === "string" && m.trim().toLowerCase() === targetModel);
         if (!found) {
-          return { ok: false, modelAvailable: false, balanceCoversCredit: false, error: `Model "${model}" not available for this API key` };
+          return { ok: false, modelAvailable: false, balanceCoversCredit: false, error: `Model "${model}" not available for this API key (exact match required)` };
+        }
+      }
+
+      // 2. Real balance & quota preflight check via minimal completion probe
+      if (isAnthropic) {
+        const probeRes = await fetch(`${baseUrl}/messages`, {
+          method: "POST",
+          headers: { ...headers, "Content-Type": "application/json" },
+          body: JSON.stringify({
+            model: model.trim(),
+            messages: [{ role: "user", content: "ping" }],
+            max_tokens: 1,
+          }),
+        });
+        if (probeRes.status === 402 || probeRes.status === 429) {
+          return { ok: false, modelAvailable: true, balanceCoversCredit: false, error: "Anthropic account quota or balance insufficient" };
+        }
+        if (probeRes.status === 401 || probeRes.status === 403) {
+          return { ok: false, modelAvailable: true, balanceCoversCredit: false, error: "Anthropic authentication failed during balance preflight" };
+        }
+      } else {
+        const probeRes = await fetch(`${baseUrl}/chat/completions`, {
+          method: "POST",
+          headers: { ...headers, "Content-Type": "application/json" },
+          body: JSON.stringify({
+            model: model.trim(),
+            messages: [{ role: "user", content: "ping" }],
+            max_tokens: 1,
+          }),
+        });
+        if (probeRes.status === 402) {
+          return { ok: false, modelAvailable: true, balanceCoversCredit: false, error: "Provider account balance insufficient (HTTP 402)" };
+        }
+        if (probeRes.status === 429) {
+          const probeText = await probeRes.text();
+          if (probeText.includes("insufficient_quota")) {
+            return { ok: false, modelAvailable: true, balanceCoversCredit: false, error: "Provider quota depleted (insufficient_quota)" };
+          }
+        }
+        if (probeRes.status === 401 || probeRes.status === 403) {
+          return { ok: false, modelAvailable: true, balanceCoversCredit: false, error: "Authentication failed during balance preflight" };
         }
       }
 

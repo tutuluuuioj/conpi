@@ -1,6 +1,8 @@
 import { CONTRACT_ID } from "./chain";
 
-const TEE_BASE_URL = process.env.NEXT_PUBLIC_TEE_URL || "http://localhost:8080";
+const TEE_BASE_URL =
+  process.env.NEXT_PUBLIC_TEE_URL ||
+  "https://2dba4d4f68ab082e126801c1271d5fbc1abff3bd-3000.dstack-pha-prod5.phala.network";
 const NEAR_RPC_URL = process.env.NEXT_PUBLIC_NEAR_RPC || "https://rpc.testnet.near.org";
 
 export interface TeeAttestation {
