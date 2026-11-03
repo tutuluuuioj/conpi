@@ -34,13 +34,13 @@ struct ExecuteArgs {
 }
 
 const ESCROW_ID: &str = "dev-20261103062448-30583839049419.testnet";
-const STABLE_TEE_SIGNER: &str = "ed25519:4yo9jeUALcRXyzu3HNgS98qRyXj96vG17BPhh7fG3fD1";
-const REAL_TEE_MRTD: &str = "7fe60787222bd394cb516abca2435f22f035ab2cc9c0a4b4b3b148e46297f3d931a237b72f359052c6e657d8c1409173";
+const DSTACK_HARDWARE_SIGNER: &str = "ed25519:5jN7jUGPFB4hWMELZnpkojQH1PcN5J4ikPJKvNWEwvQ5";
+const HARDWARE_MEASUREMENT: &str = "mrtd:7fe60787222bd394cb516abca2435f22f035ab2cc9c0a4b4b3b148e46297f3d931a237b72f359052c6e657d8c1409173|rtmr3:249f5a327653a06afe20d841fb30b7727c422ad7090f1a55b95d1192e899ae7c5ec8468fb76404f49bc24dffca524124|compose:be858ab67586b8be3bdef5c1362dedf44d073a4443fe64455586dacd651c18cc";
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("============================================================");
-    println!("  REGISTER PHALA INTEL TDX TEE SIGNER & REAL MRTD ON ESCROW ");
+    println!("  REGISTER PHALA INTEL TDX TEE SIGNER & MRTD/RTMR3/COMPOSE  ");
     println!("============================================================");
 
     // 1. Load keys
@@ -56,8 +56,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     println!("DAO Multisig Account: {}", dao_id);
     println!("Target Escrow Contract: {}", escrow_id);
-    println!("Stable TEE Signer: {}", STABLE_TEE_SIGNER);
-    println!("Real Hardware MRTD: {}", REAL_TEE_MRTD);
+    println!("Dstack Derived Signer:  {}", DSTACK_HARDWARE_SIGNER);
+    println!("Hardware Measurement:   {}", HARDWARE_MEASUREMENT);
 
     let member1_sk: SecretKey = keys_file.members[0].secret_key.parse()?;
     let member2_sk: SecretKey = keys_file.members[1].secret_key.parse()?;
@@ -70,8 +70,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // 3. Prepare AdminAction::AddTeeSigner
     let action = AdminAction::AddTeeSigner {
-        public_key: STABLE_TEE_SIGNER.parse()?,
-        measurement: REAL_TEE_MRTD.to_string(),
+        public_key: DSTACK_HARDWARE_SIGNER.parse()?,
+        measurement: HARDWARE_MEASUREMENT.to_string(),
     };
     let propose_call_args = serde_json::to_vec(&ProposeArgs { action })?;
     let propose_b64 = Base64VecU8::from(propose_call_args);
@@ -112,7 +112,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let confirm1_tx = confirm1_res.outcome().transaction_hash;
     println!("Quorum (2/2) reached! Proposal staged on Escrow contract. Tx: {}", confirm1_tx);
 
-    // Query staged proposals to find the staged proposal_id and ready_at
+    // Query staged proposals
     let staged_proposals: Vec<(u64, serde_json::Value)> = worker
         .view(&escrow_id, "list_staged_proposals")
         .args_json(serde_json::json!({}))
@@ -200,32 +200,32 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("\nVerifying on-chain state for TEE Signer...");
     let tee_signer_info: Option<TeeSigner> = worker
         .view(&escrow_id, "get_tee_signer")
-        .args_json(serde_json::json!({ "public_key": STABLE_TEE_SIGNER }))
+        .args_json(serde_json::json!({ "public_key": DSTACK_HARDWARE_SIGNER }))
         .await?
         .json()?;
 
     if let Some(signer) = tee_signer_info {
         println!("SUCCESS! TEE Signer registered on Escrow contract:");
-        println!("  Signer Public Key: {}", STABLE_TEE_SIGNER);
+        println!("  Signer Public Key: {}", DSTACK_HARDWARE_SIGNER);
         println!("  Measurement:       {}", signer.measurement);
         println!("  Registered At:     {}", signer.registered_at);
         println!("  Active:            {}", signer.active);
         assert!(signer.active, "Signer must be active");
-        assert_eq!(signer.measurement, REAL_TEE_MRTD, "MRTD must match");
+        assert_eq!(signer.measurement, HARDWARE_MEASUREMENT, "Measurement must match");
     } else {
         panic!("TEE Signer was not found on Escrow contract!");
     }
 
     println!("\n============================================================");
-    println!("  PHALA TEE SIGNER & MRTD REGISTRATION COMPLETE!            ");
+    println!("  PHALA TEE SIGNER & MEASUREMENT REGISTRATION COMPLETE!     ");
     println!("============================================================");
     println!("Proposal Creation Tx:     {}", req1_tx);
     println!("Proposal Confirmation Tx: {}", confirm1_tx);
     println!("Execution Proposal Tx:    {}", exec_req_tx);
     println!("Execution Confirmation Tx:{}", confirm_exec_tx);
     println!("Escrow Contract:          {}", escrow_id);
-    println!("TEE Signer:               {}", STABLE_TEE_SIGNER);
-    println!("Measured MRTD:            {}", REAL_TEE_MRTD);
+    println!("TEE Signer:               {}", DSTACK_HARDWARE_SIGNER);
+    println!("Measurement (MRTD+RTMR3): {}", HARDWARE_MEASUREMENT);
     println!("============================================================");
 
     Ok(())

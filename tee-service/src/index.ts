@@ -6,6 +6,8 @@ import { attestationService } from "./attestation/tdx.js";
 import { negotiationService } from "./negotiation/matcher.js";
 import { keyVault } from "./vault/preflight.js";
 import { handleChatCompletions, handleModels, handleAnthropicMessages } from "./proxy/server.js";
+import { meterEngine } from "./proxy/meter.js";
+import { DefaultReason } from "./crypto/borsh.js";
 import { nearRelayer } from "./chain/relayer.js";
 
 const app = Fastify({ logger: true });
@@ -157,6 +159,43 @@ async function bootstrap() {
         },
         signatureHex: item.signatureHex,
       })),
+    };
+  });
+
+  app.post("/v1/deals/:id/default", async (req, reply) => {
+    const { id } = req.params as { id: string };
+    const dealId = parseInt(id, 10);
+    const { reason } = (req.body as any) || {};
+    const entry = keyVault.getByDealId(dealId);
+    if (!entry) {
+      return reply.status(404).send({ error: "Deal not found in key vault" });
+    }
+    entry.active = false;
+    let defReason = DefaultReason.InvalidKey;
+    if (reason === "BuyerBreach") defReason = DefaultReason.BuyerBreach;
+    if (reason === "InsufficientQuota") defReason = DefaultReason.InsufficientQuota;
+    if (reason === "ProviderBan") defReason = DefaultReason.ProviderBan;
+    const defaultSig = meterEngine.emitDefault(entry, entry.termsHashHex, defReason);
+    entry.signedPayloads.push(defaultSig);
+    return {
+      ok: true,
+      dealId,
+      defaultPayload: {
+        payload: {
+          domain: defaultSig.payload.domain,
+          contractId: defaultSig.payload.contractId,
+          chainId: defaultSig.payload.chainId,
+          dealId: Number(defaultSig.payload.dealId),
+          termsHashHex: Buffer.from(defaultSig.payload.termsHash).toString("hex"),
+          kind: defaultSig.payload.kind,
+          stage: defaultSig.payload.stage,
+          meteredValueYocto: defaultSig.payload.meteredValueYocto.toString(),
+          reason: defaultSig.payload.reason !== null && defaultSig.payload.reason !== undefined ? defaultSig.payload.reason : null,
+          nonce: defaultSig.payload.nonce.toString(),
+          issuedAtNs: defaultSig.payload.issuedAtNs.toString(),
+        },
+        signatureHex: defaultSig.signatureHex,
+      },
     };
   });
 
