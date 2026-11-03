@@ -1169,13 +1169,15 @@ async fn test_workspaces_multisig_dao_upgrade_execution_with_timelock_and_migrat
     assert_eq!(deal_after.buyer_deposited, NearToken::from_near(4).as_yoctonear());
     assert_eq!(deal_after.seller_deposited, NearToken::from_near(1).as_yoctonear());
 
-    // (e) Config survived migration
-    let config_after: serde_json::Value = escrow_contract
+    // (e) Config survived migration (asserting exact config values)
+    let config_after: conpi_escrow::types::Config = escrow_contract
         .view("get_config")
         .args_json(serde_json::json!({}))
         .await?
         .json()?;
-    assert!(config_after.get("min_slash_bps").is_some());
+    assert_eq!(config_after.min_slash_bps, 1_000, "min_slash_bps value must be preserved across migration");
+    assert_eq!(config_after.max_slash_bps, 10_000, "max_slash_bps value must be preserved across migration");
+    assert_eq!(config_after.notice_period_duration, 86_400_000_000_000, "notice_period_duration must be preserved across migration");
 
     // (f) Proposal #1 is consumed
     let staged_after: Option<serde_json::Value> = escrow_contract
