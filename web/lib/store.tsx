@@ -3,7 +3,7 @@
 import { createContext, useContext, useEffect, useMemo, useRef, useState } from "react";
 import { BASE_URL, CONFIG, CONTRACT_ID, MARKET_SNAPSHOT, TX } from "./chain";
 import { KEY_CHECKS, MODELS, listingTerms } from "./data";
-import { maskKey, round2, sameTerms, txId, usd } from "./format";
+import { maskKey, round2, sameTerms, usd } from "./format";
 import { escrowOf, settleComplete, settleRevoke, stageFor } from "./money";
 import type { Asset, Claim, Deal, DealStatus, DealStep, Listing, Notice, Proposal, SignResult, Terms, ThemeMode, Toast, WalletName } from "./types";
 import { teeApi } from "./tee-api";
@@ -19,13 +19,17 @@ import {
   getWalletSelector,
   connectWalletModal,
   disconnectWallet,
+  signAndSendCall,
   txCreateDeal,
+  txAcceptDeal,
   txDepositNear,
   txDepositFt,
+  txStorageDeposit,
   txActivateDeal,
   txReleaseStage,
   txSettleDefault,
   txClaim,
+  formatSignedPayloadForContract,
 } from "./wallet";
 
 interface State {
@@ -85,12 +89,12 @@ interface Api {
   openTicket: (listingId: string) => string | null;
   sendMessage: (dealId: string, text: string) => void;
   updateBuyerTerms: (dealId: string, patch: Partial<Deal["buyerTerms"]>) => void;
-  submitTerms: (dealId: string) => void;
+  acceptDeal: (dealId: string) => Promise<SignResult>;
   deposit: (dealId: string) => Promise<SignResult>;
   submitSellerKey: (dealId: string, plainApiKey?: string) => Promise<void>;
-  simulateUsage: (dealId: string) => void;
-  simulateRevoke: (dealId: string) => void;
-  simulateCounterparty: (dealId: string) => void;
+  releaseStagePayout: (dealId: string) => Promise<SignResult>;
+  triggerDefaultSettlement: (dealId: string, reason?: string) => Promise<SignResult>;
+  syncMeterState: (dealId: string) => Promise<void>;
   setHeartbeat: (dealId: string, heartbeat: "live" | "stale") => void;
   claimOne: (id: string) => Promise<SignResult>;
   claimAll: () => Promise<SignResult>;
@@ -98,9 +102,9 @@ interface Api {
   cancelMyListings: () => SignResult;
   rotateKey: (dealId: string) => SignResult;
   revokeKey: (dealId: string) => SignResult;
-  cancelDeal: (dealId: string) => SignResult;
+  cancelDeal: (dealId: string) => Promise<SignResult> | SignResult;
   confirmProposal: (id: string) => void;
-  executeProposal: (id: string) => SignResult;
+  executeProposal: (id: string) => Promise<SignResult> | SignResult;
   markNotice: (id: string) => void;
   markAllNotices: () => void;
   clearPulse: (dealId: string) => void;
@@ -557,15 +561,28 @@ export function Providers({ children }: { children: React.ReactNode }) {
           buyerTerms: { ...deal.buyerTerms, ...patch },
         }));
       },
-      submitTerms: (dealId) => {
-        patchDeal(dealId, (deal) => ({
-          ...deal,
-          buyerSubmitted: true,
-          sellerSubmitted: true,
-          step: "deposit",
-          activity: [{ id: crypto.randomUUID(), title: "Terms matched", detail: "Terms confirmed on both sides.", time: "Now" }, ...deal.activity],
-        }));
-        pushToast({ kind: "success", title: "Terms confirmed", body: "Proceed to deposit escrow funds on NEAR." });
+      acceptDeal: async (dealId) => {
+        const deal = stateRef.current.deals.find((item) => item.id === dealId);
+        if (!deal) return { ok: false, title: "Deal not found" };
+        try {
+          const cleanHex = (deal.termsHash || "").replace(/^0x/, "");
+          const hashBytes = Array.from(Buffer.from(cleanHex, "hex"));
+          if (hashBytes.length !== 32) throw new Error("Deal terms_hash missing or invalid");
+
+          const outcome: any = await txAcceptDeal(Number(dealId), hashBytes);
+          const txHash = outcome?.transaction?.hash || outcome?.transaction_outcome?.id;
+          if (!txHash) throw new Error("Accept deal transaction was not confirmed");
+
+          setTimeout(loadOnChainData, 2000);
+          return {
+            ok: true,
+            title: "Deal accepted on NEAR!",
+            body: "Counterparty acceptance registered on contract.",
+            href: `https://testnet.nearblocks.io/txns/${txHash}`,
+          };
+        } catch (err: any) {
+          return { ok: false, title: "Accept deal failed", body: err.message };
+        }
       },
       deposit: async (dealId) => {
         const deal = stateRef.current.deals.find((item) => item.id === dealId);
@@ -578,7 +595,9 @@ export function Providers({ children }: { children: React.ReactNode }) {
           if (deal.token === "NEAR") {
             const yocto = BigInt(Math.round(amount * 1e6)) * BigInt(1e18);
             const outcome: any = await txDepositNear(Number(dealId), yocto.toString());
-            const txHash = outcome?.transaction?.hash || outcome?.transaction_outcome?.id || txId();
+            const txHash = outcome?.transaction?.hash || outcome?.transaction_outcome?.id;
+            if (!txHash) throw new Error("Deposit transaction was not confirmed");
+
             patchDeal(dealId, (item) => ({
               ...item,
               buyerDeposited: isBuyer ? true : item.buyerDeposited,
@@ -587,13 +606,16 @@ export function Providers({ children }: { children: React.ReactNode }) {
               status: "Funded",
               activity: [{ id: crypto.randomUUID(), title: "Escrow deposited", detail: `${amount} NEAR locked on-chain.`, tx: txHash, time: "Now" }, ...item.activity],
             }));
+            setTimeout(loadOnChainData, 2000);
             return { ok: true, title: "Deposit confirmed on NEAR", body: `${amount} NEAR locked in escrow.`, href: `https://testnet.nearblocks.io/txns/${txHash}` };
           } else {
-            // Fungible Token deposit via ft_transfer_call
-            const tokenContract = "usdc.fakes.testnet";
+            const tokenContract = (deal as any).tokenContract || (deal.token === "USDT" ? "usdt.fakes.testnet" : "usdc.fakes.testnet");
             const rawAmount = Math.round(amount * 1e6).toString();
             const outcome: any = await txDepositFt(tokenContract, Number(dealId), rawAmount);
-            const txHash = outcome?.transaction?.hash || outcome?.transaction_outcome?.id || txId();
+            const txHash = outcome?.transaction?.hash || outcome?.transaction_outcome?.id;
+            if (!txHash) throw new Error("FT Deposit transaction was not confirmed");
+
+            setTimeout(loadOnChainData, 2000);
             return { ok: true, title: "FT Deposit confirmed", body: `${amount} ${deal.token} deposited via ft_transfer_call.`, href: `https://testnet.nearblocks.io/txns/${txHash}` };
           }
         } catch (err: any) {
@@ -621,72 +643,143 @@ export function Providers({ children }: { children: React.ReactNode }) {
             return;
           }
 
-          // Submit on-chain activate with TEE signature
-          let txHash = txId();
-          if (res.activatePayload && res.activateSignatureHex) {
-            try {
-              const outcome: any = await txActivateDeal(Number(dealId), res.activatePayload, res.activateSignatureHex);
-              txHash = outcome?.transaction?.hash || outcome?.transaction_outcome?.id || txHash;
-            } catch (txErr: any) {
-              console.warn("txActivateDeal on-chain error:", txErr);
-            }
+          if (!res.activatePayload || !res.activateSignatureHex) {
+            pushToast({ kind: "error", title: "Missing TEE activation payload or signature" });
+            return;
+          }
+
+          pushToast({ kind: "pending", title: "Submitting deal activation transaction to NEAR..." });
+          const outcome: any = await txActivateDeal(Number(dealId), res.activatePayload, res.activateSignatureHex);
+          const txHash = outcome?.transaction?.hash || outcome?.transaction_outcome?.id;
+          if (!txHash) {
+            throw new Error("Activation transaction was rejected or failed on-chain");
           }
 
           patchDeal(dealId, (item) => ({
             ...item,
             status: "Active",
             step: "live",
-            proxyKey: res.proxyKey || `cpk_live_${txHash.slice(0, 12)}`,
+            proxyKey: res.proxyKey || "",
             keyStatus: "verified",
             keyChecks: KEY_CHECKS.map((label) => ({ label, ok: true })),
             activity: [{ id: crypto.randomUUID(), title: "Deal Activated via TEE", detail: "Hardware proof verified. Proxy key live.", tx: txHash, time: "Now" }, ...item.activity],
           }));
 
           pushToast({ kind: "success", title: "Deal Activated!", body: "Proxy key is active and ready for inference.", href: `https://testnet.nearblocks.io/txns/${txHash}` });
+          setTimeout(loadOnChainData, 2000);
         } catch (err: any) {
-          pushToast({ kind: "error", title: "Key submission failed", body: err.message });
+          pushToast({ kind: "error", title: "Key activation failed", body: err.message });
         }
       },
-      simulateUsage: (dealId) => {
+      releaseStagePayout: async (dealId) => {
         const deal = stateRef.current.deals.find((item) => item.id === dealId);
-        if (!deal || deal.status !== "Active") return;
-        const addUsd = Math.round((deal.credit * 0.25) * 100) / 100;
-        const nextUsed = Math.min(deal.credit, round2(deal.usedUsd + addUsd));
-        const stage = Math.min(100, Math.floor((nextUsed / deal.credit) * 100));
-        patchDeal(dealId, (item) => ({
-          ...item,
-          usedUsd: nextUsed,
-          stage,
-          tokens: item.tokens + 15000,
-          pulseStage: stage,
-        }));
+        if (!deal) return { ok: false, title: "Deal not found" };
+        pushToast({ kind: "pending", title: "Querying TEE stage payloads..." });
+
+        try {
+          const res = await fetch(`${BASE_URL}/deals/${dealId}/payloads`);
+          if (!res.ok) {
+            throw new Error(`Failed to fetch signed payloads from TEE: ${res.statusText}`);
+          }
+          const data = await res.json();
+          const signedPayloads = data.signedPayloads || [];
+          
+          const stagePayloads = signedPayloads.filter((p: any) => {
+            const kind = p.payload?.kind;
+            const isStage = kind === 2 || kind === "Stage";
+            const stg = Number(p.payload?.stage || 0);
+            return isStage && stg > (deal.stage || 0);
+          });
+
+          if (stagePayloads.length === 0) {
+            const mRes = await fetch(`${BASE_URL}/deals/${dealId}/meter`);
+            const mData = mRes.ok ? await mRes.json() : null;
+            const used = mData?.usedUsd ?? deal.usedUsd;
+            const pct = deal.credit > 0 ? Math.round((used / deal.credit) * 100) : 0;
+            return {
+              ok: false,
+              title: "No new stage payload available yet",
+              body: `Current usage is $${used.toFixed(2)} (${pct}%). The TEE signs a stage release payload once usage reaches 25%, 50%, 75%, or 100%.`,
+            };
+          }
+
+          const target = stagePayloads[0];
+          const stg = Number(target.payload.stage);
+          pushToast({ kind: "pending", title: `Submitting on-chain release for Stage ${stg}%...` });
+
+          const outcome: any = await txReleaseStage(Number(dealId), stg, target.payload, target.signatureHex);
+          const txHash = outcome?.transaction?.hash || outcome?.transaction_outcome?.id;
+          if (!txHash) throw new Error("Stage release transaction failed");
+
+          setTimeout(loadOnChainData, 2000);
+          return {
+            ok: true,
+            title: `Stage ${stg}% released on NEAR!`,
+            body: `Stage payout executed on escrow contract.`,
+            href: `https://testnet.nearblocks.io/txns/${txHash}`,
+          };
+        } catch (err: any) {
+          return { ok: false, title: "Stage release failed", body: err.message };
+        }
       },
-      simulateRevoke: (dealId) => {
+      triggerDefaultSettlement: async (dealId, reason = "SellerSelfDrain") => {
         const deal = stateRef.current.deals.find((item) => item.id === dealId);
-        if (!deal || deal.status !== "Active") return;
-        const next = { ...deal };
-        const split = settleRevoke(next);
-        const tx = txId();
-        patchDeal(dealId, (item) => ({
-          ...item,
-          status: "Defaulted",
-          step: "settled",
-          outcome: "revoked",
-          split,
-          proxyRevoked: true,
-          heartbeat: "stale",
-          steps: { ...item.steps, settled: { time: "Now", tx } },
-          activity: [{ id: crypto.randomUUID(), title: "Seller key revoked", detail: `TEE initiated default at ${usd(item.usedUsd)}.`, tx, time: "Now" }, ...item.activity],
-        }));
+        if (!deal) return { ok: false, title: "Deal not found" };
+        pushToast({ kind: "pending", title: "Requesting signed default payload from TEE..." });
+
+        try {
+          const res = await fetch(`${BASE_URL}/deals/${dealId}/default`, {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ reason }),
+          });
+
+          if (!res.ok) {
+            throw new Error(`Failed to get default payload from TEE: ${res.statusText}`);
+          }
+
+          const data = await res.json();
+          if (!data.defaultPayload) {
+            throw new Error("No default payload returned by TEE");
+          }
+
+          pushToast({ kind: "pending", title: "Submitting default settlement on NEAR..." });
+          const outcome: any = await txSettleDefault(
+            Number(dealId),
+            data.defaultPayload.payload,
+            data.defaultPayload.signatureHex
+          );
+          const txHash = outcome?.transaction?.hash || outcome?.transaction_outcome?.id;
+          if (!txHash) throw new Error("Default settlement transaction failed");
+
+          setTimeout(loadOnChainData, 2000);
+          return {
+            ok: true,
+            title: "Default settled on NEAR!",
+            body: `Settlement executed with reason: ${reason}`,
+            href: `https://testnet.nearblocks.io/txns/${txHash}`,
+          };
+        } catch (err: any) {
+          return { ok: false, title: "Default settlement failed", body: err.message };
+        }
       },
-      simulateCounterparty: (dealId) => {
-        patchDeal(dealId, (item) => ({
-          ...item,
-          buyerDeposited: true,
-          sellerDeposited: true,
-          status: "Funded",
-          step: "key",
-        }));
+      syncMeterState: async (dealId) => {
+        try {
+          const res = await fetch(`${BASE_URL}/deals/${dealId}/meter`);
+          if (res.ok) {
+            const data = await res.json();
+            patchDeal(dealId, (item) => ({
+              ...item,
+              usedUsd: data.usedUsd ?? item.usedUsd,
+              tokens: data.tokensTotal ?? item.tokens,
+              stage: item.credit > 0 ? Math.min(100, Math.floor(((data.usedUsd ?? item.usedUsd) / item.credit) * 100)) : item.stage,
+              lastUpdate: new Date().toLocaleTimeString(),
+            }));
+            pushToast({ kind: "success", title: "Meter synced with TEE enclave" });
+          }
+        } catch (err: any) {
+          console.warn("Meter sync error:", err);
+        }
       },
       setHeartbeat: (dealId, heartbeat) => patchDeal(dealId, (deal) => ({ ...deal, heartbeat })),
       claimOne: async (id) => {
@@ -694,7 +787,8 @@ export function Providers({ children }: { children: React.ReactNode }) {
         if (!current.account) return { ok: false, title: "Connect a wallet to claim" };
         try {
           const outcome: any = await txClaim(null);
-          const txHash = outcome?.transaction?.hash || outcome?.transaction_outcome?.id || txId();
+          const txHash = outcome?.transaction?.hash || outcome?.transaction_outcome?.id;
+          if (!txHash) throw new Error("Claim transaction failed");
           setState((s) => ({
             ...s,
             claims: s.claims.map((item) => (item.id === id ? { ...item, claimed: true, tx: txHash } : item)),
@@ -709,7 +803,8 @@ export function Providers({ children }: { children: React.ReactNode }) {
         if (!current.account) return { ok: false, title: "Connect a wallet to claim" };
         try {
           const outcome: any = await txClaim(null);
-          const txHash = outcome?.transaction?.hash || outcome?.transaction_outcome?.id || txId();
+          const txHash = outcome?.transaction?.hash || outcome?.transaction_outcome?.id;
+          if (!txHash) throw new Error("Batch claim transaction failed");
           setState((s) => ({
             ...s,
             claims: s.claims.map((item) => ({ ...item, claimed: true, tx: txHash })),
@@ -724,38 +819,38 @@ export function Providers({ children }: { children: React.ReactNode }) {
         if (!current.account) return { ok: false, title: "Connect a wallet first" };
 
         try {
-          // Prepare on-chain deal params
           const priceYocto = (BigInt(Math.round(listing.price * 1e6)) * BigInt(1e18)).toString();
           const creditYocto = (BigInt(Math.round(listing.credit * 1e6)) * BigInt(1e18)).toString();
           const buyerCollatYocto = (BigInt(Math.round(listing.price * (listing.buyerCollateralPct / 100) * 1e6)) * BigInt(1e18)).toString();
           const sellerCollatYocto = (BigInt(Math.round(listing.price * (listing.collateralPct / 100) * 1e6)) * BigInt(1e18)).toString();
 
-          const termsHash = Array.from(new Uint8Array(32)); // Clean canonical terms hash
           const params = {
-            seller: current.account,
-            token: null,
+            buyer: listing.type === "buy" ? current.account : (listing.seller || "buyer.testnet"),
+            seller: listing.type === "sell" ? current.account : listing.seller,
+            token: listing.token === "NEAR" ? null : ((listing as any).tokenContract || "usdc.fakes.testnet"),
             price: priceYocto,
             credit_amount: creditYocto,
-            seller_collateral: sellerCollatYocto,
             buyer_collateral: buyerCollatYocto,
-            deposit_duration: 86400000000000 * 2,
-            usage_duration: 86400000000000 * 30,
-            tee_liveness_timeout: 3600000000000,
-            slash_bps: 2000,
-            terms_hash: termsHash,
+            seller_collateral: sellerCollatYocto,
+            tee_pubkey: "ed25519:CLHhDLsLCCqFeTjz7g31NkfbtN1UqT2mJRmRZgcRPTj3",
+            deposit_duration_sec: 172800,
+            key_duration_sec: 172800,
+            tee_liveness_timeout_sec: 3600,
+            slash_bps_provider_ban: 5000,
+            slash_bps_revoke: 8000,
+            slash_bps_buyer_breach: 5000,
           };
 
           const outcome: any = await txCreateDeal(params);
-          const txHash = outcome?.transaction?.hash || outcome?.transaction_outcome?.id || txId();
+          const txHash = outcome?.transaction?.hash || outcome?.transaction_outcome?.id;
+          if (!txHash) throw new Error("Create deal transaction failed or rejected");
 
           setState((s) => ({
             ...s,
             listings: [listing, ...s.listings],
           }));
 
-          // Trigger on-chain refresh
           setTimeout(loadOnChainData, 2000);
-
           return { ok: true, title: "Deal created on NEAR!", body: `Deal registered on contract ${CONTRACT_ID}`, href: `https://testnet.nearblocks.io/txns/${txHash}` };
         } catch (err: any) {
           return { ok: false, title: "Create deal transaction failed", body: err.message };
@@ -769,8 +864,8 @@ export function Providers({ children }: { children: React.ReactNode }) {
         return { ok: true, title: "Listings cancelled", body: `${mine.length} listing${mine.length === 1 ? "" : "s"} removed.` };
       },
       rotateKey: (dealId) => {
-        const tx = txId();
-        const proxyKey = `cpk_live_${tx.slice(0, 12).toLowerCase()}bb45`;
+        const keySuffix = crypto.randomUUID().replace(/-/g, "").slice(0, 16);
+        const proxyKey = `cpk_live_${keySuffix}`;
         patchDeal(dealId, (deal) => ({ ...deal, proxyKey, proxyRevoked: false }));
         return { ok: true, title: "Proxy key rotated", body: maskKey(proxyKey) };
       },
@@ -778,17 +873,18 @@ export function Providers({ children }: { children: React.ReactNode }) {
         patchDeal(dealId, (deal) => ({ ...deal, proxyRevoked: true }));
         return { ok: true, title: "Proxy key revoked", body: "Calls with this key will be refused." };
       },
-      cancelDeal: (dealId) => {
+      cancelDeal: async (dealId) => {
         const deal = stateRef.current.deals.find((item) => item.id === dealId);
         if (!deal) return { ok: false, title: "Deal not found" };
-        const tx = txId();
-        patchDeal(dealId, (item) => ({
-          ...item,
-          status: "Cancelled",
-          step: "settled",
-          activity: [{ id: crypto.randomUUID(), title: "Deal cancelled", detail: "Refunded.", tx, time: "Now" }, ...item.activity],
-        }));
-        return { ok: true, title: "Deal cancelled", href: `https://testnet.nearblocks.io/txns/${tx}` };
+        try {
+          const outcome: any = await signAndSendCall("timeout_refund", { deal_id: Number(dealId) }, "50000000000000");
+          const txHash = outcome?.transaction?.hash || outcome?.transaction_outcome?.id;
+          if (!txHash) throw new Error("Timeout refund transaction failed");
+          setTimeout(loadOnChainData, 2000);
+          return { ok: true, title: "Deal refunded on NEAR", href: `https://testnet.nearblocks.io/txns/${txHash}`, body: "Timeout refund executed." };
+        } catch (err: any) {
+          return { ok: false, title: "Timeout refund failed", body: err.message };
+        }
       },
       confirmProposal: (id) => {
         setState((s) => ({
@@ -800,15 +896,18 @@ export function Providers({ children }: { children: React.ReactNode }) {
         }));
         pushToast({ kind: "success", title: "Confirmation recorded" });
       },
-      executeProposal: (id) => {
+      executeProposal: async (id) => {
         const proposal = stateRef.current.proposals.find((item) => item.id === id);
         if (!proposal || proposal.status !== "Ready") return { ok: false, title: "Proposal not executable yet" };
-        const tx = txId();
-        setState((s) => ({
-          ...s,
-          proposals: s.proposals.map((item) => (item.id === id ? { ...item, status: "Executed" } : item)),
-        }));
-        return { ok: true, title: "Proposal executed", href: `https://testnet.nearblocks.io/txns/${tx}` };
+        try {
+          const outcome: any = await signAndSendCall("execute_admin_action", { proposal_id: Number(id) }, "100000000000000");
+          const txHash = outcome?.transaction?.hash || outcome?.transaction_outcome?.id;
+          if (!txHash) throw new Error("Execute proposal transaction failed");
+          setTimeout(loadOnChainData, 2000);
+          return { ok: true, title: "Proposal executed on NEAR", href: `https://testnet.nearblocks.io/txns/${txHash}`, body: "Governance action executed on escrow." };
+        } catch (err: any) {
+          return { ok: false, title: "Execute proposal failed", body: err.message };
+        }
       },
       markNotice: (id) => setState((s) => ({ ...s, notices: s.notices.map((notice) => (notice.id === id ? { ...notice, read: true } : notice)) })),
       markAllNotices: () => setState((s) => ({ ...s, notices: s.notices.map((notice) => ({ ...notice, read: true })) })),

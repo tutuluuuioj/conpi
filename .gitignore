@@ -2,7 +2,9 @@
 target/
 **/*.rs.bk
 
-# Node / Next.js
+# Scratch & temporary test scripts
+scratch/
+
 node_modules/
 .next/
 out/

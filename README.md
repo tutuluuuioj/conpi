@@ -21,6 +21,8 @@
 
 Developers and teams routinely end up with prepaid LLM API credits they will not use (OpenAI, OpenRouter, Anthropic). Conpi makes credit exchange trust-minimised:
 
+> **Note on Anthropic:** The native Anthropic `/v1/messages` proxy path is implemented and format-verified; it is not yet tested with a live key.
+
 1. **Real API Key Isolation:** The real provider key is encrypted directly into a **Phala Network Intel TDX Confidential VM (TEE)** over an attested channel. The real key never leaves the secure enclave.
 2. **Drop-in Proxy Key for Buyers:** The buyer receives a temporary proxy key (`cpk_live_...`) and standard base URL (`https://tee.conpi.network/v1`).
 3. **NEAR Dual-Collateral Escrow:** A NEAR smart contract holds buyer payment + collateral from both parties.

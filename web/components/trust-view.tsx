@@ -76,19 +76,31 @@ export function TrustView() {
           </Badge>
         </div>
 
-        {/* 7 Verification Checks Grid */}
+        {/* 9 Verification Checks Grid */}
         <div className="mt-6 rounded-lg border border-line bg-surface-2/60 p-4">
           <h3 className="text-xs font-semibold uppercase tracking-wider text-muted">Cryptographic Proof Checklist</h3>
           <div className="mt-3 grid gap-3 sm:grid-cols-2">
             <div className="flex items-start gap-2 text-sm">
-              {result?.checks.nonceFresh ? (
+              {result?.checks.hardwareEnclave ? (
                 <CheckCircle2 className="h-4 w-4 text-mint shrink-0 mt-0.5" />
               ) : (
                 <XCircle className="h-4 w-4 text-danger shrink-0 mt-0.5" />
               )}
               <div>
-                <span className="font-medium text-ink">1. Fresh Nonce Generated</span>
-                <p className="text-xs font-mono text-muted truncate max-w-[280px]">nonce: {activeNonce}</p>
+                <span className="font-medium text-ink">1. Intel TDX Hardware Enclave</span>
+                <p className="text-xs text-muted">inEnclave: true (genuine Intel TDX CVM on Phala)</p>
+              </div>
+            </div>
+
+            <div className="flex items-start gap-2 text-sm">
+              {result?.checks.intelQuoteVerified ? (
+                <CheckCircle2 className="h-4 w-4 text-mint shrink-0 mt-0.5" />
+              ) : (
+                <XCircle className="h-4 w-4 text-danger shrink-0 mt-0.5" />
+              )}
+              <div>
+                <span className="font-medium text-ink">2. Intel DCAP Quote Verified</span>
+                <p className="text-xs text-muted">dcap-qvl signature chain & TCB UpToDate verified</p>
               </div>
             </div>
 
@@ -99,8 +111,8 @@ export function TrustView() {
                 <XCircle className="h-4 w-4 text-danger shrink-0 mt-0.5" />
               )}
               <div>
-                <span className="font-medium text-ink">2. sha256(ed25519 ‖ x25519 ‖ nonce)</span>
-                <p className="text-xs text-muted">Binds ephemeral signer + encryption keys</p>
+                <span className="font-medium text-ink">3. sha256(ed25519 ‖ x25519 ‖ nonce)</span>
+                <p className="text-xs text-muted">Cryptographic binding to fresh nonce {activeNonce.slice(0, 8)}...</p>
               </div>
             </div>
 
@@ -111,19 +123,33 @@ export function TrustView() {
                 <XCircle className="h-4 w-4 text-danger shrink-0 mt-0.5" />
               )}
               <div>
-                <span className="font-medium text-ink">3. Raw TDX Quote Report Data</span>
-                <p className="text-xs text-muted">32-byte raw binary injection at offset 568</p>
+                <span className="font-medium text-ink">4. Raw TDX Quote Report Data</span>
+                <p className="text-xs text-muted">32-byte binary match at hardware offset 568</p>
               </div>
             </div>
 
             <div className="flex items-start gap-2 text-sm">
-              {result?.checks.eventLogComposeHashMatches ? (
+              {result?.checks.rtmr3ReplayMatchesQuote ? (
                 <CheckCircle2 className="h-4 w-4 text-mint shrink-0 mt-0.5" />
               ) : (
                 <XCircle className="h-4 w-4 text-danger shrink-0 mt-0.5" />
               )}
               <div>
-                <span className="font-medium text-ink">4. RTMR3 Event Log Compose Hash</span>
+                <span className="font-medium text-ink">5. RTMR3 Event Log Replay Match</span>
+                <p className="text-xs font-mono text-muted truncate max-w-[280px]">
+                  {result?.rtmr3Replayed ? `${result.rtmr3Replayed.slice(0, 16)}...` : "Replaying..."}
+                </p>
+              </div>
+            </div>
+
+            <div className="flex items-start gap-2 text-sm">
+              {result?.checks.composeHashPresent ? (
+                <CheckCircle2 className="h-4 w-4 text-mint shrink-0 mt-0.5" />
+              ) : (
+                <XCircle className="h-4 w-4 text-danger shrink-0 mt-0.5" />
+              )}
+              <div>
+                <span className="font-medium text-ink">6. Compose Hash Measured</span>
                 <p className="text-xs font-mono text-muted truncate max-w-[280px]">{activeCompose.slice(0, 16)}...</p>
               </div>
             </div>
@@ -135,7 +161,7 @@ export function TrustView() {
                 <XCircle className="h-4 w-4 text-danger shrink-0 mt-0.5" />
               )}
               <div>
-                <span className="font-medium text-ink">5. Registered on Escrow Contract</span>
+                <span className="font-medium text-ink">7. Registered on Escrow Contract</span>
                 <p className="text-xs text-muted">Verified via get_tee_signer RPC view</p>
               </div>
             </div>
@@ -147,8 +173,8 @@ export function TrustView() {
                 <XCircle className="h-4 w-4 text-danger shrink-0 mt-0.5" />
               )}
               <div>
-                <span className="font-medium text-ink">6. Signer Active & Authorized</span>
-                <p className="text-xs text-muted">Active: true on NEAR state</p>
+                <span className="font-medium text-ink">8. Signer Active & Authorized</span>
+                <p className="text-xs text-muted">active: true on NEAR escrow state</p>
               </div>
             </div>
 
@@ -159,8 +185,8 @@ export function TrustView() {
                 <XCircle className="h-4 w-4 text-danger shrink-0 mt-0.5" />
               )}
               <div>
-                <span className="font-medium text-ink">7. On-Chain Measurement Match (MRTD + RTMR3/Compose)</span>
-                <p className="text-xs text-muted">Multisig DAO governance registered exact MRTD and Compose Hash</p>
+                <span className="font-medium text-ink">9. On-Chain Measurement Match (MRTD + Compose)</span>
+                <p className="text-xs text-muted">MRTD from quote and Compose Hash match contract record</p>
               </div>
             </div>
           </div>

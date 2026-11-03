@@ -81,17 +81,79 @@ export async function signAndSendCall(
   return outcome;
 }
 
+/**
+ * Converts a TEE CVM payload (camelCase / hex) to the exact Borsh/JSON SignedPayload
+ * struct expected by the NEAR smart contract.
+ */
+export function formatSignedPayloadForContract(cvmPayload: any) {
+  let termsHashArr: number[];
+  if (cvmPayload.termsHashHex) {
+    const cleanHex = cvmPayload.termsHashHex.replace(/^0x/, "");
+    termsHashArr = Array.from(Buffer.from(cleanHex, "hex"));
+  } else if (Array.isArray(cvmPayload.terms_hash)) {
+    termsHashArr = cvmPayload.terms_hash;
+  } else if (Array.isArray(cvmPayload.termsHash)) {
+    termsHashArr = cvmPayload.termsHash;
+  } else {
+    termsHashArr = new Array(32).fill(0);
+  }
+
+  let kindStr = "Activate";
+  if (cvmPayload.kind === 0 || cvmPayload.kind === "Terms") kindStr = "Terms";
+  else if (cvmPayload.kind === 1 || cvmPayload.kind === "Activate") kindStr = "Activate";
+  else if (cvmPayload.kind === 2 || cvmPayload.kind === "Stage") kindStr = "Stage";
+  else if (cvmPayload.kind === 3 || cvmPayload.kind === "Checkpoint") kindStr = "Checkpoint";
+  else if (cvmPayload.kind === 4 || cvmPayload.kind === "Default") kindStr = "Default";
+
+  const REASONS = [
+    "InvalidKey",
+    "InsufficientQuota",
+    "KeyNotSubmitted",
+    "ValidationFailed",
+    "ProviderBan",
+    "SellerSelfDrain",
+    "BuyerBreach",
+  ];
+  let reasonVal: string | null = null;
+  if (cvmPayload.reason !== null && cvmPayload.reason !== undefined) {
+    if (typeof cvmPayload.reason === "number" && REASONS[cvmPayload.reason]) {
+      reasonVal = REASONS[cvmPayload.reason];
+    } else if (typeof cvmPayload.reason === "string") {
+      reasonVal = cvmPayload.reason;
+    }
+  }
+
+  return {
+    domain: cvmPayload.domain || "conpi:v1",
+    contract_id: cvmPayload.contractId || cvmPayload.contract_id || CONTRACT_ID,
+    chain_id: cvmPayload.chainId || cvmPayload.chain_id || "testnet",
+    deal_id: Number(cvmPayload.dealId ?? cvmPayload.deal_id),
+    terms_hash: termsHashArr,
+    kind: kindStr,
+    stage: Number(cvmPayload.stage || 0),
+    metered_value: String(cvmPayload.meteredValueYocto ?? cvmPayload.metered_value ?? "0"),
+    reason: reasonVal,
+    nonce: Number(cvmPayload.nonce),
+    issued_at: Number(cvmPayload.issuedAtNs ?? cvmPayload.issued_at),
+  };
+}
+
 // 1. Create Deal on Escrow
 export async function txCreateDeal(params: any, storageDepositYocto = "50000000000000000000000") {
   return signAndSendCall("create_deal", { params }, "100000000000000", storageDepositYocto);
 }
 
-// 2. Deposit Native NEAR for Deal
+// 2. Accept Deal on Escrow
+export async function txAcceptDeal(dealId: number, expectedHashBytes: number[]) {
+  return signAndSendCall("accept_deal", { deal_id: dealId, expected_hash: expectedHashBytes }, "50000000000000");
+}
+
+// 3. Deposit Native NEAR for Deal
 export async function txDepositNear(dealId: number, depositYocto: string) {
   return signAndSendCall("deposit", { deal_id: dealId }, "50000000000000", depositYocto);
 }
 
-// 3. Deposit Fungible Token (USDC / USDT) via ft_transfer_call
+// 4. Deposit Fungible Token (USDC / USDT) via ft_transfer_call
 export async function txDepositFt(tokenContractId: string, dealId: number, amountRaw: string) {
   return signAndSendCall(
     "ft_transfer_call",
@@ -106,33 +168,48 @@ export async function txDepositFt(tokenContractId: string, dealId: number, amoun
   );
 }
 
-// 4. Activate Deal with TEE Signed Payload
-export async function txActivateDeal(dealId: number, payload: any, sigHex: string) {
-  const sigBytes = Array.from(Buffer.from(sigHex, "hex"));
-  return signAndSendCall("activate", { deal_id: dealId, payload, sig: sigBytes }, "50000000000000");
+// 5. FT Storage Deposit (register receiver on NEP-141 token)
+export async function txStorageDeposit(tokenContractId: string, accountId: string = CONTRACT_ID, depositNear = "0.00125") {
+  const depositYocto = (BigInt(Math.round(parseFloat(depositNear) * 1e6)) * BigInt(1e18)).toString();
+  return signAndSendCall(
+    "storage_deposit",
+    { account_id: accountId, registration_only: true },
+    "30000000000000",
+    depositYocto,
+    tokenContractId
+  );
 }
 
-// 5. Release Stage with TEE Signed Payload
+// 6. Activate Deal with TEE Signed Payload
+export async function txActivateDeal(dealId: number, payload: any, sigHex: string) {
+  const formattedPayload = formatSignedPayloadForContract(payload);
+  const sigBytes = Array.from(Buffer.from(sigHex, "hex"));
+  return signAndSendCall("activate", { deal_id: dealId, payload: formattedPayload, sig: sigBytes }, "50000000000000");
+}
+
+// 7. Release Stage with TEE Signed Payload
 export async function txReleaseStage(dealId: number, stage: number, payload: any, sigHex: string) {
+  const formattedPayload = formatSignedPayloadForContract(payload);
   const sigBytes = Array.from(Buffer.from(sigHex, "hex"));
   return signAndSendCall(
     "release_stage",
-    { deal_id: dealId, stage, payload, sig: sigBytes },
+    { deal_id: dealId, stage, payload: formattedPayload, sig: sigBytes },
     "50000000000000"
   );
 }
 
-// 6. Settle Default with TEE Signed Payload
+// 8. Settle Default with TEE Signed Payload
 export async function txSettleDefault(dealId: number, payload: any, sigHex: string) {
+  const formattedPayload = formatSignedPayloadForContract(payload);
   const sigBytes = Array.from(Buffer.from(sigHex, "hex"));
   return signAndSendCall(
     "settle_default",
-    { deal_id: dealId, payload, sig: sigBytes },
+    { deal_id: dealId, payload: formattedPayload, sig: sigBytes },
     "50000000000000"
   );
 }
 
-// 7. Claim Payouts
+// 9. Claim Payouts
 export async function txClaim(token: string | null = null) {
   return signAndSendCall("claim", { token }, "50000000000000");
 }

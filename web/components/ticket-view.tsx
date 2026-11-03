@@ -97,7 +97,7 @@ export function TicketView({ id }: { id: string }) {
             </div>
           ) : null}
           <div className="mt-4 flex flex-col gap-2">
-            {!matched ? <Button onClick={() => app.submitTerms(deal.id)}>Submit terms</Button> : null}
+            {!matched ? <Button onClick={() => app.acceptDeal(deal.id)}>Accept On-Chain Terms</Button> : null}
             {matched && deal.role === "buyer" ? (
               <Button onClick={() => router.push(`/deals/${deal.id}`)}>Accept and deposit</Button>
             ) : null}

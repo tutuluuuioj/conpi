@@ -79,13 +79,32 @@ export function MeterView() {
       )}
 
       <Card>
-        <Overline>Testnet tools</Overline>
-        <p className="mt-2 text-sm text-muted">These actions stay on testnet builds. They update the local deal the way the enclave would.</p>
+        <Overline>TEE Payout & Default Controls</Overline>
+        <p className="mt-2 text-sm text-muted">
+          Execute real on-chain stage releases or trigger default settlement using payloads signed by the Phala Intel TDX enclave.
+        </p>
         <div className="mt-4 flex flex-wrap gap-2">
-          <Button variant="secondary" disabled={!deal || deal.status !== "Active"} onClick={() => deal && app.simulateUsage(deal.id)}>Simulate requests</Button>
-          <Button variant="danger" disabled={!deal || deal.status !== "Active"} onClick={() => deal && app.simulateRevoke(deal.id)}>Simulate seller revoke</Button>
-          <Button variant="secondary" disabled={!deal} onClick={() => deal && app.simulateCounterparty(deal.id)}>Simulate counterparty</Button>
-          <Button variant="secondary" disabled={!deal} onClick={() => deal && app.setHeartbeat(deal.id, deal.heartbeat === "live" ? "stale" : "live")}>{deal?.heartbeat === "stale" ? "Restore heartbeat" : "Drop heartbeat"}</Button>
+          <Button
+            variant="secondary"
+            disabled={!deal || deal.status !== "Active"}
+            onClick={() => deal && app.releaseStagePayout(deal.id)}
+          >
+            Release Stage Payout (TEE Signed)
+          </Button>
+          <Button
+            variant="danger"
+            disabled={!deal || (deal.status !== "Active" && deal.status !== "Funded")}
+            onClick={() => deal && app.triggerDefaultSettlement(deal.id, "SellerSelfDrain")}
+          >
+            Trigger Default Settlement (TEE Signed)
+          </Button>
+          <Button
+            variant="secondary"
+            disabled={!deal}
+            onClick={() => deal && app.syncMeterState(deal.id)}
+          >
+            Sync TEE Meter State
+          </Button>
         </div>
       </Card>
     </div>

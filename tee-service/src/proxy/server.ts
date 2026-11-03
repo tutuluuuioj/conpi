@@ -73,12 +73,13 @@ export async function handleChatCompletions(req: FastifyRequest, reply: FastifyR
       reply.raw.setHeader("Cache-Control", "no-cache");
       reply.raw.setHeader("Connection", "keep-alive");
 
+      const testContent = `[Test Output]: ${Array.isArray(body.messages) ? (body.messages[body.messages.length - 1]?.content || "ok") : "ok"}`;
       const deltaChunk = {
         id: `chatcmpl-${Date.now()}`,
         object: "chat.completion.chunk",
         created: Math.floor(Date.now() / 1000),
         model: requestedModel,
-        choices: [{ index: 0, delta: { role: "assistant", content: "Hello from Conpi Phala TEE secure proxy!" }, finish_reason: null }],
+        choices: [{ index: 0, delta: { role: "assistant", content: testContent }, finish_reason: null }],
       };
       reply.raw.write(`data: ${JSON.stringify(deltaChunk)}\n\n`);
 
@@ -95,6 +96,7 @@ export async function handleChatCompletions(req: FastifyRequest, reply: FastifyR
       return reply.raw.end();
     }
 
+    const testContent = `[Test Output]: ${Array.isArray(body.messages) ? (body.messages[body.messages.length - 1]?.content || "ok") : "ok"}`;
     return reply.send({
       id: `chatcmpl-${Date.now()}`,
       object: "chat.completion",
@@ -102,7 +104,7 @@ export async function handleChatCompletions(req: FastifyRequest, reply: FastifyR
       model: requestedModel,
       choices: [{
         index: 0,
-        message: { role: "assistant", content: "Hello from Conpi Phala TEE secure proxy!" },
+        message: { role: "assistant", content: testContent },
         finish_reason: "stop",
       }],
       usage: {
@@ -325,12 +327,13 @@ export async function handleAnthropicMessages(req: FastifyRequest, reply: Fastif
       entry.signedPayloads.push(stagePayload);
     }
 
+    const testContent = `[Test Output]: ${Array.isArray(body.messages) ? (body.messages[body.messages.length - 1]?.content || "ok") : "ok"}`;
     return reply.send({
       id: `msg_${Date.now()}`,
       type: "message",
       role: "assistant",
       model: requestedModel,
-      content: [{ type: "text", text: "Hello from Conpi Phala TEE secure proxy (Anthropic adapter)!" }],
+      content: [{ type: "text", text: testContent }],
       stop_reason: "end_turn",
       stop_sequence: null,
       usage: {
