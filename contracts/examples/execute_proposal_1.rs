@@ -27,14 +27,18 @@ struct DaoKeysFile {
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("=== EXECUTE TIMELOCKED MULTISIG PROPOSAL #1 ON NEAR TESTNET ===");
 
-    let credentials_path = Path::new(".credentials/dao_member_keys.json");
-    if !credentials_path.exists() {
+    let creds_p1 = Path::new(".credentials/dao_member_keys.json");
+    let creds_p2 = Path::new("contracts/.credentials/dao_member_keys.json");
+    let credentials_path = if creds_p1.exists() {
+        creds_p1
+    } else if creds_p2.exists() {
+        creds_p2
+    } else {
         eprintln!(
-            "Error: Credentials file not found at {}. Ensure you run from contracts/ directory.",
-            credentials_path.display()
+            "Error: Credentials file not found at .credentials/dao_member_keys.json or contracts/.credentials/dao_member_keys.json."
         );
         std::process::exit(1);
-    }
+    };
 
     let file_content = fs::read_to_string(credentials_path)?;
     let dao_keys: DaoKeysFile = serde_json::from_str(&file_content)?;
@@ -135,7 +139,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .transact()
         .await?;
 
-    if req_res.is_failure() {
+    if !req_res.is_success() {
         eprintln!("add_request_and_confirm failed: {:?}", req_res.failures());
         std::process::exit(1);
     }
@@ -157,7 +161,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .transact()
         .await?;
 
-    if confirm_res.is_failure() {
+    if !confirm_res.is_success() {
         eprintln!("Execution failed: {:?}", confirm_res.failures());
         std::process::exit(1);
     }
