@@ -188,11 +188,18 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .json()?;
     println!("\nActive Staged Proposals on Escrow: {:?}", staged_proposals);
 
-    let (prop_upgrade_id, _prop_upgrade_val) = &staged_proposals[staged_proposals.len() - 2];
-    let (prop_transfer_id, prop_transfer_val) = &staged_proposals[staged_proposals.len() - 1];
+    let prop_upgrade = staged_proposals
+        .iter()
+        .find(|(_, val)| val["action"].get("Upgrade").is_some())
+        .expect("Upgrade proposal must be staged on Escrow");
+    let prop_transfer = staged_proposals
+        .iter()
+        .find(|(_, val)| val["action"].get("TransferOwnership").is_some())
+        .expect("TransferOwnership proposal must be staged on Escrow");
 
-    let prop_upgrade_id = *prop_upgrade_id;
-    let prop_transfer_id = *prop_transfer_id;
+    let prop_upgrade_id = prop_upgrade.0;
+    let prop_transfer_id = prop_transfer.0;
+    let prop_transfer_val = &prop_transfer.1;
 
     let trf_ready_at_ns: u64 = if let Some(n) = prop_transfer_val["ready_at"].as_u64() {
         n
