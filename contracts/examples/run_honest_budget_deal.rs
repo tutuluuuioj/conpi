@@ -369,9 +369,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         let meter_url = format!("{}/v1/deals/{}/meter", CVM_BASE_URL, deal_id);
         let meter_res = http_client.get(&meter_url).send().await?.json::<Value>().await?;
         let used_usd = meter_res["usedUsd"].as_f64().unwrap_or(0.0);
-        let pct = (used_usd / credit_usd) * 100.0;
+        let live_credit_usd = meter_res["creditUsd"].as_f64().unwrap_or(credit_usd);
+        let pct = (used_usd / live_credit_usd) * 100.0;
         println!("Live CVM Meter: usedUsd=${} ({:.1}% of ${}), tokens={}",
-            used_usd, pct, credit_usd, meter_res["tokensTotal"]);
+            used_usd, pct, live_credit_usd, meter_res["tokensTotal"]);
 
         if pct >= 100.0 {
             println!("Reached 100% honest budget milestone!");
