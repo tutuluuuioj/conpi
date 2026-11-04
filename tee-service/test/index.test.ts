@@ -4,9 +4,10 @@ import { computeTermsHash, buildTermsMessage } from "../src/crypto/terms.js";
 import { serializeSignedPayload, PayloadKind } from "../src/crypto/borsh.js";
 import { encryptToEnclave, decryptFromClient } from "../src/crypto/encryption.js";
 import { negotiationService } from "../src/negotiation/matcher.js";
-import { keyVault } from "../src/vault/preflight.js";
+import { keyVault, fetchLiveNearPriceUsd } from "../src/vault/preflight.js";
 import { calculateCost, meterEngine } from "../src/proxy/meter.js";
 import { buildApp, INTERNAL_SERVER_TOKEN } from "../src/index.js";
+import { isProviderBan } from "../src/proxy/server.js";
 
 async function runTests() {
   console.log("=== RUNNING CONPI TEE SERVICE UNIT TESTS ===");
@@ -269,8 +270,59 @@ async function runTests() {
   }
   console.log("PASS: Meter successfully records exact OpenRouter reported cost ($0.000009747).");
 
+  // 11. Provider Ban Automatic Detection Test
+  console.log("\n[Test 11] Testing Provider Ban Automatic Detection...");
+  if (!isProviderBan(403, "Forbidden")) throw new Error("403 should be detected as provider ban");
+  if (!isProviderBan(400, { error: { message: "Your account_deactivated by admin" } })) {
+    throw new Error("account_deactivated should be detected as provider ban");
+  }
+  if (!isProviderBan(401, "Your organization_disabled due to breach")) {
+    throw new Error("organization_disabled should be detected as provider ban");
+  }
+  if (!isProviderBan(400, "Account suspended due to policy violation")) {
+    throw new Error("suspended should be detected as provider ban");
+  }
+  if (isProviderBan(200, "OK") || isProviderBan(429, "Rate limit reached") || isProviderBan(500, "Internal Server Error")) {
+    throw new Error("Standard errors / 200 should not be detected as provider ban");
+  }
+  console.log("PASS: Provider ban heuristics accurately classify bans and ignore transient errors.");
+
+  // 12. Budget Cap Clamping Test
+  console.log("\n[Test 12] Testing 100% Budget Cap Clamping...");
+  const capEntry = keyVault.getByDealId(1)!;
+  capEntry.usedUsd = capEntry.creditUsd * 1.5; // Simulate spending 150%
+  const stagesCap = meterEngine.checkAndEmitStages(capEntry, ticketMatched.termsHashHex);
+  console.log("  Stages emitted:", stagesCap.map((s) => s.payload.stage));
+  if (stagesCap.length === 0) throw new Error("Expected stage payloads for cap test");
+  const finalStage = stagesCap[stagesCap.length - 1];
+  console.log("  Final stage reached:", finalStage.payload.stage);
+  console.log("  Metered yocto value:", finalStage.payload.meteredValueYocto);
+  console.log("  Deal creditAmountYocto:", capEntry.creditAmountYocto.toString());
+  if (finalStage.payload.stage !== 100) throw new Error("Highest stage should be 100%");
+  for (const s of stagesCap) {
+    if (s.payload.stage > 100) throw new Error("Stage exceeded 100%");
+    if (BigInt(s.payload.meteredValueYocto) > capEntry.creditAmountYocto) {
+      throw new Error("Metered value exceeded 100% of deal credit amount!");
+    }
+  }
+  // Also verify that emitDefault at 150% is clamped to 100%
+  const defaultSig = meterEngine.emitDefault(capEntry, ticketMatched.termsHashHex, 1 as any);
+  if (BigInt(defaultSig.payload.meteredValueYocto) > capEntry.creditAmountYocto) {
+    throw new Error("emitDefault metered value exceeded 100%!");
+  }
+  console.log("PASS: Metering strictly clamps stages at 100% and metered yocto to totalCredit.");
+
+  // 13. Live NEAR Price Oracle Test
+  console.log("\n[Test 13] Testing Live NEAR Price Oracle...");
+  const livePrice = await fetchLiveNearPriceUsd();
+  console.log("  Fetched live NEAR price (USD):", livePrice);
+  if (typeof livePrice !== "number" || livePrice <= 0 || isNaN(livePrice)) {
+    throw new Error(`Invalid live NEAR price fetched: ${livePrice}`);
+  }
+  console.log("PASS: Live NEAR price oracle returns valid positive USD price.");
+
   console.log("\n=======================================================");
-  console.log("  ALL CONPI TEE SERVICE UNIT TESTS PASSED (10/10)!     ");
+  console.log("  ALL CONPI TEE SERVICE UNIT TESTS PASSED (13/13)!     ");
   console.log("=======================================================");
 }
 

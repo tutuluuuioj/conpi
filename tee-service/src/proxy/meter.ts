@@ -93,13 +93,17 @@ export class MeterEngine {
         this.lastStageEmitted.set(entry.dealId, targetStage);
 
         // Unit scaling: if creditAmountYocto is present, scale to contract's deal.credit_amount
-        // No Math.max(1, ...) floor: 0 usage signs cleanly as 0 yocto
-        const usedMicro = BigInt(Math.round(entry.usedUsd * 1_000_000));
+        // Strictly capped at deal.credit_amount (100%) to prevent overspending
+        const usedMicro = BigInt(Math.min(
+          Math.round(entry.creditUsd * 1_000_000),
+          Math.round(entry.usedUsd * 1_000_000)
+        ));
         let meteredYocto: bigint;
         if (entry.creditAmountYocto) {
           const totalCredit = toBigIntYocto(entry.creditAmountYocto);
           const totalMicro = BigInt(Math.max(1, Math.round(entry.creditUsd * 1_000_000)));
-          meteredYocto = (usedMicro * totalCredit) / totalMicro;
+          const rawMetered = (usedMicro * totalCredit) / totalMicro;
+          meteredYocto = rawMetered > totalCredit ? totalCredit : rawMetered;
         } else {
           meteredYocto = usedMicro * 1_000_000_000_000_000_000n;
         }
@@ -137,12 +141,16 @@ export class MeterEngine {
 
   public emitDefault(entry: VaultEntry, termsHashHex: string, reason: DefaultReason): { payload: SignedPayloadDto; signatureHex: string } {
     entry.active = false;
-    const usedMicro = BigInt(Math.round(entry.usedUsd * 1_000_000));
+    const usedMicro = BigInt(Math.min(
+      Math.round(entry.creditUsd * 1_000_000),
+      Math.round(entry.usedUsd * 1_000_000)
+    ));
     let meteredYocto: bigint;
     if (entry.creditAmountYocto) {
       const totalCredit = toBigIntYocto(entry.creditAmountYocto);
       const totalMicro = BigInt(Math.max(1, Math.round(entry.creditUsd * 1_000_000)));
-      meteredYocto = (usedMicro * totalCredit) / totalMicro;
+      const rawMetered = (usedMicro * totalCredit) / totalMicro;
+      meteredYocto = rawMetered > totalCredit ? totalCredit : rawMetered;
     } else {
       meteredYocto = usedMicro * 1_000_000_000_000_000_000n;
     }
@@ -154,7 +162,7 @@ export class MeterEngine {
       dealId: entry.dealId,
       termsHash: Buffer.from(termsHashHex, "hex"),
       kind: PayloadKind.Default,
-      stage: Math.floor((entry.usedUsd / entry.creditUsd) * 100),
+      stage: Math.min(100, Math.floor((entry.usedUsd / entry.creditUsd) * 100)),
       meteredValueYocto: meteredYocto,
       reason,
       nonce: this.getNextNonce(entry.dealId),

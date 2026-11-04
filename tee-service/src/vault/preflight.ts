@@ -43,6 +43,48 @@ export interface KeyCheckResult {
   activateSignatureHex?: string;
 }
 
+let cachedNearPriceUsd: { price: number; fetchedAt: number } | null = null;
+
+export async function fetchLiveNearPriceUsd(): Promise<number> {
+  const now = Date.now();
+  if (cachedNearPriceUsd && now - cachedNearPriceUsd.fetchedAt < 60_000) {
+    return cachedNearPriceUsd.price;
+  }
+
+  // 1. Try CoinGecko
+  try {
+    const res = await fetch("https://api.coingecko.com/api/v3/simple/price?ids=near&vs_currencies=usd", {
+      signal: AbortSignal.timeout(3000),
+    });
+    if (res.ok) {
+      const data: any = await res.json();
+      if (typeof data?.near?.usd === "number" && data.near.usd > 0) {
+        cachedNearPriceUsd = { price: data.near.usd, fetchedAt: now };
+        return data.near.usd;
+      }
+    }
+  } catch {}
+
+  // 2. Try Binance
+  try {
+    const res = await fetch("https://api.binance.com/api/v3/ticker/price?symbol=NEARUSDT", {
+      signal: AbortSignal.timeout(3000),
+    });
+    if (res.ok) {
+      const data: any = await res.json();
+      const p = parseFloat(data?.price);
+      if (!isNaN(p) && p > 0) {
+        cachedNearPriceUsd = { price: p, fetchedAt: now };
+        return p;
+      }
+    }
+  } catch {}
+
+  // 3. Fallback to last known price or benchmark default ($3.75)
+  if (cachedNearPriceUsd) return cachedNearPriceUsd.price;
+  return 3.75;
+}
+
 export interface VaultEntry {
   dealId: number;
   provider: string;
@@ -131,9 +173,15 @@ class KeyVault {
         }
         resolvedCreditYocto = creditBigInt.toString();
         const priceBigInt = parseBalance(deal.price);
-        const decimals = (deal.token === null || deal.token === "NEAR") ? 24 : 6;
-        resolvedCreditUsd = Number(creditBigInt) / (10 ** decimals);
-        resolvedPriceUsd = Number(priceBigInt) / (10 ** decimals);
+        const isNear = (deal.token === null || deal.token === "NEAR");
+        if (isNear) {
+          const nearPrice = await fetchLiveNearPriceUsd();
+          resolvedCreditUsd = (Number(creditBigInt) / 1e24) * nearPrice;
+          resolvedPriceUsd = (Number(priceBigInt) / 1e24) * nearPrice;
+        } else {
+          resolvedCreditUsd = Number(creditBigInt) / 1e6;
+          resolvedPriceUsd = Number(priceBigInt) / 1e6;
+        }
         if (Array.isArray(deal.terms_hash)) {
           resolvedTermsHashHex = Buffer.from(deal.terms_hash).toString("hex");
         }

@@ -153,6 +153,12 @@ impl ConpiEscrow {
             AdminAction::Unpause => {
                 require!(self.paused, "Contract is not paused");
             }
+            AdminAction::UpdateTimelock { timelock_duration } => {
+                require!(
+                    *timelock_duration >= 300_000_000_000,
+                    "Timelock duration must be at least 5 minutes"
+                );
+            }
         }
 
         let ready_at = env::block_timestamp() + self.timelock_duration;
@@ -174,6 +180,7 @@ impl ConpiEscrow {
             AdminAction::RevokeTeeSigner { .. } => "REVOKE_TEE_SIGNER",
             AdminAction::Upgrade { .. } => "UPGRADE",
             AdminAction::Unpause => "UNPAUSE",
+            AdminAction::UpdateTimelock { .. } => "UPDATE_TIMELOCK",
         };
 
         emit_event(ConpiEvent::GovernanceActionProposed {
@@ -283,6 +290,18 @@ impl ConpiEscrow {
                 emit_event(ConpiEvent::GovernanceActionExecuted {
                     proposal_id,
                     action_type: "UNPAUSE",
+                });
+                PromiseOrValue::Value(true)
+            }
+            AdminAction::UpdateTimelock { timelock_duration } => {
+                require!(
+                    timelock_duration >= 300_000_000_000,
+                    "Timelock duration must be at least 5 minutes"
+                );
+                self.timelock_duration = timelock_duration;
+                emit_event(ConpiEvent::GovernanceActionExecuted {
+                    proposal_id,
+                    action_type: "UPDATE_TIMELOCK",
                 });
                 PromiseOrValue::Value(true)
             }

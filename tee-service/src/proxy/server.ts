@@ -15,6 +15,26 @@ function getProxyKey(req: FastifyRequest): string | null {
   return null;
 }
 
+export function isProviderBan(status: number, errTextOrData: any): boolean {
+  if (status === 403) return true;
+  const str = typeof errTextOrData === "string" ? errTextOrData : JSON.stringify(errTextOrData || "");
+  const lower = str.toLowerCase();
+  return (
+    lower.includes("account_deactivated") ||
+    lower.includes("organization_disabled") ||
+    lower.includes("provider_ban") ||
+    lower.includes("account_banned") ||
+    lower.includes("user_banned") ||
+    lower.includes("banned") ||
+    lower.includes("suspended") ||
+    lower.includes("access_terminated") ||
+    lower.includes("policy_violation") ||
+    lower.includes("key has been disabled") ||
+    lower.includes("account disabled") ||
+    lower.includes("permission_denied")
+  );
+}
+
 export async function handleChatCompletions(req: FastifyRequest, reply: FastifyReply) {
   const proxyKey = getProxyKey(req);
   if (!proxyKey) {
@@ -107,12 +127,19 @@ export async function handleChatCompletions(req: FastifyRequest, reply: FastifyR
         body: JSON.stringify(streamBody),
       });
 
-      if (upstreamRes.status === 401) {
+      if (upstreamRes.status === 401 || upstreamRes.status === 403) {
+        const text = await upstreamRes.text();
         entry.active = false;
-        const defaultSig = meterEngine.emitDefault(entry, entry.termsHashHex, DefaultReason.InvalidKey);
+        const reason = isProviderBan(upstreamRes.status, text) ? DefaultReason.ProviderBan : DefaultReason.InvalidKey;
+        const defaultSig = meterEngine.emitDefault(entry, entry.termsHashHex, reason);
         entry.signedPayloads.push(defaultSig);
         return reply.status(502).send({
-          error: { message: "Seller API key was revoked or invalid. Settlement default initiated.", code: "seller_key_revoked" },
+          error: {
+            message: reason === DefaultReason.ProviderBan
+              ? "Seller account/key was banned or suspended by provider. Settlement default initiated."
+              : "Seller API key was revoked or invalid. Settlement default initiated.",
+            code: reason === DefaultReason.ProviderBan ? "provider_banned" : "seller_key_revoked",
+          },
           defaultPayload: defaultSig,
         });
       }
@@ -133,6 +160,15 @@ export async function handleChatCompletions(req: FastifyRequest, reply: FastifyR
 
       if (!upstreamRes.ok) {
         const errText = await upstreamRes.text();
+        if (isProviderBan(upstreamRes.status, errText)) {
+          entry.active = false;
+          const defaultSig = meterEngine.emitDefault(entry, entry.termsHashHex, DefaultReason.ProviderBan);
+          entry.signedPayloads.push(defaultSig);
+          return reply.status(502).send({
+            error: { message: "Seller account/key was banned or suspended by provider. Settlement default initiated.", code: "provider_banned" },
+            defaultPayload: defaultSig,
+          });
+        }
         return reply.status(upstreamRes.status).send({ error: { message: errText, code: "upstream_error" } });
       }
 
@@ -183,7 +219,10 @@ export async function handleChatCompletions(req: FastifyRequest, reply: FastifyR
       const usageCost = (reportedCost !== undefined && reportedCost > 0)
         ? reportedCost
         : calculateCost(requestedModel, promptTokens, completionTokens).costUsd;
-      entry.usedUsd += usageCost;
+      entry.usedUsd = Math.min(entry.creditUsd, entry.usedUsd + usageCost);
+      if (entry.usedUsd >= entry.creditUsd) {
+        entry.active = false;
+      }
       entry.tokensTotal += (promptTokens + completionTokens);
 
       const newStages = meterEngine.checkAndEmitStages(entry, entry.termsHashHex);
@@ -200,12 +239,19 @@ export async function handleChatCompletions(req: FastifyRequest, reply: FastifyR
       body: JSON.stringify(body),
     });
 
-    if (upstreamRes.status === 401) {
+    if (upstreamRes.status === 401 || upstreamRes.status === 403) {
+      const text = await upstreamRes.text();
       entry.active = false;
-      const defaultSig = meterEngine.emitDefault(entry, entry.termsHashHex, DefaultReason.InvalidKey);
+      const reason = isProviderBan(upstreamRes.status, text) ? DefaultReason.ProviderBan : DefaultReason.InvalidKey;
+      const defaultSig = meterEngine.emitDefault(entry, entry.termsHashHex, reason);
       entry.signedPayloads.push(defaultSig);
       return reply.status(502).send({
-        error: { message: "Seller API key was revoked or invalid. Settlement default initiated.", code: "seller_key_revoked" },
+        error: {
+          message: reason === DefaultReason.ProviderBan
+            ? "Seller account/key was banned or suspended by provider. Settlement default initiated."
+            : "Seller API key was revoked or invalid. Settlement default initiated.",
+          code: reason === DefaultReason.ProviderBan ? "provider_banned" : "seller_key_revoked",
+        },
         defaultPayload: defaultSig,
       });
     }
@@ -224,6 +270,20 @@ export async function handleChatCompletions(req: FastifyRequest, reply: FastifyR
       return reply.status(429).send({ error: { message: "Upstream rate limit exceeded. Retry later.", code: "rate_limit_exceeded" } });
     }
 
+    if (!upstreamRes.ok) {
+      const errText = await upstreamRes.text();
+      if (isProviderBan(upstreamRes.status, errText)) {
+        entry.active = false;
+        const defaultSig = meterEngine.emitDefault(entry, entry.termsHashHex, DefaultReason.ProviderBan);
+        entry.signedPayloads.push(defaultSig);
+        return reply.status(502).send({
+          error: { message: "Seller account/key was banned or suspended by provider. Settlement default initiated.", code: "provider_banned" },
+          defaultPayload: defaultSig,
+        });
+      }
+      return reply.status(upstreamRes.status).send({ error: { message: errText, code: "upstream_error" } });
+    }
+
     const data: any = await upstreamRes.json();
     if (data.usage) {
       const reportedCost = typeof data.usage.cost === "number" && data.usage.cost > 0
@@ -238,7 +298,10 @@ export async function handleChatCompletions(req: FastifyRequest, reply: FastifyR
             data.usage.completion_tokens || 0
           ).costUsd;
 
-      entry.usedUsd += usageCost;
+      entry.usedUsd = Math.min(entry.creditUsd, entry.usedUsd + usageCost);
+      if (entry.usedUsd >= entry.creditUsd) {
+        entry.active = false;
+      }
       entry.tokensTotal += (data.usage.total_tokens || ((data.usage.prompt_tokens || 0) + (data.usage.completion_tokens || 0)));
 
       const newStages = meterEngine.checkAndEmitStages(entry, entry.termsHashHex);
@@ -336,13 +399,32 @@ export async function handleAnthropicMessages(req: FastifyRequest, reply: Fastif
     });
 
     if (upstreamRes.status === 401 || upstreamRes.status === 403) {
+      const errText = await upstreamRes.text();
       entry.active = false;
-      const defaultSig = meterEngine.emitDefault(entry, entry.termsHashHex, DefaultReason.InvalidKey);
+      const reason = isProviderBan(upstreamRes.status, errText) ? DefaultReason.ProviderBan : DefaultReason.InvalidKey;
+      const defaultSig = meterEngine.emitDefault(entry, entry.termsHashHex, reason);
       entry.signedPayloads.push(defaultSig);
       return reply.status(502).send({
-        error: { type: "seller_key_revoked", message: "Seller API key was revoked or invalid." },
+        error: {
+          type: reason === DefaultReason.ProviderBan ? "provider_banned" : "seller_key_revoked",
+          message: reason === DefaultReason.ProviderBan ? "Seller account/key was banned or suspended by provider." : "Seller API key was revoked or invalid.",
+        },
         defaultPayload: defaultSig,
       });
+    }
+
+    if (!upstreamRes.ok) {
+      const errText = await upstreamRes.text();
+      if (isProviderBan(upstreamRes.status, errText)) {
+        entry.active = false;
+        const defaultSig = meterEngine.emitDefault(entry, entry.termsHashHex, DefaultReason.ProviderBan);
+        entry.signedPayloads.push(defaultSig);
+        return reply.status(502).send({
+          error: { type: "provider_banned", message: "Seller account/key was banned by provider." },
+          defaultPayload: defaultSig,
+        });
+      }
+      return reply.status(upstreamRes.status).send({ error: { type: "upstream_error", message: errText } });
     }
 
     const data: any = await upstreamRes.json();
@@ -355,7 +437,10 @@ export async function handleAnthropicMessages(req: FastifyRequest, reply: Fastif
         ? reportedCost
         : calculateCost(requestedModel, data.usage.input_tokens || 0, data.usage.output_tokens || 0).costUsd;
 
-      entry.usedUsd += usageCost;
+      entry.usedUsd = Math.min(entry.creditUsd, entry.usedUsd + usageCost);
+      if (entry.usedUsd >= entry.creditUsd) {
+        entry.active = false;
+      }
       entry.tokensTotal += ((data.usage.input_tokens || 0) + (data.usage.output_tokens || 0));
 
       const newStages = meterEngine.checkAndEmitStages(entry, entry.termsHashHex);
@@ -403,12 +488,17 @@ export async function handleAnthropicMessages(req: FastifyRequest, reply: Fastif
       }),
     });
 
-    if (upstreamRes.status === 401) {
+    if (upstreamRes.status === 401 || upstreamRes.status === 403) {
+      const errText = await upstreamRes.text();
       entry.active = false;
-      const defaultSig = meterEngine.emitDefault(entry, entry.termsHashHex, DefaultReason.InvalidKey);
+      const reason = isProviderBan(upstreamRes.status, errText) ? DefaultReason.ProviderBan : DefaultReason.InvalidKey;
+      const defaultSig = meterEngine.emitDefault(entry, entry.termsHashHex, reason);
       entry.signedPayloads.push(defaultSig);
       return reply.status(502).send({
-        error: { type: "seller_key_revoked", message: "Seller API key was revoked or invalid." },
+        error: {
+          type: reason === DefaultReason.ProviderBan ? "provider_banned" : "seller_key_revoked",
+          message: reason === DefaultReason.ProviderBan ? "Seller account/key was banned or suspended by provider." : "Seller API key was revoked or invalid.",
+        },
         defaultPayload: defaultSig,
       });
     }
@@ -427,6 +517,20 @@ export async function handleAnthropicMessages(req: FastifyRequest, reply: Fastif
       return reply.status(429).send({ error: { type: "rate_limit_error", message: "Upstream rate limit exceeded." } });
     }
 
+    if (!upstreamRes.ok) {
+      const errText = await upstreamRes.text();
+      if (isProviderBan(upstreamRes.status, errText)) {
+        entry.active = false;
+        const defaultSig = meterEngine.emitDefault(entry, entry.termsHashHex, DefaultReason.ProviderBan);
+        entry.signedPayloads.push(defaultSig);
+        return reply.status(502).send({
+          error: { type: "provider_banned", message: "Seller account/key was banned by provider." },
+          defaultPayload: defaultSig,
+        });
+      }
+      return reply.status(upstreamRes.status).send({ error: { type: "upstream_error", message: errText } });
+    }
+
     const data: any = await upstreamRes.json();
     const promptTokens = data.usage?.prompt_tokens ?? 0;
     const completionTokens = data.usage?.completion_tokens ?? 0;
@@ -439,7 +543,10 @@ export async function handleAnthropicMessages(req: FastifyRequest, reply: Fastif
       ? reportedCost
       : calculateCost(requestedModel, promptTokens, completionTokens).costUsd;
 
-    entry.usedUsd += usageCost;
+    entry.usedUsd = Math.min(entry.creditUsd, entry.usedUsd + usageCost);
+    if (entry.usedUsd >= entry.creditUsd) {
+      entry.active = false;
+    }
     entry.tokensTotal += (promptTokens + completionTokens);
 
     const newStages = meterEngine.checkAndEmitStages(entry, entry.termsHashHex);

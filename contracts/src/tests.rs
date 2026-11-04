@@ -1248,6 +1248,43 @@ mod tests {
         );
     }
 
+    #[test]
+    fn test_update_timelock_via_governance() {
+        let owner: AccountId = "owner.near".parse().unwrap();
+        let mut context = get_context(owner.clone(), NearToken::from_yoctonear(0));
+        context.block_timestamp(1_000_000_000_000);
+        testing_env!(context.build());
+
+        let mut contract = ConpiEscrow::new(owner.clone(), None, None, None, Some(300_000_000_000));
+        assert_eq!(contract.get_timelock_duration(), 300_000_000_000);
+
+        // Propose changing timelock to 48 hours (172_800_000_000_000 ns)
+        let new_timelock = 172_800_000_000_000u64;
+        let proposal_id = contract.propose_admin_action(AdminAction::UpdateTimelock {
+            timelock_duration: new_timelock,
+        });
+
+        // Attempting to execute immediately before timelock passes must fail
+        let early_res = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _ = contract.execute_admin_action(proposal_id, None);
+        }));
+        assert!(early_res.is_err(), "Early execution before timelock must fail");
+
+        // Advance past timelock (5 minutes = 300_000_000_000 ns)
+        context.block_timestamp(1_000_000_000_000 + 300_000_000_001);
+        testing_env!(context.build());
+
+        // Execute admin action
+        let res = contract.execute_admin_action(proposal_id, None);
+        match res {
+            near_sdk::PromiseOrValue::Value(v) => assert!(v, "Execution should succeed"),
+            _ => panic!("Expected value result"),
+        }
+
+        // Verify updated timelock duration is now 48h
+        assert_eq!(contract.get_timelock_duration(), new_timelock);
+    }
+
     // -------------------------------------------------------------------------
     // 14. Multisig Owner Governance Cycle with UpdateConfig (Owner Retained)
     // -------------------------------------------------------------------------

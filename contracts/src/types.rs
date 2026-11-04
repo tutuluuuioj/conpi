@@ -160,6 +160,7 @@ pub enum AdminAction {
     RevokeTeeSigner { public_key: PublicKey },
     Upgrade { code_hash: [u8; 32] },
     Unpause,
+    UpdateTimelock { timelock_duration: u64 },
 }
 
 #[near(serializers = [json, borsh])]

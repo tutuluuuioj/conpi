@@ -3,7 +3,8 @@ import cors from "@fastify/cors";
 import crypto from "crypto";
 import { CONFIG } from "./config.js";
 
-export const INTERNAL_SERVER_TOKEN = process.env.ENCLAVE_INTERNAL_TOKEN || crypto.randomUUID();
+// Internal token is generated strictly in-enclave in memory; no environment variable can override it
+export const INTERNAL_SERVER_TOKEN = crypto.randomUUID();
 import { enclaveKeys } from "./crypto/keys.js";
 import { attestationService } from "./attestation/tdx.js";
 import { negotiationService } from "./negotiation/matcher.js";
