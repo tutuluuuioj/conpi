@@ -4,7 +4,7 @@ mod tests {
     use crate::types::{
         AdminAction, CreateDealParams, DealStatus, DefaultReason, PayloadKind, SignedPayload,
     };
-    use crate::ConpiEscrow;
+    use crate::{ConpiEscrow, LIVE_CVM_COMPOSE_HASH, LIVE_CVM_MRTD};
     use ed25519_dalek::{Signer, SigningKey};
     use near_sdk::json_types::U128;
     use near_sdk::test_utils::VMContextBuilder;
@@ -1433,6 +1433,106 @@ mod tests {
         };
 
         contract.create_deal(params);
+    }
+
+    #[test]
+    #[should_panic(expected = "TEE signer measurement does not match approved live CVM measurement")]
+    fn test_active_tee_signer_with_mismatched_measurement_rejected_on_deal_creation() {
+        let owner: AccountId = "owner.testnet".parse().unwrap();
+        let (_sk, tee_pk) = generate_tee_keypair();
+        let context = get_context(owner.clone(), NearToken::from_yoctonear(50_000_000_000_000_000_000_000));
+        testing_env!(context.build());
+
+        let mut contract = ConpiEscrow::new(
+            owner,
+            None,
+            None,
+            Some((tee_pk.clone(), "mrtd:old_unapproved_quote|compose:outdated_compose_hash".to_string())),
+            None,
+        );
+
+        let buyer: AccountId = "buyer.testnet".parse().unwrap();
+        let seller: AccountId = "seller.testnet".parse().unwrap();
+
+        let context = get_context(buyer.clone(), NearToken::from_yoctonear(50_000_000_000_000_000_000_000));
+        testing_env!(context.build());
+
+        let params = CreateDealParams {
+            buyer,
+            seller,
+            token: None,
+            price: U128(100),
+            credit_amount: U128(100),
+            buyer_collateral: U128(10),
+            seller_collateral: U128(20),
+            tee_pubkey: tee_pk,
+            deposit_duration_sec: 3600,
+            key_duration_sec: 3600,
+            tee_liveness_timeout_sec: 3600,
+            slash_bps_revoke: 8000,
+            slash_bps_provider_ban: 5000,
+            slash_bps_buyer_breach: 5000,
+        };
+
+        contract.create_deal(params);
+    }
+
+    #[test]
+    #[should_panic(expected = "Measurement does not match approved live CVM measurement")]
+    fn test_propose_add_tee_signer_rejects_mismatched_measurement() {
+        let owner: AccountId = "owner.testnet".parse().unwrap();
+        let (_sk, tee_pk) = generate_tee_keypair();
+        let context = get_context(owner.clone(), NearToken::from_yoctonear(0));
+        testing_env!(context.build());
+
+        let mut contract = ConpiEscrow::new(owner, None, None, None, None);
+        contract.propose_admin_action(AdminAction::AddTeeSigner {
+            public_key: tee_pk,
+            measurement: "mrtd:7fe60787222bd394cb516abca2435f22f035ab2cc9c0a4b4b3b148e46297f3d931a237b72f359052c6e657d8c1409173|compose:outdated_compose_a1f7be33".to_string(),
+        });
+    }
+
+    #[test]
+    fn test_active_tee_signer_with_valid_live_measurement_accepted() {
+        let owner: AccountId = "owner.testnet".parse().unwrap();
+        let (_sk, tee_pk) = generate_tee_keypair();
+        let context = get_context(owner.clone(), NearToken::from_yoctonear(50_000_000_000_000_000_000_000));
+        testing_env!(context.build());
+
+        let valid_meas = format!("mrtd:{}|compose:{}", LIVE_CVM_MRTD, LIVE_CVM_COMPOSE_HASH);
+        let mut contract = ConpiEscrow::new(
+            owner,
+            None,
+            None,
+            Some((tee_pk.clone(), valid_meas)),
+            None,
+        );
+
+        let buyer: AccountId = "buyer.testnet".parse().unwrap();
+        let seller: AccountId = "seller.testnet".parse().unwrap();
+
+        let context = get_context(buyer.clone(), NearToken::from_yoctonear(50_000_000_000_000_000_000_000));
+        testing_env!(context.build());
+
+        let params = CreateDealParams {
+            buyer,
+            seller,
+            token: None,
+            price: U128(100),
+            credit_amount: U128(100),
+            buyer_collateral: U128(10),
+            seller_collateral: U128(20),
+            tee_pubkey: tee_pk,
+            deposit_duration_sec: 3600,
+            key_duration_sec: 3600,
+            tee_liveness_timeout_sec: 3600,
+            slash_bps_revoke: 8000,
+            slash_bps_provider_ban: 5000,
+            slash_bps_buyer_breach: 5000,
+        };
+
+        let deal_id = contract.create_deal(params);
+        assert_eq!(deal_id, 1);
     }
 }
 

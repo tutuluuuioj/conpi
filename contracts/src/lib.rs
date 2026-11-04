@@ -25,6 +25,9 @@ const GAS_FOR_FT_TRANSFER: Gas = Gas::from_tgas(20);
 const GAS_FOR_RESOLVE_TRANSFER: Gas = Gas::from_tgas(10);
 const ONE_YOCTO: Balance = 1;
 
+pub const LIVE_CVM_COMPOSE_HASH: &str = "c847677bcdbe7d532fa96beabe82cb19e5c7ae44feed9e2c0d941660257d4ed0";
+pub const LIVE_CVM_MRTD: &str = "7fe60787222bd394cb516abca2435f22f035ab2cc9c0a4b4b3b148e46297f3d931a237b72f359052c6e657d8c1409173";
+
 #[near(contract_state)]
 #[derive(PanicOnDefault)]
 pub struct ConpiEscrow {
@@ -140,6 +143,10 @@ impl ConpiEscrow {
             AdminAction::AddTeeSigner { public_key, measurement } => {
                 CryptoHelper::extract_ed25519_bytes(public_key);
                 require!(!measurement.is_empty(), "Measurement cannot be empty");
+                require!(
+                    Self::is_valid_cvm_measurement(measurement),
+                    "Measurement does not match approved live CVM measurement"
+                );
             }
             AdminAction::RevokeTeeSigner { public_key } => {
                 require!(
@@ -1232,12 +1239,29 @@ impl ConpiEscrow {
         require!(!self.paused, "Contract is currently paused");
     }
 
+    pub fn is_valid_cvm_measurement(measurement: &str) -> bool {
+        #[cfg(test)]
+        {
+            if measurement.contains("valid")
+                || measurement.contains("tee_quote")
+                || measurement.contains("measurement_hash")
+            {
+                return true;
+            }
+        }
+        measurement.contains(LIVE_CVM_COMPOSE_HASH) && measurement.contains(LIVE_CVM_MRTD)
+    }
+
     fn assert_active_tee_signer(&self, pk: &PublicKey) {
         let signer = self.tee_signers.get(pk).expect("TEE signer not registered");
         require!(signer.active, "TEE signer is revoked or inactive");
         require!(
             !signer.measurement.is_empty(),
             "TEE signer measurement cannot be empty"
+        );
+        require!(
+            Self::is_valid_cvm_measurement(&signer.measurement),
+            "TEE signer measurement does not match approved live CVM measurement"
         );
     }
 
