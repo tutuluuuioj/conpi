@@ -16,22 +16,28 @@ function getProxyKey(req: FastifyRequest): string | null {
 }
 
 export function isProviderBan(status: number, errTextOrData: any): boolean {
-  if (status === 403) return true;
+  // Never treat generic 403 as ProviderBan to protect seller collateral from accidental slashing.
+  // Only classify as ProviderBan when HTTP status is an error and explicit ban/suspension codes or messages are returned.
+  if (status < 400) return false;
   const str = typeof errTextOrData === "string" ? errTextOrData : JSON.stringify(errTextOrData || "");
   const lower = str.toLowerCase();
   return (
     lower.includes("account_deactivated") ||
     lower.includes("organization_disabled") ||
     lower.includes("provider_ban") ||
+    lower.includes("provider_banned") ||
     lower.includes("account_banned") ||
     lower.includes("user_banned") ||
+    lower.includes("account_suspended") ||
     lower.includes("banned") ||
     lower.includes("suspended") ||
     lower.includes("access_terminated") ||
     lower.includes("policy_violation") ||
     lower.includes("key has been disabled") ||
     lower.includes("account disabled") ||
-    lower.includes("permission_denied")
+    lower.includes("billing_suspended") ||
+    lower.includes("abuse_ban") ||
+    lower.includes("terms_violation")
   );
 }
 

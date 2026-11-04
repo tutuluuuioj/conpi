@@ -137,8 +137,9 @@ impl ConpiEscrow {
             AdminAction::UpdateConfig { config } => {
                 Self::validate_config(config);
             }
-            AdminAction::AddTeeSigner { public_key, .. } => {
+            AdminAction::AddTeeSigner { public_key, measurement } => {
                 CryptoHelper::extract_ed25519_bytes(public_key);
+                require!(!measurement.is_empty(), "Measurement cannot be empty");
             }
             AdminAction::RevokeTeeSigner { public_key } => {
                 require!(
@@ -1234,6 +1235,10 @@ impl ConpiEscrow {
     fn assert_active_tee_signer(&self, pk: &PublicKey) {
         let signer = self.tee_signers.get(pk).expect("TEE signer not registered");
         require!(signer.active, "TEE signer is revoked or inactive");
+        require!(
+            !signer.measurement.is_empty(),
+            "TEE signer measurement cannot be empty"
+        );
     }
 
     fn check_and_transition_funded(&mut self, deal: &mut Deal) {

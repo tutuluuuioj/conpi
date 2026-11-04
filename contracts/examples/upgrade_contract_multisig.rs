@@ -181,7 +181,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         "method_name": "execute_admin_action",
                         "args": exec_b64,
                         "deposit": "0",
-                        "gas": "250000000000000" // 250 Tgas for deploy & migrate
+                        "gas": "160000000000000" // 160 Tgas: plenty for deploy (15 Tgas) + migrate (30 Tgas) while leaving 140 Tgas for multisig
                     }
                 ]
             }

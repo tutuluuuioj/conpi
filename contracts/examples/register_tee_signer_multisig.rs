@@ -31,11 +31,12 @@ struct ProposeArgs {
 #[derive(serde::Serialize)]
 struct ExecuteArgs {
     proposal_id: u64,
+    code: Option<Vec<u8>>,
 }
 
 const ESCROW_ID: &str = "dev-20261103062448-30583839049419.testnet";
 const DSTACK_HARDWARE_SIGNER: &str = "ed25519:CLHhDLsLCCqFeTjz7g31NkfbtN1UqT2mJRmRZgcRPTj3";
-const HARDWARE_MEASUREMENT: &str = "mrtd:7fe60787222bd394cb516abca2435f22f035ab2cc9c0a4b4b3b148e46297f3d931a237b72f359052c6e657d8c1409173|compose:3b2df1746e75e7be40019af7995e73239adcdc3b3b1be82d02d663a009ad1979";
+const HARDWARE_MEASUREMENT: &str = "mrtd:7fe60787222bd394cb516abca2435f22f035ab2cc9c0a4b4b3b148e46297f3d931a237b72f359052c6e657d8c1409173|compose:e4755489b27bdd025284b4db49483d74a2d60580458ca24aed4f06711669cf24";
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -157,7 +158,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // 5. Execute proposal through multisig
     println!("\n[4/4] Executing Proposal #{} via Multisig DAO...", proposal_id);
-    let exec_call_args = serde_json::to_vec(&ExecuteArgs { proposal_id })?;
+    let exec_call_args = serde_json::to_vec(&ExecuteArgs { proposal_id, code: None })?;
     let exec_b64 = Base64VecU8::from(exec_call_args);
 
     println!("Member 1 submitting add_request_and_confirm for execute_admin_action...");

@@ -34,3 +34,4 @@ tee/credentials/
 **/credentials/
 **/.credentials/
 *.sock
+tunnel_url.txt

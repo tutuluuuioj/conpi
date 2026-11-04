@@ -272,8 +272,9 @@ async function runTests() {
 
   // 11. Provider Ban Automatic Detection Test
   console.log("\n[Test 11] Testing Provider Ban Automatic Detection...");
-  if (!isProviderBan(403, "Forbidden")) throw new Error("403 should be detected as provider ban");
-  if (!isProviderBan(400, { error: { message: "Your account_deactivated by admin" } })) {
+  if (isProviderBan(403, "Forbidden")) throw new Error("Generic 403 Forbidden must NOT be detected as provider ban");
+  if (isProviderBan(403, "permission_denied")) throw new Error("Generic permission_denied must NOT be detected as provider ban");
+  if (!isProviderBan(403, { error: { message: "Your account_deactivated by admin" } })) {
     throw new Error("account_deactivated should be detected as provider ban");
   }
   if (!isProviderBan(401, "Your organization_disabled due to breach")) {
@@ -282,7 +283,10 @@ async function runTests() {
   if (!isProviderBan(400, "Account suspended due to policy violation")) {
     throw new Error("suspended should be detected as provider ban");
   }
-  if (isProviderBan(200, "OK") || isProviderBan(429, "Rate limit reached") || isProviderBan(500, "Internal Server Error")) {
+  if (!isProviderBan(403, "Account banned: policy_violation")) {
+    throw new Error("Explicit ban code with 403 should be detected as provider ban");
+  }
+  if (isProviderBan(200, "OK") || isProviderBan(200, "account_deactivated") || isProviderBan(429, "Rate limit reached") || isProviderBan(500, "Internal Server Error")) {
     throw new Error("Standard errors / 200 should not be detected as provider ban");
   }
   console.log("PASS: Provider ban heuristics accurately classify bans and ignore transient errors.");

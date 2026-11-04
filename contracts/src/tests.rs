@@ -1377,4 +1377,62 @@ mod tests {
         assert!(!migrated.is_paused());
         assert_eq!(migrated.get_chain_id(), "testnet");
     }
+
+    #[test]
+    #[should_panic(expected = "Measurement cannot be empty")]
+    fn test_propose_add_tee_signer_rejects_empty_measurement() {
+        let owner: AccountId = "owner.testnet".parse().unwrap();
+        let (_sk, tee_pk) = generate_tee_keypair();
+        let context = get_context(owner.clone(), NearToken::from_yoctonear(0));
+        testing_env!(context.build());
+
+        let mut contract = ConpiEscrow::new(owner, None, None, None, None);
+        contract.propose_admin_action(AdminAction::AddTeeSigner {
+            public_key: tee_pk,
+            measurement: "".to_string(),
+        });
+    }
+
+    #[test]
+    #[should_panic(expected = "TEE signer measurement cannot be empty")]
+    fn test_active_tee_signer_with_empty_measurement_rejected_on_deal_creation() {
+        let owner: AccountId = "owner.testnet".parse().unwrap();
+        let (_sk, tee_pk) = generate_tee_keypair();
+        let context = get_context(owner.clone(), NearToken::from_yoctonear(50_000_000_000_000_000_000_000));
+        testing_env!(context.build());
+
+        let mut contract = ConpiEscrow::new(
+            owner,
+            None,
+            None,
+            Some((tee_pk.clone(), "".to_string())),
+            None,
+        );
+
+        let buyer: AccountId = "buyer.testnet".parse().unwrap();
+        let seller: AccountId = "seller.testnet".parse().unwrap();
+
+        let context = get_context(buyer.clone(), NearToken::from_yoctonear(50_000_000_000_000_000_000_000));
+        testing_env!(context.build());
+
+        let params = CreateDealParams {
+            buyer,
+            seller,
+            token: None,
+            price: U128(100),
+            credit_amount: U128(100),
+            buyer_collateral: U128(10),
+            seller_collateral: U128(20),
+            tee_pubkey: tee_pk,
+            deposit_duration_sec: 3600,
+            key_duration_sec: 3600,
+            tee_liveness_timeout_sec: 3600,
+            slash_bps_revoke: 8000,
+            slash_bps_provider_ban: 5000,
+            slash_bps_buyer_breach: 5000,
+        };
+
+        contract.create_deal(params);
+    }
 }
+

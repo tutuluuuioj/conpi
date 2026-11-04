@@ -80,9 +80,11 @@ export async function fetchLiveNearPriceUsd(): Promise<number> {
     }
   } catch {}
 
-  // 3. Fallback to last known price or benchmark default ($3.75)
-  if (cachedNearPriceUsd) return cachedNearPriceUsd.price;
-  return 3.75;
+  // 3. If recent valid price cache exists, return it; otherwise fail explicitly rather than silently falling back to $3.75
+  if (cachedNearPriceUsd && now - cachedNearPriceUsd.fetchedAt < 300_000) {
+    return cachedNearPriceUsd.price;
+  }
+  throw new Error("Live NEAR price oracle unavailable (both CoinGecko and Binance unreachable). Silent fallback price is disabled; deal must fail.");
 }
 
 export interface VaultEntry {
