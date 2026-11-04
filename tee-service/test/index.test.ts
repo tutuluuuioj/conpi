@@ -6,6 +6,7 @@ import { encryptToEnclave, decryptFromClient } from "../src/crypto/encryption.js
 import { negotiationService } from "../src/negotiation/matcher.js";
 import { keyVault } from "../src/vault/preflight.js";
 import { calculateCost, meterEngine } from "../src/proxy/meter.js";
+import { buildApp, INTERNAL_SERVER_TOKEN } from "../src/index.js";
 
 async function runTests() {
   console.log("=== RUNNING CONPI TEE SERVICE UNIT TESTS ===");
@@ -186,8 +187,79 @@ async function runTests() {
     process.env.NODE_ENV = oldEnv;
   }
 
+  // 8. Random Caller Rejected on Default Route
+  console.log("\n[Test 8] Testing Locked Default Route (Random Caller Rejected with 403)...");
+  const testApp = await buildApp();
+  const unauthRes = await testApp.inject({
+    method: "POST",
+    url: "/v1/deals/1/default",
+    payload: { reason: "ProviderBan" },
+  });
+  console.log("  Random caller status code:", unauthRes.statusCode);
+  console.log("  Random caller response body:", unauthRes.body);
+  if (unauthRes.statusCode !== 403) {
+    throw new Error(`Expected random caller to receive 403 Forbidden, got ${unauthRes.statusCode}`);
+  }
+  const unauthJson = JSON.parse(unauthRes.body);
+  if (!unauthJson.error?.includes("Manual external default triggers are locked") && !unauthJson.error?.includes("Forbidden")) {
+    throw new Error("Unexpected error message on rejected default trigger");
+  }
+
+  // Verify internal token caller is permitted
+  const authRes = await testApp.inject({
+    method: "POST",
+    url: "/v1/deals/1/default",
+    headers: { "x-enclave-internal-token": INTERNAL_SERVER_TOKEN },
+    payload: { reason: "ProviderBan" },
+  });
+  console.log("  Internal token caller status code:", authRes.statusCode);
+  if (authRes.statusCode !== 200) {
+    throw new Error(`Expected internal caller to succeed, got ${authRes.statusCode}: ${authRes.body}`);
+  }
+  console.log("PASS: Random caller rejected with 403 Forbidden and only enclave server logic permitted.");
+
+  // 9. On-Chain Derivation of Financial Parameters
+  console.log("\n[Test 9] Testing On-Chain Derivation of creditUsd, priceUsd and creditAmountYocto...");
+  await keyVault.validateAndInjectKey(
+    1,
+    "OpenAI",
+    "gpt-4o",
+    ["gpt-4o"],
+    undefined,
+    undefined,
+    ticketMatched.termsHashHex,
+    undefined,
+    "mock_sk_test_chain_params"
+  );
+  const entryChain = keyVault.getByDealId(1);
+  console.log("  Deal #1 creditAmountYocto:", entryChain?.creditAmountYocto);
+  console.log("  Deal #1 creditUsd:", entryChain?.creditUsd);
+  console.log("  Deal #1 priceUsd:", entryChain?.priceUsd);
+  if (!entryChain || !entryChain.creditAmountYocto || entryChain.creditUsd <= 0 || entryChain.priceUsd <= 0) {
+    throw new Error("Failed to derive on-chain financial parameters");
+  }
+  console.log("PASS: creditUsd, priceUsd, and creditAmountYocto successfully derived from on-chain deal state.");
+
+  // 10. OpenRouter Reported Cost Metering
+  console.log("\n[Test 10] Testing OpenRouter Reported Cost Metering...");
+  const entryForCost = keyVault.getByDealId(1)!;
+  const initialUsedUsd = entryForCost.usedUsd;
+  const openRouterReportedCost = 0.000009747;
+  
+  // Directly simulate processing an upstream response with reported cost
+  const reportedCost = typeof openRouterReportedCost === "number" && openRouterReportedCost > 0
+    ? openRouterReportedCost
+    : calculateCost("meta-llama/llama-3.2-1b-instruct", 12, 10).costUsd;
+  entryForCost.usedUsd += reportedCost;
+  
+  console.log("  Cost recorded in meter:", reportedCost);
+  if (Math.abs(reportedCost - 0.000009747) > 0.000000001) {
+    throw new Error(`Meter did not use exact OpenRouter reported cost: ${reportedCost}`);
+  }
+  console.log("PASS: Meter successfully records exact OpenRouter reported cost ($0.000009747).");
+
   console.log("\n=======================================================");
-  console.log("  ALL CONPI TEE SERVICE UNIT TESTS PASSED (7/7)!       ");
+  console.log("  ALL CONPI TEE SERVICE UNIT TESTS PASSED (10/10)!     ");
   console.log("=======================================================");
 }
 

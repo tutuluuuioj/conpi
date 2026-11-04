@@ -1,6 +1,9 @@
 import Fastify from "fastify";
 import cors from "@fastify/cors";
+import crypto from "crypto";
 import { CONFIG } from "./config.js";
+
+export const INTERNAL_SERVER_TOKEN = process.env.ENCLAVE_INTERNAL_TOKEN || crypto.randomUUID();
 import { enclaveKeys } from "./crypto/keys.js";
 import { attestationService } from "./attestation/tdx.js";
 import { negotiationService } from "./negotiation/matcher.js";
@@ -10,9 +13,13 @@ import { meterEngine } from "./proxy/meter.js";
 import { DefaultReason } from "./crypto/borsh.js";
 import { nearRelayer } from "./chain/relayer.js";
 
-const app = Fastify({ logger: true });
+export const app = Fastify({ logger: false });
 
-async function bootstrap() {
+let initialized = false;
+export async function buildApp() {
+  if (initialized) return app;
+  initialized = true;
+
   await enclaveKeys.init();
   await attestationService.init();
 
@@ -75,7 +82,7 @@ async function bootstrap() {
   app.post("/v1/deals/:id/key", async (req, reply) => {
     const { id } = req.params as { id: string };
     const dealId = parseInt(id, 10);
-    const { provider, model, models, creditUsd, priceUsd, termsHashHex, encryptedEnvelope, plainApiKey, creditAmountYocto } = req.body as any;
+    const { provider, model, models, termsHashHex, encryptedEnvelope, plainApiKey } = req.body as any;
 
     try {
       const result = await keyVault.validateAndInjectKey(
@@ -83,12 +90,12 @@ async function bootstrap() {
         provider,
         model,
         models || [model],
-        creditUsd,
-        priceUsd,
+        undefined,
+        undefined,
         termsHashHex,
         encryptedEnvelope,
         plainApiKey,
-        creditAmountYocto
+        undefined
       );
       if (!result.ok) {
         return reply.status(400).send(result);
@@ -164,6 +171,14 @@ async function bootstrap() {
   });
 
   app.post("/v1/deals/:id/default", async (req, reply) => {
+    const internalHeader = req.headers["x-enclave-internal-token"];
+    if (!internalHeader || internalHeader !== INTERNAL_SERVER_TOKEN) {
+      return reply.status(403).send({
+        error: "Forbidden: Manual external default triggers are locked. Only enclave server logic can trigger defaults.",
+        code: "external_default_forbidden",
+      });
+    }
+
     const { id } = req.params as { id: string };
     const dealId = parseInt(id, 10);
     const { reason } = (req.body as any) || {};
@@ -238,6 +253,11 @@ async function bootstrap() {
     return nearRelayer.getDeal(parseInt(id, 10));
   });
 
+  return app;
+}
+
+export async function startServer() {
+  await buildApp();
   await app.listen({ port: CONFIG.port, host: CONFIG.host });
   console.log(`=======================================================`);
   console.log(`  CONPI PHALA TDX TEE PROXY SERVICE RUNNING ON ${CONFIG.host}:${CONFIG.port}`);
@@ -245,7 +265,10 @@ async function bootstrap() {
   console.log(`=======================================================`);
 }
 
-bootstrap().catch((err) => {
-  console.error("Failed to start TEE service:", err);
-  process.exit(1);
-});
+const isTest = process.env.NODE_ENV === "test" || process.argv.some((a) => a.includes("test"));
+if (!isTest) {
+  startServer().catch((err) => {
+    console.error("Failed to start TEE service:", err);
+    process.exit(1);
+  });
+}

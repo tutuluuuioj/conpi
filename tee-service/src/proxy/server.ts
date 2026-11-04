@@ -142,6 +142,7 @@ export async function handleChatCompletions(req: FastifyRequest, reply: FastifyR
 
       let promptTokens = 0;
       let completionTokens = 0;
+      let reportedCost: number | undefined = undefined;
 
       if (upstreamRes.body) {
         const reader = upstreamRes.body.getReader();
@@ -165,6 +166,11 @@ export async function handleChatCompletions(req: FastifyRequest, reply: FastifyR
                 if (parsed.usage) {
                   promptTokens = parsed.usage.prompt_tokens ?? promptTokens;
                   completionTokens = parsed.usage.completion_tokens ?? completionTokens;
+                  if (typeof parsed.usage.cost === "number" && parsed.usage.cost > 0) {
+                    reportedCost = parsed.usage.cost;
+                  } else if (typeof parsed.usage.total_cost === "number" && parsed.usage.total_cost > 0) {
+                    reportedCost = parsed.usage.total_cost;
+                  }
                 } else if (parsed.choices && parsed.choices[0]?.delta?.content) {
                   completionTokens += 1;
                 }
@@ -174,8 +180,10 @@ export async function handleChatCompletions(req: FastifyRequest, reply: FastifyR
         }
       }
 
-      const usage = calculateCost(requestedModel, promptTokens, completionTokens);
-      entry.usedUsd += usage.costUsd;
+      const usageCost = (reportedCost !== undefined && reportedCost > 0)
+        ? reportedCost
+        : calculateCost(requestedModel, promptTokens, completionTokens).costUsd;
+      entry.usedUsd += usageCost;
       entry.tokensTotal += (promptTokens + completionTokens);
 
       const newStages = meterEngine.checkAndEmitStages(entry, entry.termsHashHex);
@@ -218,13 +226,20 @@ export async function handleChatCompletions(req: FastifyRequest, reply: FastifyR
 
     const data: any = await upstreamRes.json();
     if (data.usage) {
-      const usage = calculateCost(
-        requestedModel,
-        data.usage.prompt_tokens || 0,
-        data.usage.completion_tokens || 0
-      );
-      entry.usedUsd += usage.costUsd;
-      entry.tokensTotal += (data.usage.total_tokens || 0);
+      const reportedCost = typeof data.usage.cost === "number" && data.usage.cost > 0
+        ? data.usage.cost
+        : (typeof data.usage.total_cost === "number" && data.usage.total_cost > 0 ? data.usage.total_cost : undefined);
+
+      const usageCost = (reportedCost !== undefined && reportedCost > 0)
+        ? reportedCost
+        : calculateCost(
+            requestedModel,
+            data.usage.prompt_tokens || 0,
+            data.usage.completion_tokens || 0
+          ).costUsd;
+
+      entry.usedUsd += usageCost;
+      entry.tokensTotal += (data.usage.total_tokens || ((data.usage.prompt_tokens || 0) + (data.usage.completion_tokens || 0)));
 
       const newStages = meterEngine.checkAndEmitStages(entry, entry.termsHashHex);
       for (const stg of newStages) {
@@ -332,8 +347,15 @@ export async function handleAnthropicMessages(req: FastifyRequest, reply: Fastif
 
     const data: any = await upstreamRes.json();
     if (data.usage) {
-      const usage = calculateCost(requestedModel, data.usage.input_tokens || 0, data.usage.output_tokens || 0);
-      entry.usedUsd += usage.costUsd;
+      const reportedCost = typeof data.usage.cost === "number" && data.usage.cost > 0
+        ? data.usage.cost
+        : (typeof data.usage.total_cost === "number" && data.usage.total_cost > 0 ? data.usage.total_cost : undefined);
+
+      const usageCost = (reportedCost !== undefined && reportedCost > 0)
+        ? reportedCost
+        : calculateCost(requestedModel, data.usage.input_tokens || 0, data.usage.output_tokens || 0).costUsd;
+
+      entry.usedUsd += usageCost;
       entry.tokensTotal += ((data.usage.input_tokens || 0) + (data.usage.output_tokens || 0));
 
       const newStages = meterEngine.checkAndEmitStages(entry, entry.termsHashHex);
@@ -409,8 +431,15 @@ export async function handleAnthropicMessages(req: FastifyRequest, reply: Fastif
     const promptTokens = data.usage?.prompt_tokens ?? 0;
     const completionTokens = data.usage?.completion_tokens ?? 0;
 
-    const usage = calculateCost(requestedModel, promptTokens, completionTokens);
-    entry.usedUsd += usage.costUsd;
+    const reportedCost = typeof data.usage?.cost === "number" && data.usage.cost > 0
+      ? data.usage.cost
+      : (typeof data.usage?.total_cost === "number" && data.usage.total_cost > 0 ? data.usage.total_cost : undefined);
+
+    const usageCost = (reportedCost !== undefined && reportedCost > 0)
+      ? reportedCost
+      : calculateCost(requestedModel, promptTokens, completionTokens).costUsd;
+
+    entry.usedUsd += usageCost;
     entry.tokensTotal += (promptTokens + completionTokens);
 
     const newStages = meterEngine.checkAndEmitStages(entry, entry.termsHashHex);
