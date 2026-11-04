@@ -385,12 +385,34 @@ impl ConpiEscrow {
 
     pub fn cancel_admin_action(&mut self, proposal_id: u64) {
         self.assert_owner();
-        require!(
-            self.staged_proposals.get(&proposal_id).is_some(),
-            "Proposal not found"
-        );
-        self.staged_proposals.remove(&proposal_id);
+        let staged = self
+            .staged_proposals
+            .remove(&proposal_id)
+            .expect("Proposal not found");
+
+        if let AdminAction::Upgrade { .. } = staged.action {
+            let still_has_matching = if let Some(ref code) = self.staged_upgrade_code {
+                let code_hash = env::sha256_array(code);
+                self.staged_proposals.values().any(|p| {
+                    if let AdminAction::Upgrade { code_hash: h } = &p.action {
+                        h == &code_hash
+                    } else {
+                        false
+                    }
+                })
+            } else {
+                false
+            };
+            if !still_has_matching {
+                self.staged_upgrade_code = None;
+            }
+        }
         emit_event(ConpiEvent::GovernanceActionCancelled { proposal_id });
+    }
+
+    pub fn clear_staged_upgrade_code(&mut self) {
+        self.assert_owner();
+        self.staged_upgrade_code = None;
     }
 
     /// Migration entry point executed immediately after contract code deployment.
@@ -400,7 +422,7 @@ impl ConpiEscrow {
     #[init(ignore_state)]
     pub fn migrate() -> Self {
         let state_bytes = env::storage_read(b"STATE").expect("Contract state not found");
-        let (v1, approved_measurement, staged_upgrade_code) = if let Ok(cur) =
+        let (v1, approved_measurement) = if let Ok(cur) =
             ConpiEscrow::try_from_slice(&state_bytes)
         {
             let v1 = ConpiEscrowV1 {
@@ -418,7 +440,7 @@ impl ConpiEscrow {
                 timelock_duration: cur.timelock_duration,
                 state_version: cur.state_version,
             };
-            (v1, cur.approved_measurement, cur.staged_upgrade_code)
+            (v1, cur.approved_measurement)
         } else if let Ok(v2) =
             ConpiEscrowV2::try_from_slice(&state_bytes)
         {
@@ -437,7 +459,7 @@ impl ConpiEscrow {
                 timelock_duration: v2.timelock_duration,
                 state_version: v2.state_version,
             };
-            (v1, v2.approved_measurement, None)
+            (v1, v2.approved_measurement)
         } else if let Ok(v1) =
             ConpiEscrowV1::try_from_slice(&state_bytes)
         {
@@ -446,7 +468,7 @@ impl ConpiEscrow {
                 .values()
                 .find(|s| s.active)
                 .map(|s| s.measurement.clone());
-            (v1, approved, None)
+            (v1, approved)
         } else {
             env::panic_str("Failed to deserialize old contract state");
         };
@@ -472,7 +494,7 @@ impl ConpiEscrow {
             timelock_duration: v1.timelock_duration,
             state_version: v1.state_version + 1,
             approved_measurement,
-            staged_upgrade_code,
+            staged_upgrade_code: None,
         }
     }
 

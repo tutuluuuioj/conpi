@@ -1701,5 +1701,29 @@ mod tests {
         assert!(!contract.has_staged_upgrade_code());
         assert_eq!(contract.get_owner(), owner);
     }
+
+    #[test]
+    fn test_cancel_admin_action_clears_staged_upgrade_code() {
+        let owner: AccountId = "dao.testnet".parse().unwrap();
+        let context = get_context(owner.clone(), NearToken::from_yoctonear(0));
+        testing_env!(context.build());
+
+        let mut contract = ConpiEscrow::new(owner.clone(), None, None, None, None);
+        let dummy_code = vec![0x00, 0x61, 0x73, 0x6d, 0x01, 0x00, 0x00, 0x00];
+        let code_hash = near_sdk::env::sha256_array(&dummy_code);
+
+        // 1. Propose upgrade
+        let prop_id = contract.propose_admin_action(AdminAction::Upgrade { code_hash });
+
+        // 2. Stage code
+        contract.stage_upgrade_code(dummy_code.clone());
+        assert!(contract.has_staged_upgrade_code());
+
+        // 3. Cancel proposal
+        contract.cancel_admin_action(prop_id);
+
+        // 4. Staged upgrade code must be cleared
+        assert!(!contract.has_staged_upgrade_code());
+    }
 }
 
