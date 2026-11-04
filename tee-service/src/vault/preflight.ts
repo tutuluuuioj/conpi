@@ -134,6 +134,14 @@ class KeyVault {
   ): Promise<KeyCheckResult> {
     let apiKey: string;
     if (plainApiKey) {
+      if (process.env.NODE_ENV !== "test") {
+        return {
+          ok: false,
+          modelAvailable: false,
+          balanceCoversCredit: false,
+          error: "Plaintext API keys are rejected outside test mode; encryptedEnvelope is required",
+        };
+      }
       apiKey = plainApiKey;
     } else if (encryptedEnvelope) {
       apiKey = decryptFromClient(encryptedEnvelope);

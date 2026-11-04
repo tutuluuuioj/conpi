@@ -207,6 +207,7 @@ export async function GET(req: NextRequest) {
       verified,
       inEnclave: data.inEnclave,
       signerPublicKeyNear,
+      encryptionPublicKeyHex,
       mrtd: quoteMrtd,
       composeHash,
       rtmr3Quote: quoteRtmr3,

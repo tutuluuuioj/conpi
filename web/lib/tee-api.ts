@@ -23,8 +23,9 @@ export interface TicketResponse {
   buyer: string;
   seller: string;
   matched: boolean;
-  buyerTerms?: any;
-  sellerTerms?: any;
+  buyerSubmitted: boolean;
+  sellerSubmitted: boolean;
+  messages: Array<{ id: string; sender: string; text: string; createdAt: string }>;
   diffFields?: string[];
   termsHashHex?: string;
   signatureHex?: string;
@@ -68,15 +69,34 @@ export const teeApi = {
     return res.json();
   },
 
-  async submitTerms(ticketId: string, party: "buyer" | "seller", terms: any): Promise<TicketResponse> {
+  async getTicket(ticketId: string): Promise<TicketResponse> {
+    const res = await fetch(`${TEE_BASE_URL}/v1/tickets/${ticketId}`, { cache: "no-store" });
+    if (!res.ok) throw new Error(`Failed to fetch ticket: ${res.statusText}`);
+    return res.json();
+  },
+
+  async submitTerms(ticketId: string, party: "buyer" | "seller", encryptedEnvelope: any): Promise<TicketResponse> {
     const res = await fetch(`${TEE_BASE_URL}/v1/tickets/${ticketId}/terms`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ party, terms }),
+      body: JSON.stringify({ party, encryptedEnvelope }),
     });
     if (!res.ok) {
       const err = await res.json().catch(() => ({ error: res.statusText }));
       throw new Error(err.error || "Failed to submit terms");
+    }
+    return res.json();
+  },
+
+  async sendMessage(ticketId: string, sender: string, encryptedEnvelope: any): Promise<TicketResponse> {
+    const res = await fetch(`${TEE_BASE_URL}/v1/tickets/${ticketId}/messages`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ sender, encryptedEnvelope }),
+    });
+    if (!res.ok) {
+      const err = await res.json().catch(() => ({ error: res.statusText }));
+      throw new Error(err.error || "Failed to send encrypted message");
     }
     return res.json();
   },

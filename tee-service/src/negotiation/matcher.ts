@@ -1,5 +1,7 @@
+import crypto from "crypto";
 import { computeTermsHash, buildTermsMessage, DealTermsParams } from "../crypto/terms.js";
 import { enclaveKeys } from "../crypto/keys.js";
+import { decryptFromClient, EncryptedEnvelope } from "../crypto/encryption.js";
 import { CONFIG } from "../config.js";
 
 export interface TermSheet {
@@ -30,8 +32,21 @@ export interface TicketState {
   termsHashHex?: string;
   signatureHex?: string;
   diffFields?: string[];
+  messages: TicketMessage[];
   updatedAt: string;
 }
+
+export interface TicketMessage {
+  id: string;
+  sender: string;
+  text: string;
+  createdAt: string;
+}
+
+export type TicketView = Omit<TicketState, "buyerTerms" | "sellerTerms"> & {
+  buyerSubmitted: boolean;
+  sellerSubmitted: boolean;
+};
 
 export function normalizeTerms(input: any): TermSheet {
   const creditAmountUsd = Number(input.creditAmountUsd ?? input.creditUsd ?? 100);
@@ -66,6 +81,7 @@ class NegotiationService {
         buyer,
         seller,
         matched: false,
+        messages: [],
         updatedAt: new Date().toISOString(),
       };
       this.tickets.set(ticketId, ticket);
@@ -77,10 +93,69 @@ class NegotiationService {
     return this.tickets.get(ticketId);
   }
 
+  /**
+   * Returns only negotiation status and messages. Counterparty term sheets stay
+   * private inside the enclave and are never returned by the public API.
+   */
+  public getTicketView(ticketId: string): TicketView | undefined {
+    const ticket = this.tickets.get(ticketId);
+    if (!ticket) return undefined;
+    const { buyerTerms, sellerTerms, ...view } = ticket;
+    return {
+      ...view,
+      buyerSubmitted: Boolean(buyerTerms),
+      sellerSubmitted: Boolean(sellerTerms),
+    };
+  }
+
+  public submitEncryptedTerms(
+    ticketId: string,
+    party: "buyer" | "seller",
+    envelope: EncryptedEnvelope
+  ): TicketView {
+    const plaintext = decryptFromClient(envelope);
+    let terms: unknown;
+    try {
+      terms = JSON.parse(plaintext);
+    } catch {
+      throw new Error("Encrypted term sheet is not valid JSON");
+    }
+    this.submitTerms(ticketId, party, terms);
+    return this.getTicketView(ticketId)!;
+  }
+
+  public addEncryptedMessage(
+    ticketId: string,
+    sender: string,
+    envelope: EncryptedEnvelope
+  ): TicketView {
+    const ticket = this.tickets.get(ticketId);
+    if (!ticket) throw new Error(`Ticket ${ticketId} not found`);
+    if (sender !== ticket.buyer && sender !== ticket.seller) {
+      throw new Error("Message sender is not a ticket participant");
+    }
+
+    const text = decryptFromClient(envelope).trim();
+    if (!text) throw new Error("Message cannot be empty");
+    if (text.length > 4_000) throw new Error("Message exceeds 4,000 characters");
+
+    ticket.messages.push({
+      id: crypto.randomUUID(),
+      sender,
+      text,
+      createdAt: new Date().toISOString(),
+    });
+    ticket.updatedAt = new Date().toISOString();
+    return this.getTicketView(ticketId)!;
+  }
+
   public submitTerms(ticketId: string, party: "buyer" | "seller", inputTerms: any): TicketState {
     const ticket = this.tickets.get(ticketId);
     if (!ticket) {
       throw new Error(`Ticket ${ticketId} not found`);
+    }
+    if (party !== "buyer" && party !== "seller") {
+      throw new Error("Term submitter must be buyer or seller");
     }
 
     const terms = normalizeTerms(inputTerms);
@@ -156,6 +231,7 @@ class NegotiationService {
     if (a.slashBpsProviderBan !== b.slashBpsProviderBan) diffs.push("slashBpsProviderBan");
     if (a.slashBpsRevoke !== b.slashBpsRevoke) diffs.push("slashBpsRevoke");
     if (a.slashBpsBuyerBreach !== b.slashBpsBuyerBreach) diffs.push("slashBpsBuyerBreach");
+    if (a.deadline !== b.deadline) diffs.push("deadline");
     if (JSON.stringify(a.models.slice().sort()) !== JSON.stringify(b.models.slice().sort())) diffs.push("models");
     return diffs;
   }

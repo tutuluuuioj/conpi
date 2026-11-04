@@ -4,6 +4,7 @@ export interface AttestationVerificationResult {
   verified: boolean;
   inEnclave: boolean;
   signerPublicKeyNear: string;
+  encryptionPublicKeyHex: string;
   mrtd: string;
   composeHash: string;
   rtmr3Quote: string;

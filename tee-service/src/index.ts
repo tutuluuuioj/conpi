@@ -59,21 +59,53 @@ export async function buildApp() {
   app.post("/v1/tickets/:id/init", async (req) => {
     const { id } = req.params as { id: string };
     const { dealId, buyer, seller } = req.body as { dealId: number; buyer: string; seller: string };
-    return negotiationService.getOrCreateTicket(id, dealId, buyer, seller);
+    negotiationService.getOrCreateTicket(id, dealId, buyer, seller);
+    return negotiationService.getTicketView(id);
   });
 
   app.get("/v1/tickets/:id", async (req, reply) => {
     const { id } = req.params as { id: string };
-    const ticket = negotiationService.getTicket(id);
+    const ticket = negotiationService.getTicketView(id);
     if (!ticket) return reply.status(404).send({ error: "Ticket not found" });
     return ticket;
   });
 
   app.post("/v1/tickets/:id/terms", async (req, reply) => {
     const { id } = req.params as { id: string };
-    const { party, terms } = req.body as { party: "buyer" | "seller"; terms: any };
+    const { party, terms, encryptedEnvelope } = req.body as {
+      party: "buyer" | "seller";
+      terms?: any;
+      encryptedEnvelope?: any;
+    };
     try {
-      return negotiationService.submitTerms(id, party, terms);
+      if (encryptedEnvelope) {
+        return negotiationService.submitEncryptedTerms(id, party, encryptedEnvelope);
+      }
+      if (process.env.NODE_ENV !== "test") {
+        return reply.status(400).send({
+          error: "Plaintext term sheets are disabled; encryptedEnvelope is required",
+        });
+      }
+      negotiationService.submitTerms(id, party, terms);
+      return negotiationService.getTicketView(id);
+    } catch (err: any) {
+      return reply.status(400).send({ error: err.message });
+    }
+  });
+
+  app.post("/v1/tickets/:id/messages", async (req, reply) => {
+    const { id } = req.params as { id: string };
+    const { sender, encryptedEnvelope } = req.body as {
+      sender: string;
+      encryptedEnvelope?: any;
+    };
+    try {
+      if (!encryptedEnvelope) {
+        return reply.status(400).send({
+          error: "Plaintext chat is disabled; encryptedEnvelope is required",
+        });
+      }
+      return negotiationService.addEncryptedMessage(id, sender, encryptedEnvelope);
     } catch (err: any) {
       return reply.status(400).send({ error: err.message });
     }

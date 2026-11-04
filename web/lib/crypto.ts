@@ -31,7 +31,7 @@ function hexToBytes(hex: string): Uint8Array {
  * Encrypts an API key directly to the Intel TDX enclave public key using X25519 ECDH + AES-256-GCM.
  * The plaintext key is never exposed outside the browser or to intermediate proxies.
  */
-export function encryptApiKeyToEnclave(apiKey: string, enclavePubKeyHex: string): EncryptedKeyEnvelope {
+export function encryptPayloadToEnclave(plaintext: string, enclavePubKeyHex: string): EncryptedKeyEnvelope {
   // 1. Generate client ephemeral X25519 keypair
   const { secretKey, publicKey } = x25519.keygen();
 
@@ -49,7 +49,7 @@ export function encryptApiKeyToEnclave(apiKey: string, enclavePubKeyHex: string)
   crypto.getRandomValues(iv);
 
   const cipher = gcm(derivedKey, iv);
-  const encodedPlaintext = new TextEncoder().encode(apiKey.trim());
+  const encodedPlaintext = new TextEncoder().encode(plaintext);
   const ciphertextWithTag = cipher.encrypt(encodedPlaintext);
 
   // Split ciphertext and 16-byte authentication tag
@@ -62,4 +62,8 @@ export function encryptApiKeyToEnclave(apiKey: string, enclavePubKeyHex: string)
     ciphertextHex: bytesToHex(ciphertext),
     tagHex: bytesToHex(tag),
   };
+}
+
+export function encryptApiKeyToEnclave(apiKey: string, enclavePubKeyHex: string): EncryptedKeyEnvelope {
+  return encryptPayloadToEnclave(apiKey.trim(), enclavePubKeyHex);
 }

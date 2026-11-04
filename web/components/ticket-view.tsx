@@ -1,6 +1,6 @@
 "use client";
 
-import { FormEvent, useState } from "react";
+import { FormEvent, useEffect, useState } from "react";
 import { useRouter } from "next/navigation";
 import { Fingerprint, Lock, MessagesSquare, Send } from "lucide-react";
 import { differingFields, ratioOf, sameTerms, usd } from "@/lib/format";
@@ -14,20 +14,26 @@ export function TicketView({ id }: { id: string }) {
   const router = useRouter();
   const deal = app.deals.find((item) => item.id === id);
   const [text, setText] = useState("");
+  useEffect(() => {
+    void app.syncNegotiationTicket(id);
+    const interval = window.setInterval(() => void app.syncNegotiationTicket(id), 2_000);
+    return () => window.clearInterval(interval);
+  }, [id, app.syncNegotiationTicket]);
   if (!deal) {
     return <EmptyState icon={<MessagesSquare className="h-6 w-6" />} title="Ticket not found." body="Open a listing from the market." action={<Button href="/">Browse the market</Button>} />;
   }
-  const fields = differingFields(deal.buyerTerms, deal.sellerTerms);
+  const fields = deal.termDiffFields ?? differingFields(deal.buyerTerms, deal.sellerTerms);
   const matched = Boolean(deal.termsHash);
   const waiting = deal.buyerSubmitted && deal.sellerSubmitted && !deal.termsHash && fields.length === 0;
   const mismatch = deal.buyerSubmitted && deal.sellerSubmitted && fields.length > 0;
   const escrow = escrowOf(deal);
   const account = app.account ?? "";
+  const ownTerms = deal.role === "buyer" ? deal.buyerTerms : deal.sellerTerms;
 
   const send = (event: FormEvent) => {
     event.preventDefault();
     if (!text.trim()) return;
-    app.sendMessage(deal.id, text.trim());
+    void app.sendMessage(deal.id, text.trim());
     setText("");
   };
 
@@ -64,27 +70,27 @@ export function TicketView({ id }: { id: string }) {
           </div>
           <div className="mt-4 space-y-3">
             <Field label="Credit" error={changed("credit") ? "This field differs." : undefined}>
-              <input className={`${fieldClass} tabular text-right`} type="number" value={deal.buyerTerms.credit} onChange={(event) => app.updateBuyerTerms(deal.id, { credit: Number(event.target.value) })} />
+              <input className={`${fieldClass} tabular text-right`} type="number" value={ownTerms.credit} onChange={(event) => app.updateBuyerTerms(deal.id, { credit: Number(event.target.value) })} />
             </Field>
-            <Field label="Price" hint={ratioOf(deal.buyerTerms.price, deal.buyerTerms.credit)} error={changed("price") ? "This field differs." : undefined}>
-              <input className={`${fieldClass} tabular text-right`} type="number" value={deal.buyerTerms.price} onChange={(event) => app.updateBuyerTerms(deal.id, { price: Number(event.target.value) })} />
+            <Field label="Price" hint={ratioOf(ownTerms.price, ownTerms.credit)} error={changed("price") ? "This field differs." : undefined}>
+              <input className={`${fieldClass} tabular text-right`} type="number" value={ownTerms.price} onChange={(event) => app.updateBuyerTerms(deal.id, { price: Number(event.target.value) })} />
             </Field>
             <div className="grid grid-cols-2 gap-3">
               <Field label="Buyer collateral %">
-                <input className={`${fieldClass} tabular text-right`} type="number" value={deal.buyerTerms.buyerCollateralPct} onChange={(event) => app.updateBuyerTerms(deal.id, { buyerCollateralPct: Number(event.target.value) })} />
+                <input className={`${fieldClass} tabular text-right`} type="number" value={ownTerms.buyerCollateralPct} onChange={(event) => app.updateBuyerTerms(deal.id, { buyerCollateralPct: Number(event.target.value) })} />
               </Field>
               <Field label="Seller collateral %">
-                <input className={`${fieldClass} tabular text-right`} type="number" value={deal.buyerTerms.sellerCollateralPct} onChange={(event) => app.updateBuyerTerms(deal.id, { sellerCollateralPct: Number(event.target.value) })} />
+                <input className={`${fieldClass} tabular text-right`} type="number" value={ownTerms.sellerCollateralPct} onChange={(event) => app.updateBuyerTerms(deal.id, { sellerCollateralPct: Number(event.target.value) })} />
               </Field>
             </div>
             <Field label="Token">
-              <select className={fieldClass} value={deal.buyerTerms.token} onChange={(event) => app.updateBuyerTerms(deal.id, { token: event.target.value as Asset })}>
+              <select className={fieldClass} value={ownTerms.token} onChange={(event) => app.updateBuyerTerms(deal.id, { token: event.target.value as Asset })}>
                 <option>USDC</option>
                 <option>USDT</option>
                 <option>NEAR</option>
               </select>
             </Field>
-            <p className="text-xs text-muted">Allowlist: {deal.buyerTerms.models.join(", ")}. Deadline {deal.buyerTerms.deadline}.</p>
+            <p className="text-xs text-muted">Allowlist: {ownTerms.models.join(", ")}. Deadline {ownTerms.deadline}.</p>
             <p className="text-sm">You lock {usd(deal.role === "buyer" ? escrow.buyerDeposit : escrow.sellerDeposit)} {deal.token} if these terms match.</p>
           </div>
           {waiting ? <p className="mt-4 flex items-center gap-2 text-sm text-blue"><span className="h-3.5 w-3.5 animate-spin rounded-full border-2 border-blue/30 border-t-blue" /> TEE matching</p> : null}
@@ -97,7 +103,7 @@ export function TicketView({ id }: { id: string }) {
             </div>
           ) : null}
           <div className="mt-4 flex flex-col gap-2">
-            {!matched ? <Button onClick={() => app.acceptDeal(deal.id)}>Accept On-Chain Terms</Button> : null}
+            {!matched ? <Button onClick={() => void app.submitNegotiationTerms(deal.id)}>Submit encrypted terms</Button> : null}
             {matched && deal.role === "buyer" ? (
               <Button onClick={() => router.push(`/deals/${deal.id}`)}>Accept and deposit</Button>
             ) : null}

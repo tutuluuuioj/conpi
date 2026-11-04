@@ -103,22 +103,45 @@ async function runTests() {
   };
 
   // Buyer submits terms with price = 60
-  negotiationService.submitTerms(ticketId, "buyer", termA);
+  const encryptedBuyerTerms = encryptToEnclave(
+    JSON.stringify(termA),
+    enclaveKeys.getEncryptionPublicKeyHex()
+  );
+  negotiationService.submitEncryptedTerms(ticketId, "buyer", encryptedBuyerTerms);
 
   // Seller submits terms with differing price = 65
-  const ticketMismatch = negotiationService.submitTerms(ticketId, "seller", { ...termA, priceUsd: 65 });
+  const ticketMismatch = negotiationService.submitEncryptedTerms(
+    ticketId,
+    "seller",
+    encryptToEnclave(
+      JSON.stringify({ ...termA, priceUsd: 65 }),
+      enclaveKeys.getEncryptionPublicKeyHex()
+    )
+  );
   console.log("  Diff fields detected:", ticketMismatch.diffFields);
   if (!ticketMismatch.diffFields?.includes("price") || ticketMismatch.matched) {
     throw new Error("Mismatch detection failed");
   }
 
   // Seller aligns terms
-  const ticketMatched = negotiationService.submitTerms(ticketId, "seller", termA);
+  const ticketMatched = negotiationService.submitEncryptedTerms(
+    ticketId,
+    "seller",
+    encryptToEnclave(JSON.stringify(termA), enclaveKeys.getEncryptionPublicKeyHex())
+  );
   console.log("  Matched status:", ticketMatched.matched);
   console.log("  Matched termsHash:", ticketMatched.termsHashHex);
   console.log("  Matched signature:", ticketMatched.signatureHex?.slice(0, 32) + "...");
   if (!ticketMatched.matched || !ticketMatched.termsHashHex || !ticketMatched.signatureHex) {
     throw new Error("Terms matching failed");
+  }
+  const ticketWithMessage = negotiationService.addEncryptedMessage(
+    ticketId,
+    "buyer.near",
+    encryptToEnclave("Private negotiation message", enclaveKeys.getEncryptionPublicKeyHex())
+  );
+  if (ticketWithMessage.messages[0]?.text !== "Private negotiation message") {
+    throw new Error("Encrypted ticket message failed");
   }
   console.log("PASS: Negotiation terms matching and diffing verified.");
 
@@ -132,8 +155,11 @@ async function runTests() {
     80,
     60,
     ticketMatched.termsHashHex,
-    undefined,
-    "mock_sk_live_valid_prepaid_credit"
+    encryptToEnclave(
+      "mock_sk_live_valid_prepaid_credit",
+      enclaveKeys.getEncryptionPublicKeyHex()
+    ),
+    undefined
   );
   console.log("  Preflight result ok:", keyResult.ok);
   console.log("  Proxy key generated:", keyResult.proxyKey);

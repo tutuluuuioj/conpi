@@ -7,7 +7,8 @@ import { maskKey, round2, sameTerms, usd } from "./format";
 import { escrowOf, settleComplete, settleRevoke, stageFor } from "./money";
 import type { Asset, Claim, Deal, DealStatus, DealStep, Listing, Notice, Proposal, SignResult, Terms, ThemeMode, Toast, WalletName } from "./types";
 import { teeApi } from "./tee-api";
-import { encryptApiKeyToEnclave } from "./crypto";
+import { encryptApiKeyToEnclave, encryptPayloadToEnclave } from "./crypto";
+import { verifyLiveAttestation } from "./attestation-verifier";
 import {
   OnChainDeal,
   fetchContractDeals,
@@ -87,8 +88,10 @@ interface Api {
   approveSign: () => void;
   rejectSign: () => void;
   openTicket: (listingId: string) => string | null;
-  sendMessage: (dealId: string, text: string) => void;
+  sendMessage: (dealId: string, text: string) => Promise<void>;
   updateBuyerTerms: (dealId: string, patch: Partial<Deal["buyerTerms"]>) => void;
+  submitNegotiationTerms: (dealId: string) => Promise<void>;
+  syncNegotiationTicket: (dealId: string) => Promise<void>;
   acceptDeal: (dealId: string) => Promise<SignResult>;
   deposit: (dealId: string) => Promise<SignResult>;
   submitSellerKey: (dealId: string, plainApiKey?: string) => Promise<void>;
@@ -112,6 +115,23 @@ interface Api {
 }
 
 const Ctx = createContext<(State & Api) | null>(null);
+
+let verifiedEncryptionKeyCache: { key: string; fetchedAt: number } | null = null;
+
+async function getVerifiedEncryptionKey(): Promise<string> {
+  if (verifiedEncryptionKeyCache && Date.now() - verifiedEncryptionKeyCache.fetchedAt < 60_000) {
+    return verifiedEncryptionKeyCache.key;
+  }
+  const attestation = await verifyLiveAttestation();
+  if (!attestation.verified || !attestation.encryptionPublicKeyHex) {
+    throw new Error(`TEE attestation verification failed${attestation.errors?.length ? `: ${attestation.errors.join("; ")}` : ""}`);
+  }
+  verifiedEncryptionKeyCache = {
+    key: attestation.encryptionPublicKeyHex,
+    fetchedAt: Date.now(),
+  };
+  return attestation.encryptionPublicKeyHex;
+}
 
 export function useApp() {
   const value = useContext(Ctx);
@@ -432,6 +452,23 @@ export function Providers({ children }: { children: React.ReactNode }) {
       setState((s) => ({ ...s, deals: s.deals.map((deal) => (deal.id === id ? recipe(deal) : deal)) }));
     };
 
+    const applyTicketState = (dealId: string, ticket: Awaited<ReturnType<typeof teeApi.getTicket>>) => {
+      patchDeal(dealId, (deal) => ({
+        ...deal,
+        buyerSubmitted: ticket.buyerSubmitted,
+        sellerSubmitted: ticket.sellerSubmitted,
+        termDiffFields: ticket.diffFields || [],
+        termsHash: ticket.termsHashHex ? `0x${ticket.termsHashHex.replace(/^0x/, "")}` : deal.termsHash,
+        messages: (ticket.messages || []).map((message) => ({
+          id: message.id,
+          sender: message.sender,
+          text: message.text,
+          time: new Date(message.createdAt).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" }),
+        })),
+        lastUpdate: ticket.matched ? "Terms matched inside verified TEE" : "Private negotiation active",
+      }));
+    };
+
     return {
       setTheme: (theme) => setState((s) => ({ ...s, theme })),
       setDefaultToken: (defaultToken) => setState((s) => ({ ...s, defaultToken })),
@@ -545,21 +582,79 @@ export function Providers({ children }: { children: React.ReactNode }) {
           pulseStage: null,
         };
         setState((s) => ({ ...s, deals: [deal, ...s.deals] }));
+        teeApi.initTicket(id, Number(id), buyer, seller)
+          .then((ticket) => applyTicketState(id, ticket))
+          .catch((err) => pushToast({ kind: "error", title: "TEE ticket initialization failed", body: err.message }));
         return id;
       },
-      sendMessage: (dealId, text) => {
+      sendMessage: async (dealId, text) => {
         const account = stateRef.current.account;
         if (!account) return;
-        patchDeal(dealId, (deal) => ({
-          ...deal,
-          messages: [...deal.messages, { id: crypto.randomUUID(), sender: account, text, time: "Just now" }],
-        }));
+        try {
+          const enclaveKey = await getVerifiedEncryptionKey();
+          const encryptedEnvelope = encryptPayloadToEnclave(text, enclaveKey);
+          const ticket = await teeApi.sendMessage(dealId, account, encryptedEnvelope);
+          applyTicketState(dealId, ticket);
+        } catch (err: any) {
+          pushToast({ kind: "error", title: "Encrypted message failed", body: err.message });
+        }
       },
       updateBuyerTerms: (dealId, patch) => {
         patchDeal(dealId, (deal) => ({
           ...deal,
-          buyerTerms: { ...deal.buyerTerms, ...patch },
+          buyerTerms: deal.role === "buyer" ? { ...deal.buyerTerms, ...patch } : deal.buyerTerms,
+          sellerTerms: deal.role === "seller" ? { ...deal.sellerTerms, ...patch } : deal.sellerTerms,
         }));
+      },
+      submitNegotiationTerms: async (dealId) => {
+        const deal = stateRef.current.deals.find((item) => item.id === dealId);
+        if (!deal) return;
+        try {
+          const party = deal.role;
+          const terms = party === "buyer" ? deal.buyerTerms : deal.sellerTerms;
+          const termSheet = {
+            provider: deal.provider,
+            models: terms.models,
+            creditAmountUsd: terms.credit,
+            priceUsd: terms.price,
+            buyerCollateralPct: terms.buyerCollateralPct,
+            sellerCollateralPct: terms.sellerCollateralPct,
+            token: terms.token === "NEAR" ? null : terms.token,
+            depositDurationSec: 172800,
+            keyDurationSec: 86400,
+            teeLivenessTimeoutSec: 3600,
+            slashBpsProviderBan: 5000,
+            slashBpsRevoke: 8000,
+            slashBpsBuyerBreach: 5000,
+            deadline: terms.deadline,
+          };
+          const enclaveKey = await getVerifiedEncryptionKey();
+          const encryptedEnvelope = encryptPayloadToEnclave(JSON.stringify(termSheet), enclaveKey);
+          const ticket = await teeApi.submitTerms(dealId, party, encryptedEnvelope);
+          applyTicketState(dealId, ticket);
+          pushToast({
+            kind: ticket.matched ? "success" : "info",
+            title: ticket.matched ? "Terms matched inside TEE" : "Encrypted terms submitted",
+            body: ticket.diffFields?.length ? `Different fields: ${ticket.diffFields.join(", ")}` : undefined,
+          });
+        } catch (err: any) {
+          pushToast({ kind: "error", title: "Encrypted term submission failed", body: err.message });
+        }
+      },
+      syncNegotiationTicket: async (dealId) => {
+        const deal = stateRef.current.deals.find((item) => item.id === dealId);
+        if (!deal) return;
+        try {
+          let ticket;
+          try {
+            ticket = await teeApi.getTicket(dealId);
+          } catch {
+            ticket = await teeApi.initTicket(dealId, Number(dealId), deal.buyer, deal.seller);
+          }
+          applyTicketState(dealId, ticket);
+        } catch {
+          // Polling remains silent while the TEE ticket is temporarily unavailable.
+        }
       },
       acceptDeal: async (dealId) => {
         const deal = stateRef.current.deals.find((item) => item.id === dealId);
@@ -626,9 +721,15 @@ export function Providers({ children }: { children: React.ReactNode }) {
       submitSellerKey: async (dealId, plainApiKey) => {
         const deal = stateRef.current.deals.find((item) => item.id === dealId);
         if (!deal) return;
+        if (!plainApiKey?.trim()) {
+          pushToast({ kind: "error", title: "API key is required" });
+          return;
+        }
         pushToast({ kind: "pending", title: "Validating key in TEE Enclave..." });
 
         try {
+          const enclaveKey = await getVerifiedEncryptionKey();
+          const encryptedEnvelope = encryptApiKeyToEnclave(plainApiKey, enclaveKey);
           const res = await teeApi.submitKey(Number(dealId), {
             provider: deal.provider.toLowerCase(),
             model: deal.model,
@@ -636,7 +737,7 @@ export function Providers({ children }: { children: React.ReactNode }) {
             creditUsd: deal.credit,
             priceUsd: deal.price,
             termsHashHex: deal.termsHash ? deal.termsHash.replace(/^0x/, "") : "00".repeat(32),
-            plainApiKey,
+            encryptedEnvelope,
           });
 
           if (!res.ok) {
