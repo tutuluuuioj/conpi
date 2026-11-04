@@ -161,6 +161,7 @@ pub enum AdminAction {
     Upgrade { code_hash: [u8; 32] },
     Unpause,
     UpdateTimelock { timelock_duration: u64 },
+    SetApprovedMeasurement { measurement: String },
 }
 
 #[near(serializers = [json, borsh])]

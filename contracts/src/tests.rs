@@ -4,13 +4,16 @@ mod tests {
     use crate::types::{
         AdminAction, CreateDealParams, DealStatus, DefaultReason, PayloadKind, SignedPayload,
     };
-    use crate::{ConpiEscrow, LIVE_CVM_COMPOSE_HASH, LIVE_CVM_MRTD};
+    use crate::ConpiEscrow;
     use ed25519_dalek::{Signer, SigningKey};
     use near_sdk::json_types::U128;
     use near_sdk::test_utils::VMContextBuilder;
     use near_sdk::testing_env;
     use near_sdk::{AccountId, NearToken, PublicKey};
     use rand::rngs::OsRng;
+
+    const REAL_CVM_MEASUREMENT: &str = "mrtd:7fe60787222bd394cb516abca2435f22f035ab2cc9c0a4b4b3b148e46297f3d931a237b72f359052c6e657d8c1409173|compose:c847677bcdbe7d532fa96beabe82cb19e5c7ae44feed9e2c0d941660257d4ed0";
+    const OUTDATED_CVM_MEASUREMENT: &str = "mrtd:7fe60787222bd394cb516abca2435f22f035ab2cc9c0a4b4b3b148e46297f3d931a237b72f359052c6e657d8c1409173|compose:outdated_compose_a1f7be33";
 
     const STORAGE_DEPOSIT: NearToken = NearToken::from_yoctonear(50_000_000_000_000_000_000_000); // 0.05 NEAR
 
@@ -55,7 +58,7 @@ mod tests {
             owner.clone(),
             None,
             None,
-            Some((tee_pk.clone(), "measurement_hash_123".to_string())),
+            Some((tee_pk.clone(), REAL_CVM_MEASUREMENT.to_string())),
             None,
         );
         assert_eq!(contract.get_owner(), owner);
@@ -117,7 +120,7 @@ mod tests {
         // Propose AddTeeSigner
         let prop_add = contract.propose_admin_action(AdminAction::AddTeeSigner {
             public_key: tee_pk.clone(),
-            measurement: "tdx_mrtd:valid".to_string(),
+            measurement: REAL_CVM_MEASUREMENT.to_string(),
         });
 
         // Advance 48 hours and execute
@@ -128,7 +131,7 @@ mod tests {
 
         let signer = contract.get_tee_signer(tee_pk.clone()).unwrap();
         assert!(signer.active);
-        assert_eq!(signer.measurement, "tdx_mrtd:valid");
+        assert_eq!(signer.measurement, REAL_CVM_MEASUREMENT);
 
         // Propose RevokeTeeSigner
         let prop_revoke = contract.propose_admin_action(AdminAction::RevokeTeeSigner {
@@ -164,7 +167,7 @@ mod tests {
             owner.clone(),
             None,
             None,
-            Some((tee_pk.clone(), "tee_quote_mrtd".to_string())),
+            Some((tee_pk.clone(), REAL_CVM_MEASUREMENT.to_string())),
             None,
         );
 
@@ -286,7 +289,7 @@ mod tests {
             owner.clone(),
             None,
             None,
-            Some((tee_pk.clone(), "tee_quote_mrtd".to_string())),
+            Some((tee_pk.clone(), REAL_CVM_MEASUREMENT.to_string())),
             None,
         );
 
@@ -532,7 +535,7 @@ mod tests {
             owner.clone(),
             None,
             None,
-            Some((tee_pk.clone(), "tee_quote_mrtd".to_string())),
+            Some((tee_pk.clone(), REAL_CVM_MEASUREMENT.to_string())),
             None,
         );
 
@@ -612,7 +615,7 @@ mod tests {
             owner.clone(),
             None,
             None,
-            Some((tee_pk.clone(), "tee_quote_mrtd".to_string())),
+            Some((tee_pk.clone(), REAL_CVM_MEASUREMENT.to_string())),
             None,
         );
 
@@ -714,7 +717,7 @@ mod tests {
         // Verify signer is strictly recorded as revoked
         let signer = contract.get_tee_signer(tee_pk).unwrap();
         assert!(!signer.active, "Signer active flag must be false");
-        assert_eq!(signer.measurement, "tee_quote_mrtd");
+        assert_eq!(signer.measurement, REAL_CVM_MEASUREMENT);
 
         // Verify deal remains active and safe from unauthorized stage release
         let live_deal = contract.get_deal(deal_id).unwrap();
@@ -742,7 +745,7 @@ mod tests {
             owner.clone(),
             None,
             None,
-            Some((tee_pk.clone(), "tee_quote_mrtd".to_string())),
+            Some((tee_pk.clone(), REAL_CVM_MEASUREMENT.to_string())),
             None,
         );
 
@@ -907,7 +910,7 @@ mod tests {
             owner.clone(),
             None,
             None,
-            Some((tee_pk.clone(), "tee_quote_mrtd".to_string())),
+            Some((tee_pk.clone(), REAL_CVM_MEASUREMENT.to_string())),
             None,
         );
 
@@ -993,7 +996,7 @@ mod tests {
             owner.clone(),
             None,
             None,
-            Some((tee_pk.clone(), "tee_quote_mrtd".to_string())),
+            Some((tee_pk.clone(), REAL_CVM_MEASUREMENT.to_string())),
             None,
         );
 
@@ -1360,11 +1363,35 @@ mod tests {
         let context = get_context(owner.clone(), NearToken::from_yoctonear(0));
         testing_env!(context.build());
 
-        let contract = ConpiEscrow::new(owner.clone(), None, None, None, None);
-        assert_eq!(contract.get_state_version(), 1);
+        let (_sk, tee_pk) = generate_tee_keypair();
+        let mut tee_signers = near_sdk::collections::UnorderedMap::new(b"t");
+        tee_signers.insert(
+            &tee_pk,
+            &crate::types::TeeSigner {
+                measurement: REAL_CVM_MEASUREMENT.to_string(),
+                registered_at: 1_000_000_000_000,
+                active: true,
+            },
+        );
+
+        let v1 = crate::ConpiEscrowV1 {
+            owner: owner.clone(),
+            chain_id: "testnet".to_string(),
+            paused: false,
+            tee_signers,
+            deals: near_sdk::collections::LookupMap::new(b"d"),
+            deal_creators: near_sdk::collections::LookupMap::new(b"c"),
+            pending_payouts: near_sdk::collections::LookupMap::new(b"p"),
+            next_deal_id: 1,
+            config: crate::types::Config::default(),
+            next_proposal_id: 1,
+            staged_proposals: near_sdk::collections::UnorderedMap::new(b"s"),
+            timelock_duration: 300_000_000_000,
+            state_version: 1,
+        };
 
         // Write contract state to simulate pre-upgrade on-chain state
-        near_sdk::env::state_write(&contract);
+        near_sdk::env::state_write(&v1);
 
         // Execute migration reading versioned ConpiEscrowV1
         let migrated = ConpiEscrow::migrate();
@@ -1376,6 +1403,10 @@ mod tests {
         assert_eq!(migrated.get_timelock_duration(), 300_000_000_000);
         assert!(!migrated.is_paused());
         assert_eq!(migrated.get_chain_id(), "testnet");
+        assert_eq!(
+            migrated.get_approved_measurement(),
+            Some(REAL_CVM_MEASUREMENT.to_string())
+        );
     }
 
     #[test]
@@ -1447,9 +1478,11 @@ mod tests {
             owner,
             None,
             None,
-            Some((tee_pk.clone(), "mrtd:old_unapproved_quote|compose:outdated_compose_hash".to_string())),
+            Some((tee_pk.clone(), OUTDATED_CVM_MEASUREMENT.to_string())),
             None,
         );
+        // DAO updates approved measurement to the real live CVM measurement
+        contract.approved_measurement = Some(REAL_CVM_MEASUREMENT.to_string());
 
         let buyer: AccountId = "buyer.testnet".parse().unwrap();
         let seller: AccountId = "seller.testnet".parse().unwrap();
@@ -1478,18 +1511,36 @@ mod tests {
     }
 
     #[test]
-    #[should_panic(expected = "Measurement does not match approved live CVM measurement")]
-    fn test_propose_add_tee_signer_rejects_mismatched_measurement() {
+    fn test_dao_registration_updates_approved_measurement() {
         let owner: AccountId = "owner.testnet".parse().unwrap();
         let (_sk, tee_pk) = generate_tee_keypair();
-        let context = get_context(owner.clone(), NearToken::from_yoctonear(0));
+        let mut context = get_context(owner.clone(), NearToken::from_yoctonear(0));
         testing_env!(context.build());
 
-        let mut contract = ConpiEscrow::new(owner, None, None, None, None);
-        contract.propose_admin_action(AdminAction::AddTeeSigner {
-            public_key: tee_pk,
-            measurement: "mrtd:7fe60787222bd394cb516abca2435f22f035ab2cc9c0a4b4b3b148e46297f3d931a237b72f359052c6e657d8c1409173|compose:outdated_compose_a1f7be33".to_string(),
+        let mut contract = ConpiEscrow::new(owner.clone(), None, None, None, None);
+        assert_eq!(contract.get_approved_measurement(), None);
+
+        // Stage proposal to add TEE signer with real CVM measurement
+        let prop_id = contract.propose_admin_action(AdminAction::AddTeeSigner {
+            public_key: tee_pk.clone(),
+            measurement: REAL_CVM_MEASUREMENT.to_string(),
         });
+        assert_eq!(prop_id, 1);
+
+        // Fast forward past timelock
+        testing_env!(context
+            .block_timestamp(1_000_000_000_000 + 301_000_000_000)
+            .build());
+
+        let _ = contract.execute_admin_action(prop_id, None);
+        assert_eq!(
+            contract.get_approved_measurement(),
+            Some(REAL_CVM_MEASUREMENT.to_string())
+        );
+
+        let signer = contract.get_tee_signer(tee_pk).expect("signer registered");
+        assert_eq!(signer.measurement, REAL_CVM_MEASUREMENT);
+        assert!(signer.active);
     }
 
     #[test]
@@ -1499,12 +1550,11 @@ mod tests {
         let context = get_context(owner.clone(), NearToken::from_yoctonear(50_000_000_000_000_000_000_000));
         testing_env!(context.build());
 
-        let valid_meas = format!("mrtd:{}|compose:{}", LIVE_CVM_MRTD, LIVE_CVM_COMPOSE_HASH);
         let mut contract = ConpiEscrow::new(
             owner,
             None,
             None,
-            Some((tee_pk.clone(), valid_meas)),
+            Some((tee_pk.clone(), REAL_CVM_MEASUREMENT.to_string())),
             None,
         );
 

@@ -25,9 +25,6 @@ const GAS_FOR_FT_TRANSFER: Gas = Gas::from_tgas(20);
 const GAS_FOR_RESOLVE_TRANSFER: Gas = Gas::from_tgas(10);
 const ONE_YOCTO: Balance = 1;
 
-pub const LIVE_CVM_COMPOSE_HASH: &str = "c847677bcdbe7d532fa96beabe82cb19e5c7ae44feed9e2c0d941660257d4ed0";
-pub const LIVE_CVM_MRTD: &str = "7fe60787222bd394cb516abca2435f22f035ab2cc9c0a4b4b3b148e46297f3d931a237b72f359052c6e657d8c1409173";
-
 #[near(contract_state)]
 #[derive(PanicOnDefault)]
 pub struct ConpiEscrow {
@@ -44,6 +41,7 @@ pub struct ConpiEscrow {
     pub staged_proposals: UnorderedMap<u64, StagedAction>,
     pub timelock_duration: Duration,
     pub state_version: u32,
+    pub approved_measurement: Option<String>,
 }
 
 /// Versioned representation of old contract state (V1) for safe schema migrations.
@@ -86,6 +84,7 @@ impl ConpiEscrow {
             timelock >= 300_000_000_000,
             "Timelock duration must be at least 5 minutes (300,000,000,000 ns)"
         );
+        let approved_measurement = initial_tee_signer.as_ref().map(|(_, m)| m.clone());
         let mut contract = Self {
             owner,
             chain_id: chain_id.unwrap_or_else(|| "testnet".to_string()),
@@ -100,6 +99,7 @@ impl ConpiEscrow {
             staged_proposals: UnorderedMap::new(b"s"),
             timelock_duration: timelock,
             state_version: 1,
+            approved_measurement,
         };
 
         if let Some((pk, measurement)) = initial_tee_signer {
@@ -143,10 +143,9 @@ impl ConpiEscrow {
             AdminAction::AddTeeSigner { public_key, measurement } => {
                 CryptoHelper::extract_ed25519_bytes(public_key);
                 require!(!measurement.is_empty(), "Measurement cannot be empty");
-                require!(
-                    Self::is_valid_cvm_measurement(measurement),
-                    "Measurement does not match approved live CVM measurement"
-                );
+            }
+            AdminAction::SetApprovedMeasurement { measurement } => {
+                require!(!measurement.is_empty(), "Measurement cannot be empty");
             }
             AdminAction::RevokeTeeSigner { public_key } => {
                 require!(
@@ -189,6 +188,7 @@ impl ConpiEscrow {
             AdminAction::Upgrade { .. } => "UPGRADE",
             AdminAction::Unpause => "UNPAUSE",
             AdminAction::UpdateTimelock { .. } => "UPDATE_TIMELOCK",
+            AdminAction::SetApprovedMeasurement { .. } => "SET_APPROVED_MEASUREMENT",
         };
 
         emit_event(ConpiEvent::GovernanceActionProposed {
@@ -252,14 +252,23 @@ impl ConpiEscrow {
                 self.tee_signers.insert(
                     &public_key,
                     &TeeSigner {
-                        measurement,
+                        measurement: measurement.clone(),
                         registered_at: env::block_timestamp(),
                         active: true,
                     },
                 );
+                self.approved_measurement = Some(measurement);
                 emit_event(ConpiEvent::GovernanceActionExecuted {
                     proposal_id,
                     action_type: "ADD_TEE_SIGNER",
+                });
+                PromiseOrValue::Value(true)
+            }
+            AdminAction::SetApprovedMeasurement { measurement } => {
+                self.approved_measurement = Some(measurement);
+                emit_event(ConpiEvent::GovernanceActionExecuted {
+                    proposal_id,
+                    action_type: "SET_APPROVED_MEASUREMENT",
                 });
                 PromiseOrValue::Value(true)
             }
@@ -338,6 +347,12 @@ impl ConpiEscrow {
             "Unsupported contract state version for migration"
         );
         emit_event(ConpiEvent::ContractMigrated);
+        let approved_measurement = old
+            .tee_signers
+            .values()
+            .find(|s| s.active)
+            .map(|s| s.measurement.clone());
+
         Self {
             owner: old.owner,
             chain_id: old.chain_id,
@@ -352,6 +367,7 @@ impl ConpiEscrow {
             staged_proposals: old.staged_proposals,
             timelock_duration: old.timelock_duration,
             state_version: old.state_version + 1,
+            approved_measurement,
         }
     }
 
@@ -1239,17 +1255,8 @@ impl ConpiEscrow {
         require!(!self.paused, "Contract is currently paused");
     }
 
-    pub fn is_valid_cvm_measurement(measurement: &str) -> bool {
-        #[cfg(test)]
-        {
-            if measurement.contains("valid")
-                || measurement.contains("tee_quote")
-                || measurement.contains("measurement_hash")
-            {
-                return true;
-            }
-        }
-        measurement.contains(LIVE_CVM_COMPOSE_HASH) && measurement.contains(LIVE_CVM_MRTD)
+    pub fn get_approved_measurement(&self) -> Option<String> {
+        self.approved_measurement.clone()
     }
 
     fn assert_active_tee_signer(&self, pk: &PublicKey) {
@@ -1259,10 +1266,12 @@ impl ConpiEscrow {
             !signer.measurement.is_empty(),
             "TEE signer measurement cannot be empty"
         );
-        require!(
-            Self::is_valid_cvm_measurement(&signer.measurement),
-            "TEE signer measurement does not match approved live CVM measurement"
-        );
+        if let Some(ref approved) = self.approved_measurement {
+            require!(
+                &signer.measurement == approved,
+                "TEE signer measurement does not match approved live CVM measurement"
+            );
+        }
     }
 
     fn check_and_transition_funded(&mut self, deal: &mut Deal) {
