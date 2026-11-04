@@ -1410,6 +1410,52 @@ mod tests {
     }
 
     #[test]
+    fn test_versioned_state_migration_with_conpi_escrow_v2() {
+        let owner: AccountId = "dao.testnet".parse().unwrap();
+        let context = get_context(owner.clone(), NearToken::from_yoctonear(0));
+        testing_env!(context.build());
+
+        let (_sk, tee_pk) = generate_tee_keypair();
+        let mut tee_signers = near_sdk::collections::UnorderedMap::new(b"t");
+        tee_signers.insert(
+            &tee_pk,
+            &crate::types::TeeSigner {
+                measurement: REAL_CVM_MEASUREMENT.to_string(),
+                registered_at: 1_000_000_000_000,
+                active: true,
+            },
+        );
+
+        let v2 = crate::ConpiEscrowV2 {
+            owner: owner.clone(),
+            chain_id: "testnet".to_string(),
+            paused: false,
+            tee_signers,
+            deals: near_sdk::collections::LookupMap::new(b"d"),
+            deal_creators: near_sdk::collections::LookupMap::new(b"c"),
+            pending_payouts: near_sdk::collections::LookupMap::new(b"p"),
+            next_deal_id: 1,
+            config: crate::types::Config::default(),
+            next_proposal_id: 1,
+            staged_proposals: near_sdk::collections::UnorderedMap::new(b"s"),
+            timelock_duration: 300_000_000_000,
+            state_version: 4,
+            approved_measurement: Some(REAL_CVM_MEASUREMENT.to_string()),
+        };
+
+        near_sdk::env::state_write(&v2);
+
+        let migrated = ConpiEscrow::migrate();
+        assert_eq!(migrated.get_state_version(), 5);
+        assert_eq!(migrated.get_owner(), owner);
+        assert_eq!(
+            migrated.get_approved_measurement(),
+            Some(REAL_CVM_MEASUREMENT.to_string())
+        );
+        assert_eq!(migrated.staged_upgrade_code, None);
+    }
+
+    #[test]
     #[should_panic(expected = "Measurement cannot be empty")]
     fn test_propose_add_tee_signer_rejects_empty_measurement() {
         let owner: AccountId = "owner.testnet".parse().unwrap();
@@ -1583,6 +1629,77 @@ mod tests {
 
         let deal_id = contract.create_deal(params);
         assert_eq!(deal_id, 1);
+    }
+
+    #[test]
+    #[should_panic(expected = "Approved CVM measurement is not set")]
+    fn test_assert_active_tee_signer_fails_when_approved_measurement_is_none() {
+        let owner: AccountId = "owner.testnet".parse().unwrap();
+        let (_sk, tee_pk) = generate_tee_keypair();
+        let context = get_context(owner.clone(), NearToken::from_yoctonear(50_000_000_000_000_000_000_000));
+        testing_env!(context.build());
+
+        let mut contract = ConpiEscrow::new(
+            owner,
+            None,
+            None,
+            Some((tee_pk.clone(), REAL_CVM_MEASUREMENT.to_string())),
+            None,
+        );
+        contract.approved_measurement = None;
+
+        let buyer: AccountId = "buyer.testnet".parse().unwrap();
+        let seller: AccountId = "seller.testnet".parse().unwrap();
+
+        let context = get_context(buyer.clone(), NearToken::from_yoctonear(50_000_000_000_000_000_000_000));
+        testing_env!(context.build());
+
+        let params = CreateDealParams {
+            buyer,
+            seller,
+            token: None,
+            price: U128(100),
+            credit_amount: U128(100),
+            buyer_collateral: U128(10),
+            seller_collateral: U128(20),
+            tee_pubkey: tee_pk,
+            deposit_duration_sec: 3600,
+            key_duration_sec: 3600,
+            tee_liveness_timeout_sec: 3600,
+            slash_bps_revoke: 8000,
+            slash_bps_provider_ban: 5000,
+            slash_bps_buyer_breach: 5000,
+        };
+
+        contract.create_deal(params);
+    }
+
+    #[test]
+    fn test_direct_dao_upgrade_via_staged_code_without_transfer() {
+        let owner: AccountId = "dao.testnet".parse().unwrap();
+        let mut context = get_context(owner.clone(), NearToken::from_yoctonear(0));
+        testing_env!(context.build());
+
+        let mut contract = ConpiEscrow::new(owner.clone(), None, None, None, None);
+        let dummy_code = vec![0x00, 0x61, 0x73, 0x6d, 0x01, 0x00, 0x00, 0x00];
+        let code_hash = near_sdk::env::sha256_array(&dummy_code);
+
+        // 1. DAO stages Upgrade proposal
+        let prop_id = contract.propose_admin_action(AdminAction::Upgrade { code_hash });
+
+        // 2. Someone stages matching upgrade bytecode
+        contract.stage_upgrade_code(dummy_code.clone());
+        assert!(contract.has_staged_upgrade_code());
+
+        // 3. Timelock matures
+        testing_env!(context
+            .block_timestamp(1_000_000_000_000 + 301_000_000_000)
+            .build());
+
+        // 4. DAO executes proposal passing None for code (zero bytes in transaction call!)
+        let _ = contract.execute_admin_action(prop_id, None);
+        assert!(!contract.has_staged_upgrade_code());
+        assert_eq!(contract.get_owner(), owner);
     }
 }
 

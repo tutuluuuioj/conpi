@@ -4,6 +4,7 @@ use near_sdk::{
     env, near, require, AccountId, Duration, Gas, NearToken, PanicOnDefault, Promise,
     PromiseOrValue, PublicKey,
 };
+use near_sdk::borsh::BorshDeserialize;
 
 pub mod crypto;
 pub mod events;
@@ -42,6 +43,7 @@ pub struct ConpiEscrow {
     pub timelock_duration: Duration,
     pub state_version: u32,
     pub approved_measurement: Option<String>,
+    pub staged_upgrade_code: Option<Vec<u8>>,
 }
 
 /// Versioned representation of old contract state (V1) for safe schema migrations.
@@ -60,6 +62,25 @@ pub struct ConpiEscrowV1 {
     pub staged_proposals: UnorderedMap<u64, StagedAction>,
     pub timelock_duration: Duration,
     pub state_version: u32,
+}
+
+/// Versioned representation of contract state V2 (with approved_measurement)
+#[near(serializers = [borsh])]
+pub struct ConpiEscrowV2 {
+    pub owner: AccountId,
+    pub chain_id: String,
+    pub paused: bool,
+    pub tee_signers: UnorderedMap<PublicKey, TeeSigner>,
+    pub deals: LookupMap<DealId, Deal>,
+    pub deal_creators: LookupMap<DealId, AccountId>,
+    pub pending_payouts: LookupMap<(AccountId, Option<AccountId>), Balance>,
+    pub next_deal_id: u64,
+    pub config: Config,
+    pub next_proposal_id: u64,
+    pub staged_proposals: UnorderedMap<u64, StagedAction>,
+    pub timelock_duration: Duration,
+    pub state_version: u32,
+    pub approved_measurement: Option<String>,
 }
 
 /// Versioned wrapper for historical contract state snapshots during migration.
@@ -100,6 +121,7 @@ impl ConpiEscrow {
             timelock_duration: timelock,
             state_version: 1,
             approved_measurement,
+            staged_upgrade_code: None,
         };
 
         if let Some((pk, measurement)) = initial_tee_signer {
@@ -218,7 +240,13 @@ impl ConpiEscrow {
         );
 
         if let AdminAction::Upgrade { code_hash } = &staged.action {
-            let code_bytes = code.as_ref().expect("WASM code bytes required for contract upgrade");
+            let code_bytes = if let Some(ref c) = code {
+                c
+            } else {
+                self.staged_upgrade_code
+                    .as_ref()
+                    .expect("No WASM code provided or staged for upgrade")
+            };
             require!(
                 &env::sha256_array(code_bytes) == code_hash,
                 "Code hash mismatch with staged upgrade proposal"
@@ -286,7 +314,13 @@ impl ConpiEscrow {
                 PromiseOrValue::Value(true)
             }
             AdminAction::Upgrade { .. } => {
-                let code_bytes = code.expect("WASM code bytes required for contract upgrade");
+                let code_bytes = if let Some(c) = code {
+                    c
+                } else {
+                    self.staged_upgrade_code
+                        .take()
+                        .expect("No WASM code provided or staged for upgrade")
+                };
                 emit_event(ConpiEvent::GovernanceActionExecuted {
                     proposal_id,
                     action_type: "UPGRADE",
@@ -325,6 +359,30 @@ impl ConpiEscrow {
         }
     }
 
+    /// Stages WASM code for an active Upgrade proposal ahead of execution.
+    /// This allows zero-code Multisig governance calls, completely eliminating 300 Tgas multisig limits.
+    pub fn stage_upgrade_code(&mut self, code: Vec<u8>) {
+        require!(!code.is_empty(), "Upgrade code cannot be empty");
+        let code_hash = env::sha256_array(&code);
+        let has_matching_proposal = self.staged_proposals.values().any(|staged| {
+            if let AdminAction::Upgrade { code_hash: staged_hash } = &staged.action {
+                staged_hash == &code_hash
+            } else {
+                false
+            }
+        });
+        require!(
+            has_matching_proposal,
+            "No active staged upgrade proposal matches the uploaded code hash"
+        );
+        self.staged_upgrade_code = Some(code);
+        env::log_str("Upgrade WASM code staged successfully for direct DAO execution");
+    }
+
+    pub fn has_staged_upgrade_code(&self) -> bool {
+        self.staged_upgrade_code.is_some()
+    }
+
     pub fn cancel_admin_action(&mut self, proposal_id: u64) {
         self.assert_owner();
         require!(
@@ -341,33 +399,80 @@ impl ConpiEscrow {
     #[private]
     #[init(ignore_state)]
     pub fn migrate() -> Self {
-        let old: ConpiEscrowV1 = env::state_read().expect("Old contract state not found");
+        let state_bytes = env::storage_read(b"STATE").expect("Contract state not found");
+        let (v1, approved_measurement, staged_upgrade_code) = if let Ok(cur) =
+            ConpiEscrow::try_from_slice(&state_bytes)
+        {
+            let v1 = ConpiEscrowV1 {
+                owner: cur.owner,
+                chain_id: cur.chain_id,
+                paused: cur.paused,
+                tee_signers: cur.tee_signers,
+                deals: cur.deals,
+                deal_creators: cur.deal_creators,
+                pending_payouts: cur.pending_payouts,
+                next_deal_id: cur.next_deal_id,
+                config: cur.config,
+                next_proposal_id: cur.next_proposal_id,
+                staged_proposals: cur.staged_proposals,
+                timelock_duration: cur.timelock_duration,
+                state_version: cur.state_version,
+            };
+            (v1, cur.approved_measurement, cur.staged_upgrade_code)
+        } else if let Ok(v2) =
+            ConpiEscrowV2::try_from_slice(&state_bytes)
+        {
+            let v1 = ConpiEscrowV1 {
+                owner: v2.owner,
+                chain_id: v2.chain_id,
+                paused: v2.paused,
+                tee_signers: v2.tee_signers,
+                deals: v2.deals,
+                deal_creators: v2.deal_creators,
+                pending_payouts: v2.pending_payouts,
+                next_deal_id: v2.next_deal_id,
+                config: v2.config,
+                next_proposal_id: v2.next_proposal_id,
+                staged_proposals: v2.staged_proposals,
+                timelock_duration: v2.timelock_duration,
+                state_version: v2.state_version,
+            };
+            (v1, v2.approved_measurement, None)
+        } else if let Ok(v1) =
+            ConpiEscrowV1::try_from_slice(&state_bytes)
+        {
+            let approved = v1
+                .tee_signers
+                .values()
+                .find(|s| s.active)
+                .map(|s| s.measurement.clone());
+            (v1, approved, None)
+        } else {
+            env::panic_str("Failed to deserialize old contract state");
+        };
+
         require!(
-            old.state_version >= 1,
+            v1.state_version >= 1,
             "Unsupported contract state version for migration"
         );
         emit_event(ConpiEvent::ContractMigrated);
-        let approved_measurement = old
-            .tee_signers
-            .values()
-            .find(|s| s.active)
-            .map(|s| s.measurement.clone());
 
         Self {
-            owner: old.owner,
-            chain_id: old.chain_id,
-            paused: old.paused,
-            tee_signers: old.tee_signers,
-            deals: old.deals,
-            deal_creators: old.deal_creators,
-            pending_payouts: old.pending_payouts,
-            next_deal_id: old.next_deal_id,
-            config: old.config,
-            next_proposal_id: old.next_proposal_id,
-            staged_proposals: old.staged_proposals,
-            timelock_duration: old.timelock_duration,
-            state_version: old.state_version + 1,
+            owner: v1.owner,
+            chain_id: v1.chain_id,
+            paused: v1.paused,
+            tee_signers: v1.tee_signers,
+            deals: v1.deals,
+            deal_creators: v1.deal_creators,
+            pending_payouts: v1.pending_payouts,
+            next_deal_id: v1.next_deal_id,
+            config: v1.config,
+            next_proposal_id: v1.next_proposal_id,
+            staged_proposals: v1.staged_proposals,
+            timelock_duration: v1.timelock_duration,
+            state_version: v1.state_version + 1,
             approved_measurement,
+            staged_upgrade_code,
         }
     }
 
@@ -1266,12 +1371,14 @@ impl ConpiEscrow {
             !signer.measurement.is_empty(),
             "TEE signer measurement cannot be empty"
         );
-        if let Some(ref approved) = self.approved_measurement {
-            require!(
-                &signer.measurement == approved,
-                "TEE signer measurement does not match approved live CVM measurement"
-            );
-        }
+        let approved = self
+            .approved_measurement
+            .as_ref()
+            .expect("Approved CVM measurement is not set");
+        require!(
+            &signer.measurement == approved,
+            "TEE signer measurement does not match approved live CVM measurement"
+        );
     }
 
     fn check_and_transition_funded(&mut self, deal: &mut Deal) {
