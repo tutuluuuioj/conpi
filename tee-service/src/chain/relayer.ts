@@ -44,7 +44,8 @@ export class NearRelayer {
     if (data.result && data.result.result) {
       const resultStr = Buffer.from(data.result.result).toString("utf8");
       try {
-        return JSON.parse(resultStr);
+        const sanitized = resultStr.replace(/:\s*([0-9]{15,})\b/g, ':"$1"');
+        return JSON.parse(sanitized);
       } catch {
         return resultStr;
       }

@@ -1,6 +1,7 @@
 {
   "name": "conpi-tee-service",
   "version": "0.1.0",
+  "type": "module",
   "description": "Conpi Phala Intel TDX TEE Confidential Proxy & Negotiation Engine",
   "main": "dist/index.js",
   "scripts": {

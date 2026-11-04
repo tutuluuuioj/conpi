@@ -1,4 +1,5 @@
 import crypto from "crypto";
+import { x25519 } from "@noble/curves/ed25519";
 import { enclaveKeys } from "./keys.js";
 
 export interface EncryptedEnvelope {
@@ -50,9 +51,6 @@ export function decryptFromClient(envelope: EncryptedEnvelope): string {
  */
 export function encryptToEnclave(plaintext: string, enclavePubKeyHex: string): EncryptedEnvelope {
   // Generate ephemeral client keypair
-  const ecdh = crypto.createECDH("prime256v1"); // or use noble x25519
-  // We use Node's crypto x25519 if available, or generate via @noble/curves
-  const { x25519 } = require("@noble/curves/ed25519");
   const ephemeralPriv = x25519.utils.randomPrivateKey();
   const ephemeralPub = x25519.getPublicKey(ephemeralPriv);
 

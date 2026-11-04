@@ -4,6 +4,23 @@ import { serializeSignedPayload, PayloadKind, SignedPayloadDto } from "../crypto
 import { enclaveKeys } from "../crypto/keys.js";
 import { CONFIG } from "../config.js";
 
+export function parseBalance(val: any): bigint {
+  if (typeof val === "bigint") return val;
+  if (typeof val === "number") {
+    const s = val.toLocaleString("fullwide", { useGrouping: false });
+    if (!s.includes("e") && !s.includes(".")) return BigInt(s);
+    return BigInt(Math.floor(val));
+  }
+  const str = String(val).trim();
+  if (str.includes("e") || str.includes("E")) {
+    const num = Number(str);
+    const s = num.toLocaleString("fullwide", { useGrouping: false });
+    if (!s.includes("e") && !s.includes(".")) return BigInt(s);
+    return BigInt(Math.floor(num));
+  }
+  return BigInt(str);
+}
+
 export interface KeyCheckResult {
   ok: boolean;
   modelAvailable: boolean;
@@ -108,29 +125,31 @@ class KeyVault {
       const { nearRelayer } = await import("../chain/relayer.js");
       const deal = await nearRelayer.getDeal(dealId);
       if (deal) {
-        if (!deal.credit_amount || BigInt(deal.credit_amount.toString()) === 0n) {
+        const creditBigInt = parseBalance(deal.credit_amount);
+        if (creditBigInt === 0n) {
           return { ok: false, modelAvailable: false, balanceCoversCredit: false, error: `On-chain deal #${dealId} has zero credit_amount` };
         }
-        resolvedCreditYocto = deal.credit_amount.toString();
+        resolvedCreditYocto = creditBigInt.toString();
+        const priceBigInt = parseBalance(deal.price);
         const decimals = (deal.token === null || deal.token === "NEAR") ? 24 : 6;
-        resolvedCreditUsd = Number(BigInt(deal.credit_amount.toString())) / (10 ** decimals);
-        resolvedPriceUsd = Number(BigInt(deal.price.toString())) / (10 ** decimals);
+        resolvedCreditUsd = Number(creditBigInt) / (10 ** decimals);
+        resolvedPriceUsd = Number(priceBigInt) / (10 ** decimals);
         if (Array.isArray(deal.terms_hash)) {
           resolvedTermsHashHex = Buffer.from(deal.terms_hash).toString("hex");
         }
       } else if (process.env.NODE_ENV === "test") {
-        // Fallback for isolated offline unit testing
-        resolvedCreditYocto = creditAmountYocto || "250000000000000000000000000";
-        resolvedCreditUsd = (typeof creditUsd === "number" && creditUsd > 0) ? creditUsd : 250;
-        resolvedPriceUsd = (typeof priceUsd === "number" && priceUsd > 0) ? priceUsd : 200;
+        // Fallback for isolated offline unit testing when deal is not found
+        resolvedCreditYocto = creditAmountYocto || "2000000000000000000000000";
+        resolvedCreditUsd = (typeof creditUsd === "number" && creditUsd > 0) ? creditUsd : 2;
+        resolvedPriceUsd = (typeof priceUsd === "number" && priceUsd > 0) ? priceUsd : 2;
       } else {
         return { ok: false, modelAvailable: false, balanceCoversCredit: false, error: `Deal #${dealId} does not exist on-chain` };
       }
     } catch (err: any) {
       if (process.env.NODE_ENV === "test") {
-        resolvedCreditYocto = creditAmountYocto || "250000000000000000000000000";
-        resolvedCreditUsd = (typeof creditUsd === "number" && creditUsd > 0) ? creditUsd : 250;
-        resolvedPriceUsd = (typeof priceUsd === "number" && priceUsd > 0) ? priceUsd : 200;
+        resolvedCreditYocto = creditAmountYocto || "2000000000000000000000000";
+        resolvedCreditUsd = (typeof creditUsd === "number" && creditUsd > 0) ? creditUsd : 2;
+        resolvedPriceUsd = (typeof priceUsd === "number" && priceUsd > 0) ? priceUsd : 2;
       } else {
         return { ok: false, modelAvailable: false, balanceCoversCredit: false, error: `Failed to query on-chain deal #${dealId}: ${err.message}` };
       }

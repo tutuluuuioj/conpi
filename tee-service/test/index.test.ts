@@ -149,12 +149,12 @@ async function runTests() {
   if (Math.abs(cost1.costUsd - 0.0075) > 0.0001) throw new Error("Cost calculation mismatch");
 
   const entry = keyVault.getByDealId(1)!;
-  entry.usedUsd = 20; // 25% of $80
+  entry.usedUsd = entry.creditUsd * 0.25; // 25% of on-chain creditUsd
   const stage25 = meterEngine.checkAndEmitStage(entry, ticketMatched.termsHashHex);
   console.log("  Stage 25% emitted:", stage25?.payload.stage === 25);
   if (stage25?.payload.stage !== 25) throw new Error("Stage 25 not emitted");
 
-  entry.usedUsd = 40; // 50% of $80
+  entry.usedUsd = entry.creditUsd * 0.50; // 50% of on-chain creditUsd
   const stage50 = meterEngine.checkAndEmitStage(entry, ticketMatched.termsHashHex);
   console.log("  Stage 50% emitted:", stage50?.payload.stage === 50);
   if (stage50?.payload.stage !== 50) throw new Error("Stage 50 not emitted");
@@ -203,6 +203,17 @@ async function runTests() {
   const unauthJson = JSON.parse(unauthRes.body);
   if (!unauthJson.error?.includes("Manual external default triggers are locked") && !unauthJson.error?.includes("Forbidden")) {
     throw new Error("Unexpected error message on rejected default trigger");
+  }
+
+  // Verify caller with forged / invalid internal token is also rejected
+  const forgedRes = await testApp.inject({
+    method: "POST",
+    url: "/v1/deals/1/default",
+    headers: { "x-enclave-internal-token": "attacker-forged-token-xyz" },
+    payload: { reason: "ProviderBan" },
+  });
+  if (forgedRes.statusCode !== 403) {
+    throw new Error(`Expected forged token caller to receive 403 Forbidden, got ${forgedRes.statusCode}`);
   }
 
   // Verify internal token caller is permitted
