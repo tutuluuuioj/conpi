@@ -164,3 +164,13 @@ Phala encrypted secrets. The relayer key must be a function-call key restricted
 to the escrow contract methods `release_stage`, `checkpoint`, and
 `settle_default`. `CHECKPOINT_INTERVAL_MS` defaults to five minutes and must
 remain below the deal's TEE liveness timeout.
+
+The optional live proof creates and funds a small NEAR Testnet deal and sends a
+locally stored OpenRouter key encrypted to the hard-coded, attested production
+CVM. It is deliberately disabled unless the operator reviews the destination
+and supplies an explicit confirmation:
+
+```bash
+cd tee-service
+CONPI_LIVE_PROOF_CONFIRMATION=I_APPROVE_ENCRYPTED_OPENROUTER_KEY_UPLOAD npm run test:phase4:live
+```

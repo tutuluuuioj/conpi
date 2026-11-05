@@ -11,6 +11,7 @@
     "test": "tsx test/index.test.ts && tsx test/phase3.test.ts && tsx test/phase4.test.ts",
     "test:phase3": "tsx test/phase3.test.ts",
     "test:phase4": "tsx test/phase4.test.ts",
+    "test:phase4:live": "tsx scripts/phase4-live-proof.ts",
     "provision:relayer": "node scripts/provision-relayer.mjs"
   },
   "dependencies": {
