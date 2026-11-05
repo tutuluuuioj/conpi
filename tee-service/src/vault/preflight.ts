@@ -3,6 +3,7 @@ import { decryptFromClient, EncryptedEnvelope } from "../crypto/encryption.js";
 import { serializeSignedPayload, PayloadKind, SignedPayloadDto } from "../crypto/borsh.js";
 import { enclaveKeys } from "../crypto/keys.js";
 import { CONFIG } from "../config.js";
+import { lockPricingTable, LockedPricingTable } from "../proxy/pricing.js";
 
 export function parseBalance(val: any): bigint {
   if (typeof val === "bigint") return val;
@@ -99,6 +100,8 @@ export interface VaultEntry {
   priceUsd: number;
   usedUsd: number;
   tokensTotal: number;
+  lockedPricing: LockedPricingTable;
+  rateLimitPerMinute: number;
   creditAmountYocto?: string;
   active: boolean;
   registeredAt: string;
@@ -132,6 +135,18 @@ class KeyVault {
     plainApiKey?: string,
     creditAmountYocto?: string
   ): Promise<KeyCheckResult> {
+    let lockedPricing: LockedPricingTable;
+    try {
+      const normalizedModels = [...new Set([model, ...models].map((item) => item?.trim()).filter(Boolean))];
+      if (!normalizedModels.includes(model.trim())) {
+        return { ok: false, modelAvailable: false, balanceCoversCredit: false, error: "Primary model must be included in the allowlist" };
+      }
+      lockedPricing = lockPricingTable(normalizedModels);
+      models = normalizedModels;
+    } catch (err: any) {
+      return { ok: false, modelAvailable: false, balanceCoversCredit: false, error: err.message };
+    }
+
     let apiKey: string;
     if (plainApiKey) {
       if (process.env.NODE_ENV !== "test") {
@@ -225,6 +240,8 @@ class KeyVault {
       priceUsd: resolvedPriceUsd,
       usedUsd: 0,
       tokensTotal: 0,
+      lockedPricing,
+      rateLimitPerMinute: CONFIG.rateLimitPerMinute,
       creditAmountYocto: resolvedCreditYocto,
       active: true,
       registeredAt: new Date().toISOString(),

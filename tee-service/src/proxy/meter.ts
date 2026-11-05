@@ -1,33 +1,8 @@
 import { PayloadKind, DefaultReason, SignedPayloadDto, serializeSignedPayload } from "../crypto/borsh.js";
 import { enclaveKeys } from "../crypto/keys.js";
 import { CONFIG } from "../config.js";
-import { VaultEntry } from "../vault/preflight.js";
-
-export interface PricingRate {
-  inputPerMillion: number;
-  outputPerMillion: number;
-  cachedInputPerMillion?: number;
-}
-
-export const PRICING_TABLE: Record<string, PricingRate> = {
-  "gpt-4o": { inputPerMillion: 2.50, outputPerMillion: 10.00, cachedInputPerMillion: 1.25 },
-  "gpt-4o-mini": { inputPerMillion: 0.15, outputPerMillion: 0.60 },
-  "claude-3-5-sonnet": { inputPerMillion: 3.00, outputPerMillion: 15.00 },
-  "claude-3-5-sonnet-20241022": { inputPerMillion: 3.00, outputPerMillion: 15.00 },
-  "claude-3-5-haiku": { inputPerMillion: 0.80, outputPerMillion: 4.00 },
-  "claude-3-5-haiku-20241022": { inputPerMillion: 0.80, outputPerMillion: 4.00 },
-  "meta-llama/llama-3-70b": { inputPerMillion: 0.59, outputPerMillion: 0.79 },
-  "meta-llama/llama-3.2-1b-instruct": { inputPerMillion: 0.04, outputPerMillion: 0.16 },
-  "meta-llama/llama-3.2-1b": { inputPerMillion: 0.04, outputPerMillion: 0.16 },
-  "meta-llama/llama-3.2-3b-instruct": { inputPerMillion: 0.06, outputPerMillion: 0.24 },
-};
-
-export interface UsageCalculation {
-  inputTokens: number;
-  outputTokens: number;
-  cachedTokens: number;
-  costUsd: number;
-}
+import type { VaultEntry } from "../vault/preflight.js";
+export { calculateCost, PRICING_TABLE } from "./pricing.js";
 
 export function toBigIntYocto(val: any): bigint {
   if (typeof val === "bigint") return val;
@@ -51,26 +26,6 @@ export function toBigIntYocto(val: any): bigint {
   return BigInt(s.split(".")[0]);
 }
 
-export function calculateCost(model: string, inputTokens: number, outputTokens: number, cachedTokens: number = 0): UsageCalculation {
-  const rate = PRICING_TABLE[model];
-  if (!rate) {
-    throw new Error(`Unsupported model for enclave pricing: ${model}. Model must be present in PRICING_TABLE.`);
-  }
-  const uncachedInput = Math.max(0, inputTokens - cachedTokens);
-
-  const inputCost = (uncachedInput * rate.inputPerMillion) / 1_000_000;
-  const cachedCost = (cachedTokens * (rate.cachedInputPerMillion || rate.inputPerMillion * 0.5)) / 1_000_000;
-  const outputCost = (outputTokens * rate.outputPerMillion) / 1_000_000;
-
-  const costUsd = inputCost + cachedCost + outputCost;
-  return {
-    inputTokens,
-    outputTokens,
-    cachedTokens,
-    costUsd,
-  };
-}
-
 export class MeterEngine {
   private lastStageEmitted = new Map<number, number>();
   private nonceMap = new Map<number, bigint>();
@@ -80,6 +35,16 @@ export class MeterEngine {
     const next = current + 1n;
     this.nonceMap.set(dealId, next);
     return next;
+  }
+
+  public reset(dealId?: number): void {
+    if (dealId === undefined) {
+      this.lastStageEmitted.clear();
+      this.nonceMap.clear();
+      return;
+    }
+    this.lastStageEmitted.delete(dealId);
+    this.nonceMap.delete(dealId);
   }
 
   public checkAndEmitStages(entry: VaultEntry, termsHashHex: string): Array<{ payload: SignedPayloadDto; signatureHex: string }> {

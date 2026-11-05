@@ -1,602 +1,521 @@
-import { FastifyRequest, FastifyReply } from "fastify";
-import { keyVault, VaultEntry } from "../vault/preflight.js";
-import { calculateCost, meterEngine, PRICING_TABLE } from "./meter.js";
+import { FastifyReply, FastifyRequest } from "fastify";
 import { DefaultReason } from "../crypto/borsh.js";
+import { CONFIG } from "../config.js";
+import { keyVault, VaultEntry } from "../vault/preflight.js";
+import { meterEvents } from "./events.js";
+import { meterEngine } from "./meter.js";
+import { calculateCost } from "./pricing.js";
+import { proxyRateLimiter } from "./rate-limit.js";
+import { countChatInputTokens, countEmbeddingInputTokens, countTextTokens, extractText } from "./tokenizer.js";
+
+type ProviderKind = "openai" | "openrouter" | "redpill" | "anthropic";
+export type ProviderErrorKind = "transient_rate_limit" | "insufficient_quota" | "invalid_key" | "provider_ban" | "upstream";
+
+interface UsageResult {
+  inputTokens: number;
+  outputTokens: number;
+  cachedTokens: number;
+  costUsd: number;
+  stages: number[];
+}
 
 function getProxyKey(req: FastifyRequest): string | null {
   const xApiKey = req.headers["x-api-key"];
-  if (typeof xApiKey === "string" && xApiKey.trim()) {
-    return xApiKey.trim();
-  }
+  if (typeof xApiKey === "string" && xApiKey.trim()) return xApiKey.trim();
   const authHeader = req.headers.authorization;
-  if (authHeader && authHeader.startsWith("Bearer ")) {
-    return authHeader.replace("Bearer ", "").trim();
-  }
+  if (authHeader?.startsWith("Bearer ")) return authHeader.slice("Bearer ".length).trim();
   return null;
 }
 
-export function isProviderBan(status: number, errTextOrData: any): boolean {
-  // Never treat generic 403 as ProviderBan to protect seller collateral from accidental slashing.
-  // Only classify as ProviderBan when HTTP status is an error and explicit ban/suspension codes or messages are returned.
-  if (status < 400) return false;
-  const str = typeof errTextOrData === "string" ? errTextOrData : JSON.stringify(errTextOrData || "");
-  const lower = str.toLowerCase();
-  return (
-    lower.includes("account_deactivated") ||
-    lower.includes("organization_disabled") ||
-    lower.includes("provider_ban") ||
-    lower.includes("provider_banned") ||
-    lower.includes("account_banned") ||
-    lower.includes("user_banned") ||
-    lower.includes("account_suspended") ||
-    lower.includes("banned") ||
-    lower.includes("suspended") ||
-    lower.includes("access_terminated") ||
-    lower.includes("policy_violation") ||
-    lower.includes("key has been disabled") ||
-    lower.includes("account disabled") ||
-    lower.includes("billing_suspended") ||
-    lower.includes("abuse_ban") ||
-    lower.includes("terms_violation")
-  );
+function providerKind(entry: VaultEntry): ProviderKind {
+  const provider = entry.provider.trim().toLowerCase();
+  if (provider === "anthropic") return "anthropic";
+  if (provider === "openrouter") return "openrouter";
+  if (provider === "redpill" || provider === "phala" || entry.apiKey.startsWith("sk-rp-")) return "redpill";
+  return "openai";
 }
 
-export async function handleChatCompletions(req: FastifyRequest, reply: FastifyReply) {
-  const proxyKey = getProxyKey(req);
-  if (!proxyKey) {
-    return reply.status(401).send({ error: { message: "Missing or invalid Authorization header", code: "unauthorized" } });
+function openAiBaseUrl(kind: ProviderKind): string {
+  if (kind === "openrouter") return "https://openrouter.ai/api/v1";
+  if (kind === "redpill") return "https://api.redpill.ai/v1";
+  return "https://api.openai.com/v1";
+}
+
+function providerHeaders(entry: VaultEntry, kind = providerKind(entry)): Record<string, string> {
+  if (kind === "anthropic") {
+    return {
+      "Content-Type": "application/json",
+      "x-api-key": entry.apiKey,
+      "anthropic-version": "2023-06-01",
+    };
   }
-
-  const entry = keyVault.getByProxyKey(proxyKey);
-  if (!entry || !entry.active) {
-    return reply.status(403).send({ error: { message: "Invalid or inactive proxy key", code: "key_inactive" } });
-  }
-
-  const body = req.body as any;
-  const requestedModel = body.model;
-
-  if (entry.models.length > 0) {
-    const allowed = entry.models.map((m) => m.trim().toLowerCase());
-    if (!allowed.includes((requestedModel || "").trim().toLowerCase())) {
-      return reply.status(400).send({
-        error: { message: `Model '${requestedModel}' not in allowed models: ${entry.models.join(", ")} (exact match required)`, code: "model_disallowed" },
-      });
-    }
-  }
-
-  // Verify requested model is supported in enclave pricing table
-  if (!PRICING_TABLE[requestedModel]) {
-    return reply.status(400).send({
-      error: { message: `Model '${requestedModel}' is not supported in the enclave pricing table`, code: "unsupported_model" },
-    });
-  }
-
-  // Hard credit cap check: reject before executing
-  if (entry.usedUsd >= entry.creditUsd) {
-    return reply.status(402).send({
-      error: { message: `Deal credit cap ($${entry.creditUsd}) reached`, code: "quota_exhausted" },
-    });
-  }
-
-  // Pre-flight check: ensure remaining credit can cover prompt tokens AND requested max_tokens
-  const estPromptTokens = Array.isArray(body.messages)
-    ? body.messages.reduce((acc: number, m: any) => acc + (typeof m.content === "string" ? Math.max(1, Math.ceil(m.content.length / 4)) : 4), 0)
-    : 15;
-  const requestedMaxTokens = typeof body.max_tokens === "number" && body.max_tokens > 0 ? body.max_tokens : 1000;
-  const maxPossibleCost = calculateCost(requestedModel, estPromptTokens, requestedMaxTokens).costUsd;
-
-  if (entry.usedUsd + maxPossibleCost > entry.creditUsd) {
-    return reply.status(402).send({
-      error: {
-        message: `Deal remaining credit ($${(entry.creditUsd - entry.usedUsd).toFixed(6)}) insufficient for requested max_tokens (${requestedMaxTokens} tokens = $${maxPossibleCost.toFixed(6)})`,
-        code: "quota_exhausted",
-      },
-    });
-  }
-
-  // If using mock/test key, delegate to test-mock module in test mode
-  if (entry.apiKey.startsWith("mock_") || entry.apiKey.startsWith("test_") || entry.apiKey.startsWith("sk-test")) {
-    if (process.env.NODE_ENV !== "test") {
-      return reply.status(403).send({
-        error: { message: "Mock API keys are disabled outside test mode (NODE_ENV !== 'test')", code: "mock_forbidden" },
-      });
-    }
-    const mockModulePath = "../../test/test-mock.js";
-    const { handleMockChatCompletion } = await (import(mockModulePath) as Promise<any>);
-    return handleMockChatCompletion(req, reply, entry, requestedModel);
-  }
-
-  // Real upstream forward
-  let upstreamUrl = "https://api.openai.com/v1/chat/completions";
-  const provLower = entry.provider.toLowerCase();
-  const isRedPill = entry.apiKey.startsWith("sk-rp-") || provLower === "redpill" || provLower === "phala";
-
-  if (isRedPill) {
-    upstreamUrl = "https://api.redpill.ai/v1/chat/completions";
-  } else if (provLower === "openrouter") {
-    upstreamUrl = "https://openrouter.ai/api/v1/chat/completions";
-  }
-
-  const upstreamHeaders: Record<string, string> = {
+  const headers: Record<string, string> = {
     "Content-Type": "application/json",
     Authorization: `Bearer ${entry.apiKey}`,
   };
+  if (kind === "openrouter") {
+    headers["HTTP-Referer"] = "https://conpi.network";
+    headers["X-Title"] = "Conpi TEE Proxy";
+  }
+  return headers;
+}
 
-  const isStream = Boolean(body.stream);
-  const streamBody = isStream ? { ...body, stream_options: { include_usage: true } } : body;
+export function isProviderBan(status: number, errTextOrData: unknown): boolean {
+  if (status < 400) return false;
+  const lower = (typeof errTextOrData === "string" ? errTextOrData : JSON.stringify(errTextOrData || "")).toLowerCase();
+  return [
+    "account_deactivated", "organization_disabled", "provider_ban", "provider_banned",
+    "account_banned", "user_banned", "account_suspended", "banned", "suspended",
+    "access_terminated", "policy_violation", "key has been disabled", "account disabled",
+    "billing_suspended", "abuse_ban", "terms_violation",
+  ].some((marker) => lower.includes(marker));
+}
 
-  try {
-    if (isStream) {
-      const upstreamRes = await fetch(upstreamUrl, {
-        method: "POST",
-        headers: upstreamHeaders,
-        body: JSON.stringify(streamBody),
-      });
+export function classifyProviderError(status: number, body: unknown): ProviderErrorKind {
+  const lower = (typeof body === "string" ? body : JSON.stringify(body || "")).toLowerCase();
+  if (isProviderBan(status, body)) return "provider_ban";
+  if (
+    lower.includes("insufficient_quota") || lower.includes("billing_hard_limit_reached") ||
+    lower.includes("credit balance is too low") || lower.includes("quota_exhausted")
+  ) return "insufficient_quota";
+  if (status === 401 || lower.includes("invalid_api_key") || lower.includes("invalid x-api-key")) return "invalid_key";
+  if (status === 429) return "transient_rate_limit";
+  return "upstream";
+}
 
-      if (upstreamRes.status === 401 || upstreamRes.status === 403) {
-        const text = await upstreamRes.text();
-        entry.active = false;
-        const reason = isProviderBan(upstreamRes.status, text) ? DefaultReason.ProviderBan : DefaultReason.InvalidKey;
-        const defaultSig = meterEngine.emitDefault(entry, entry.termsHashHex, reason);
-        entry.signedPayloads.push(defaultSig);
-        return reply.status(502).send({
-          error: {
-            message: reason === DefaultReason.ProviderBan
-              ? "Seller account/key was banned or suspended by provider. Settlement default initiated."
-              : "Seller API key was revoked or invalid. Settlement default initiated.",
-            code: reason === DefaultReason.ProviderBan ? "provider_banned" : "seller_key_revoked",
-          },
-          defaultPayload: defaultSig,
-        });
-      }
+function authenticate(req: FastifyRequest, reply: FastifyReply): VaultEntry | null {
+  const proxyKey = getProxyKey(req);
+  if (!proxyKey) {
+    reply.status(401).send({ error: { message: "Missing proxy API key", code: "unauthorized" } });
+    return null;
+  }
+  const entry = keyVault.getByProxyKey(proxyKey);
+  if (!entry || !entry.active) {
+    reply.status(403).send({ error: { message: "Invalid or inactive proxy key", code: "key_inactive" } });
+    return null;
+  }
+  return entry;
+}
 
-      if (upstreamRes.status === 429) {
-        const text = await upstreamRes.text();
-        if (text.includes("insufficient_quota")) {
-          entry.active = false;
-          const defaultSig = meterEngine.emitDefault(entry, entry.termsHashHex, DefaultReason.InsufficientQuota);
-          entry.signedPayloads.push(defaultSig);
-          return reply.status(502).send({
-            error: { message: "Seller account quota exhausted. Settlement default initiated.", code: "insufficient_quota" },
-            defaultPayload: defaultSig,
-          });
-        }
-        return reply.status(429).send({ error: { message: "Upstream rate limit exceeded", code: "rate_limit_exceeded" } });
-      }
+function enforceRateLimit(entry: VaultEntry, reply: FastifyReply): boolean {
+  const result = proxyRateLimiter.take(entry.proxyKey, entry.rateLimitPerMinute);
+  reply.header("X-RateLimit-Limit", String(result.limit));
+  reply.header("X-RateLimit-Remaining", String(result.remaining));
+  if (result.allowed) return true;
+  reply.header("Retry-After", String(result.retryAfterSeconds));
+  reply.status(429).send({
+    error: { message: "Conpi proxy rate limit exceeded", code: "proxy_rate_limit_exceeded", retry_after_seconds: result.retryAfterSeconds },
+  });
+  return false;
+}
 
-      if (!upstreamRes.ok) {
-        const errText = await upstreamRes.text();
-        if (isProviderBan(upstreamRes.status, errText)) {
-          entry.active = false;
-          const defaultSig = meterEngine.emitDefault(entry, entry.termsHashHex, DefaultReason.ProviderBan);
-          entry.signedPayloads.push(defaultSig);
-          return reply.status(502).send({
-            error: { message: "Seller account/key was banned or suspended by provider. Settlement default initiated.", code: "provider_banned" },
-            defaultPayload: defaultSig,
-          });
-        }
-        return reply.status(upstreamRes.status).send({ error: { message: errText, code: "upstream_error" } });
-      }
-
-      reply.raw.setHeader("Content-Type", "text/event-stream");
-      reply.raw.setHeader("Cache-Control", "no-cache");
-      reply.raw.setHeader("Connection", "keep-alive");
-
-      let promptTokens = 0;
-      let completionTokens = 0;
-      let reportedCost: number | undefined = undefined;
-
-      if (upstreamRes.body) {
-        const reader = upstreamRes.body.getReader();
-        const decoder = new TextDecoder("utf-8");
-        let buffer = "";
-
-        while (true) {
-          const { done, value } = await reader.read();
-          if (done) break;
-          const chunkStr = decoder.decode(value, { stream: true });
-          reply.raw.write(chunkStr);
-          buffer += chunkStr;
-
-          const lines = buffer.split("\n");
-          buffer = lines.pop() || "";
-
-          for (const line of lines) {
-            if (line.startsWith("data: ") && line !== "data: [DONE]") {
-              try {
-                const parsed = JSON.parse(line.slice(6));
-                if (parsed.usage) {
-                  promptTokens = parsed.usage.prompt_tokens ?? promptTokens;
-                  completionTokens = parsed.usage.completion_tokens ?? completionTokens;
-                  if (typeof parsed.usage.cost === "number" && parsed.usage.cost > 0) {
-                    reportedCost = parsed.usage.cost;
-                  } else if (typeof parsed.usage.total_cost === "number" && parsed.usage.total_cost > 0) {
-                    reportedCost = parsed.usage.total_cost;
-                  }
-                } else if (parsed.choices && parsed.choices[0]?.delta?.content) {
-                  completionTokens += 1;
-                }
-              } catch {}
-            }
-          }
-        }
-      }
-
-      const usageCost = (reportedCost !== undefined && reportedCost > 0)
-        ? reportedCost
-        : calculateCost(requestedModel, promptTokens, completionTokens).costUsd;
-      entry.usedUsd = Math.min(entry.creditUsd, entry.usedUsd + usageCost);
-      if (entry.usedUsd >= entry.creditUsd) {
-        entry.active = false;
-      }
-      entry.tokensTotal += (promptTokens + completionTokens);
-
-      const newStages = meterEngine.checkAndEmitStages(entry, entry.termsHashHex);
-      for (const stg of newStages) {
-        entry.signedPayloads.push(stg);
-      }
-
-      return reply.raw.end();
-    }
-
-    const upstreamRes = await fetch(upstreamUrl, {
-      method: "POST",
-      headers: upstreamHeaders,
-      body: JSON.stringify(body),
+function enforceModelAndBudget(entry: VaultEntry, model: string, inputTokens: number, maximumOutputTokens: number, reply: FastifyReply): boolean {
+  const normalizedModel = model.trim().toLowerCase();
+  if (!entry.models.some((item) => item.trim().toLowerCase() === normalizedModel)) {
+    reply.status(400).send({ error: { message: `Model '${model}' is not in the deal allowlist`, code: "model_disallowed" } });
+    return false;
+  }
+  if (!entry.lockedPricing[model]) {
+    reply.status(400).send({ error: { message: `Model '${model}' has no locked price for this deal`, code: "price_not_locked" } });
+    return false;
+  }
+  if (entry.usedUsd >= entry.creditUsd) {
+    reply.status(402).send({ error: { message: "Deal credit cap reached", code: "quota_exhausted" } });
+    return false;
+  }
+  const maximumCost = calculateCost(model, inputTokens, maximumOutputTokens, 0, entry.lockedPricing).costUsd;
+  const remaining = Math.max(0, entry.creditUsd - entry.usedUsd);
+  if (maximumCost > remaining + Number.EPSILON) {
+    reply.status(402).send({
+      error: {
+        message: `Remaining locked credit ($${remaining.toFixed(6)}) cannot cover the request maximum ($${maximumCost.toFixed(6)})`,
+        code: "budget_cap_exceeded",
+      },
     });
+    return false;
+  }
+  return true;
+}
 
-    if (upstreamRes.status === 401 || upstreamRes.status === 403) {
-      const text = await upstreamRes.text();
-      entry.active = false;
-      const reason = isProviderBan(upstreamRes.status, text) ? DefaultReason.ProviderBan : DefaultReason.InvalidKey;
-      const defaultSig = meterEngine.emitDefault(entry, entry.termsHashHex, reason);
-      entry.signedPayloads.push(defaultSig);
-      return reply.status(502).send({
-        error: {
-          message: reason === DefaultReason.ProviderBan
-            ? "Seller account/key was banned or suspended by provider. Settlement default initiated."
-            : "Seller API key was revoked or invalid. Settlement default initiated.",
-          code: reason === DefaultReason.ProviderBan ? "provider_banned" : "seller_key_revoked",
-        },
-        defaultPayload: defaultSig,
-      });
-    }
+function recordUsage(entry: VaultEntry, model: string, inputTokens: number, outputTokens: number, cachedTokens = 0): UsageResult {
+  const usage = calculateCost(model, inputTokens, outputTokens, cachedTokens, entry.lockedPricing);
+  entry.usedUsd = Math.min(entry.creditUsd, entry.usedUsd + usage.costUsd);
+  entry.tokensTotal += usage.inputTokens + usage.outputTokens;
+  const signedStages = meterEngine.checkAndEmitStages(entry, entry.termsHashHex);
+  for (const stage of signedStages) entry.signedPayloads.push(stage);
+  if (entry.usedUsd >= entry.creditUsd) entry.active = false;
+  const stages = signedStages.map((stage) => stage.payload.stage);
+  meterEvents.publish(entry, stages.length ? "stage" : "usage", stages);
+  return { ...usage, stages };
+}
 
-    if (upstreamRes.status === 429) {
-      const text = await upstreamRes.text();
-      if (text.includes("insufficient_quota")) {
-        entry.active = false;
-        const defaultSig = meterEngine.emitDefault(entry, entry.termsHashHex, DefaultReason.InsufficientQuota);
-        entry.signedPayloads.push(defaultSig);
-        return reply.status(502).send({
-          error: { message: "Seller account quota exhausted. Settlement default initiated.", code: "insufficient_quota" },
-          defaultPayload: defaultSig,
-        });
-      }
-      return reply.status(429).send({ error: { message: "Upstream rate limit exceeded. Retry later.", code: "rate_limit_exceeded" } });
-    }
+function emitDefault(entry: VaultEntry, reason: DefaultReason) {
+  const signed = meterEngine.emitDefault(entry, entry.termsHashHex, reason);
+  entry.signedPayloads.push(signed);
+  meterEvents.publish(entry, "default");
+  return signed;
+}
 
-    if (!upstreamRes.ok) {
-      const errText = await upstreamRes.text();
-      if (isProviderBan(upstreamRes.status, errText)) {
-        entry.active = false;
-        const defaultSig = meterEngine.emitDefault(entry, entry.termsHashHex, DefaultReason.ProviderBan);
-        entry.signedPayloads.push(defaultSig);
-        return reply.status(502).send({
-          error: { message: "Seller account/key was banned or suspended by provider. Settlement default initiated.", code: "provider_banned" },
-          defaultPayload: defaultSig,
-        });
-      }
-      return reply.status(upstreamRes.status).send({ error: { message: errText, code: "upstream_error" } });
-    }
+function publicSignedPayload(item: { payload: any; signatureHex: string }) {
+  return {
+    payload: {
+      domain: item.payload.domain,
+      contractId: item.payload.contractId,
+      chainId: item.payload.chainId,
+      dealId: Number(item.payload.dealId),
+      termsHashHex: Buffer.from(item.payload.termsHash).toString("hex"),
+      kind: item.payload.kind,
+      stage: item.payload.stage,
+      meteredValueYocto: item.payload.meteredValueYocto.toString(),
+      reason: item.payload.reason ?? null,
+      nonce: item.payload.nonce.toString(),
+      issuedAtNs: item.payload.issuedAtNs.toString(),
+    },
+    signatureHex: item.signatureHex,
+  };
+}
 
-    const data: any = await upstreamRes.json();
-    if (data.usage) {
-      const reportedCost = typeof data.usage.cost === "number" && data.usage.cost > 0
-        ? data.usage.cost
-        : (typeof data.usage.total_cost === "number" && data.usage.total_cost > 0 ? data.usage.total_cost : undefined);
-
-      const usageCost = (reportedCost !== undefined && reportedCost > 0)
-        ? reportedCost
-        : calculateCost(
-            requestedModel,
-            data.usage.prompt_tokens || 0,
-            data.usage.completion_tokens || 0
-          ).costUsd;
-
-      entry.usedUsd = Math.min(entry.creditUsd, entry.usedUsd + usageCost);
-      if (entry.usedUsd >= entry.creditUsd) {
-        entry.active = false;
-      }
-      entry.tokensTotal += (data.usage.total_tokens || ((data.usage.prompt_tokens || 0) + (data.usage.completion_tokens || 0)));
-
-      const newStages = meterEngine.checkAndEmitStages(entry, entry.termsHashHex);
-      for (const stg of newStages) {
-        entry.signedPayloads.push(stg);
-      }
-    }
-    return reply.status(upstreamRes.status).send(data);
-  } catch (err: any) {
-    return reply.status(500).send({ error: { message: err.message, code: "proxy_error" } });
+async function fetchWithTransientBackoff(url: string, init: RequestInit): Promise<Response> {
+  for (let attempt = 0; ; attempt += 1) {
+    const response = await fetch(url, init);
+    if (response.status !== 429) return response;
+    const body = await response.clone().text();
+    if (classifyProviderError(response.status, body) !== "transient_rate_limit" || attempt >= CONFIG.transientRateLimitRetries) return response;
+    const retryAfter = Number(response.headers.get("retry-after"));
+    const delayMs = Number.isFinite(retryAfter) && retryAfter > 0
+      ? Math.min(2_000, retryAfter * 1_000)
+      : Math.min(2_000, CONFIG.transientRateLimitBackoffMs * 2 ** attempt);
+    await new Promise((resolve) => setTimeout(resolve, delayMs));
   }
 }
 
-/**
- * Native Anthropic Messages Adapter: POST /v1/messages
- */
-export async function handleAnthropicMessages(req: FastifyRequest, reply: FastifyReply) {
-  const proxyKey = getProxyKey(req);
-  if (!proxyKey) {
-    return reply.status(401).send({ error: { type: "authentication_error", message: "Missing x-api-key or Authorization header" } });
+async function handleProviderFailure(response: Response, entry: VaultEntry, reply: FastifyReply, anthropicFormat = false) {
+  const text = await response.text();
+  const kind = classifyProviderError(response.status, text);
+  if (kind === "transient_rate_limit") {
+    reply.header("Retry-After", response.headers.get("retry-after") || "1");
+    return reply.status(429).send({
+      error: anthropicFormat
+        ? { type: "rate_limit_error", message: "Provider rate limit exceeded after enclave backoff" }
+        : { message: "Provider rate limit exceeded after enclave backoff", code: "rate_limit_exceeded" },
+    });
+  }
+  if (kind === "invalid_key" || kind === "provider_ban" || kind === "insufficient_quota") {
+    const reason = kind === "provider_ban" ? DefaultReason.ProviderBan
+      : kind === "invalid_key" ? DefaultReason.InvalidKey : DefaultReason.SellerSelfDrain;
+    const defaultPayload = emitDefault(entry, reason);
+    const code = kind === "insufficient_quota" ? "seller_self_drain" : kind;
+    return reply.status(502).send({
+      error: anthropicFormat
+        ? { type: code, message: "Provider credentials or quota failed; deterministic default settlement payload created" }
+        : { message: "Provider credentials or quota failed; deterministic default settlement payload created", code },
+      defaultPayload: publicSignedPayload(defaultPayload),
+    });
+  }
+  return reply.status(response.status).send({
+    error: anthropicFormat
+      ? { type: "upstream_error", message: text || `Provider returned HTTP ${response.status}` }
+      : { message: text || `Provider returned HTTP ${response.status}`, code: "upstream_error" },
+  });
+}
+
+function openAiMessagesToAnthropic(body: any) {
+  const systemParts: string[] = [];
+  const messages: Array<{ role: "user" | "assistant"; content: unknown }> = [];
+  for (const message of Array.isArray(body.messages) ? body.messages : []) {
+    if (message?.role === "system") systemParts.push(extractText(message.content));
+    else if (message?.role === "user" || message?.role === "assistant") messages.push({ role: message.role, content: message.content });
+  }
+  return {
+    model: body.model,
+    system: systemParts.length ? systemParts.join("\n") : undefined,
+    messages,
+    max_tokens: body.max_tokens ?? body.max_completion_tokens ?? 1_000,
+    temperature: body.temperature,
+    top_p: body.top_p,
+    stop_sequences: body.stop ? (Array.isArray(body.stop) ? body.stop : [body.stop]) : undefined,
+    stream: Boolean(body.stream),
+  };
+}
+
+function anthropicMessagesToOpenAi(body: any) {
+  const messages: Array<{ role: string; content: string }> = [];
+  if (body.system) messages.push({ role: "system", content: extractText(body.system) });
+  for (const message of Array.isArray(body.messages) ? body.messages : []) {
+    messages.push({ role: message.role, content: extractText(message.content) });
+  }
+  return {
+    model: body.model,
+    messages,
+    max_tokens: body.max_tokens ?? 1_000,
+    temperature: body.temperature,
+    top_p: body.top_p,
+    stop: body.stop_sequences,
+    stream: Boolean(body.stream),
+    ...(body.stream ? { stream_options: { include_usage: true } } : {}),
+  };
+}
+
+async function streamOpenAiResponse(response: Response, reply: FastifyReply, entry: VaultEntry, model: string, fallbackInputTokens: number, transformToAnthropic = false) {
+  reply.raw.setHeader("Content-Type", "text/event-stream");
+  reply.raw.setHeader("Cache-Control", "no-cache, no-transform");
+  reply.raw.setHeader("Connection", "keep-alive");
+  let buffer = "";
+  let outputText = "";
+  let inputTokens = 0;
+  let outputTokens = 0;
+  let cachedTokens = 0;
+
+  if (transformToAnthropic) {
+    reply.raw.write(`event: message_start\ndata: ${JSON.stringify({ type: "message_start", message: { id: `msg_${Date.now()}`, type: "message", role: "assistant", model, content: [], stop_reason: null, usage: { input_tokens: fallbackInputTokens, output_tokens: 0 } } })}\n\n`);
+    reply.raw.write(`event: content_block_start\ndata: ${JSON.stringify({ type: "content_block_start", index: 0, content_block: { type: "text", text: "" } })}\n\n`);
   }
 
-  const entry = keyVault.getByProxyKey(proxyKey);
-  if (!entry || !entry.active) {
-    return reply.status(403).send({ error: { type: "permission_error", message: "Invalid or inactive proxy key" } });
-  }
-
-  const body = req.body as any;
-  const requestedModel = body.model;
-
-  if (entry.models.length > 0) {
-    const allowed = entry.models.map((m) => m.trim().toLowerCase());
-    if (!allowed.includes((requestedModel || "").trim().toLowerCase())) {
-      return reply.status(400).send({
-        error: { type: "invalid_request_error", message: `Model '${requestedModel}' not in allowed models: ${entry.models.join(", ")} (exact match required)` },
-      });
+  const reader = response.body?.getReader();
+  if (!reader) throw new Error("Provider streaming response has no body");
+  const decoder = new TextDecoder();
+  while (true) {
+    const { done, value } = await reader.read();
+    if (done) break;
+    buffer += decoder.decode(value, { stream: true });
+    const lines = buffer.split(/\r?\n/);
+    buffer = lines.pop() || "";
+    for (const line of lines) {
+      if (!line.startsWith("data:")) continue;
+      const raw = line.slice(5).trim();
+      if (!raw || raw === "[DONE]") continue;
+      let data: any;
+      try { data = JSON.parse(raw); } catch { continue; }
+      const text = data.choices?.[0]?.delta?.content;
+      if (typeof text === "string") {
+        outputText += text;
+        if (transformToAnthropic) {
+          reply.raw.write(`event: content_block_delta\ndata: ${JSON.stringify({ type: "content_block_delta", index: 0, delta: { type: "text_delta", text } })}\n\n`);
+        }
+      }
+      if (!transformToAnthropic) reply.raw.write(`data: ${raw}\n\n`);
+      if (data.usage) {
+        inputTokens = Number(data.usage.prompt_tokens || inputTokens);
+        outputTokens = Number(data.usage.completion_tokens || outputTokens);
+        cachedTokens = Number(data.usage.prompt_tokens_details?.cached_tokens || cachedTokens);
+      }
     }
   }
 
-  if (!PRICING_TABLE[requestedModel]) {
-    return reply.status(400).send({
-      error: { type: "invalid_request_error", message: `Model '${requestedModel}' is not supported in the enclave pricing table` },
-    });
+  inputTokens ||= fallbackInputTokens;
+  outputTokens ||= countTextTokens(entry.provider, model, outputText);
+  const usage = recordUsage(entry, model, inputTokens, outputTokens, cachedTokens);
+  if (transformToAnthropic) {
+    reply.raw.write(`event: content_block_stop\ndata: ${JSON.stringify({ type: "content_block_stop", index: 0 })}\n\n`);
+    reply.raw.write(`event: message_delta\ndata: ${JSON.stringify({ type: "message_delta", delta: { stop_reason: "end_turn", stop_sequence: null }, usage: { output_tokens: outputTokens } })}\n\n`);
+    reply.raw.write(`event: message_stop\ndata: ${JSON.stringify({ type: "message_stop", conpi_cost_usd: usage.costUsd })}\n\n`);
+  } else {
+    reply.raw.write(`data: ${JSON.stringify({ object: "conpi.meter", usage: { prompt_tokens: inputTokens, completion_tokens: outputTokens, total_tokens: inputTokens + outputTokens, conpi_cost_usd: usage.costUsd }, stages: usage.stages })}\n\n`);
+    reply.raw.write("data: [DONE]\n\n");
   }
+  return reply.raw.end();
+}
 
-  // Hard credit cap check
-  if (entry.usedUsd >= entry.creditUsd) {
-    return reply.status(402).send({
-      error: { type: "quota_error", message: `Deal credit cap ($${entry.creditUsd}) reached` },
-    });
+async function streamAnthropicResponse(response: Response, reply: FastifyReply, entry: VaultEntry, model: string, fallbackInputTokens: number, transformToOpenAi = false) {
+  reply.raw.setHeader("Content-Type", "text/event-stream");
+  reply.raw.setHeader("Cache-Control", "no-cache, no-transform");
+  reply.raw.setHeader("Connection", "keep-alive");
+  let buffer = "";
+  let outputText = "";
+  let inputTokens = 0;
+  let outputTokens = 0;
+  const reader = response.body?.getReader();
+  if (!reader) throw new Error("Provider streaming response has no body");
+  const decoder = new TextDecoder();
+  while (true) {
+    const { done, value } = await reader.read();
+    if (done) break;
+    const chunk = decoder.decode(value, { stream: true });
+    if (!transformToOpenAi) reply.raw.write(chunk);
+    buffer += chunk;
+    const lines = buffer.split(/\r?\n/);
+    buffer = lines.pop() || "";
+    for (const line of lines) {
+      if (!line.startsWith("data:")) continue;
+      const raw = line.slice(5).trim();
+      if (!raw) continue;
+      let data: any;
+      try { data = JSON.parse(raw); } catch { continue; }
+      inputTokens = Number(data.message?.usage?.input_tokens || data.usage?.input_tokens || inputTokens);
+      outputTokens = Number(data.usage?.output_tokens || outputTokens);
+      const text = data.delta?.text;
+      if (typeof text === "string") {
+        outputText += text;
+        if (transformToOpenAi) {
+          reply.raw.write(`data: ${JSON.stringify({ id: `chatcmpl-${Date.now()}`, object: "chat.completion.chunk", created: Math.floor(Date.now() / 1000), model, choices: [{ index: 0, delta: { content: text }, finish_reason: null }] })}\n\n`);
+        }
+      }
+    }
   }
-
-  const estPromptTokens = Array.isArray(body.messages)
-    ? body.messages.reduce((acc: number, m: any) => acc + (typeof m.content === "string" ? Math.max(1, Math.ceil(m.content.length / 4)) : 4), 0)
-    : 15;
-  const requestedMaxTokens = typeof body.max_tokens === "number" && body.max_tokens > 0
-    ? body.max_tokens
-    : (typeof body.max_tokens_to_sample === "number" && body.max_tokens_to_sample > 0 ? body.max_tokens_to_sample : 1000);
-  const maxPossibleCost = calculateCost(requestedModel, estPromptTokens, requestedMaxTokens).costUsd;
-
-  if (entry.usedUsd + maxPossibleCost > entry.creditUsd) {
-    return reply.status(402).send({
-      error: {
-        type: "quota_error",
-        message: `Deal remaining credit ($${(entry.creditUsd - entry.usedUsd).toFixed(6)}) insufficient for requested max_tokens (${requestedMaxTokens} tokens = $${maxPossibleCost.toFixed(6)})`,
-      },
-    });
+  inputTokens ||= fallbackInputTokens;
+  outputTokens ||= countTextTokens(entry.provider, model, outputText);
+  const usage = recordUsage(entry, model, inputTokens, outputTokens);
+  if (transformToOpenAi) {
+    reply.raw.write(`data: ${JSON.stringify({ id: `chatcmpl-${Date.now()}`, object: "chat.completion.chunk", created: Math.floor(Date.now() / 1000), model, choices: [{ index: 0, delta: {}, finish_reason: "stop" }], usage: { prompt_tokens: inputTokens, completion_tokens: outputTokens, total_tokens: inputTokens + outputTokens, conpi_cost_usd: usage.costUsd } })}\n\n`);
+    reply.raw.write("data: [DONE]\n\n");
   }
+  return reply.raw.end();
+}
 
-  // If mock/test key, delegate to test-mock module in test mode
+export async function handleChatCompletions(req: FastifyRequest, reply: FastifyReply) {
+  const entry = authenticate(req, reply);
+  if (!entry || !enforceRateLimit(entry, reply)) return;
+  const body = (req.body || {}) as any;
+  const model = String(body.model || "");
+  if (!model) return reply.status(400).send({ error: { message: "model is required", code: "invalid_request" } });
+  const inputTokens = countChatInputTokens(entry.provider, model, body.messages);
+  const maxOutputTokens = Math.max(1, Number(body.max_tokens ?? body.max_completion_tokens ?? 1_000));
+  if (!enforceModelAndBudget(entry, model, inputTokens, maxOutputTokens, reply)) return;
+
   if (entry.apiKey.startsWith("mock_") || entry.apiKey.startsWith("test_") || entry.apiKey.startsWith("sk-test")) {
-    if (process.env.NODE_ENV !== "test") {
-      return reply.status(403).send({
-        error: { type: "permission_error", message: "Mock API keys are disabled outside test mode" },
-      });
-    }
+    if (process.env.NODE_ENV !== "test") return reply.status(403).send({ error: { message: "Mock keys are disabled", code: "mock_forbidden" } });
     const mockModulePath = "../../test/test-mock.js";
-    const { handleMockAnthropicMessage } = await (import(mockModulePath) as Promise<any>);
-    return handleMockAnthropicMessage(req, reply, entry, requestedModel);
-  }
-
-  const provLower = entry.provider.toLowerCase();
-  const isDirectAnthropic = provLower === "anthropic";
-
-  if (isDirectAnthropic) {
-    // Upstream is native Anthropic
-    const upstreamRes = await fetch("https://api.anthropic.com/v1/messages", {
-      method: "POST",
-      headers: {
-        "x-api-key": entry.apiKey,
-        "anthropic-version": "2023-06-01",
-        "Content-Type": "application/json",
-      },
-      body: JSON.stringify(body),
-    });
-
-    if (upstreamRes.status === 401 || upstreamRes.status === 403) {
-      const errText = await upstreamRes.text();
-      entry.active = false;
-      const reason = isProviderBan(upstreamRes.status, errText) ? DefaultReason.ProviderBan : DefaultReason.InvalidKey;
-      const defaultSig = meterEngine.emitDefault(entry, entry.termsHashHex, reason);
-      entry.signedPayloads.push(defaultSig);
-      return reply.status(502).send({
-        error: {
-          type: reason === DefaultReason.ProviderBan ? "provider_banned" : "seller_key_revoked",
-          message: reason === DefaultReason.ProviderBan ? "Seller account/key was banned or suspended by provider." : "Seller API key was revoked or invalid.",
-        },
-        defaultPayload: defaultSig,
-      });
-    }
-
-    if (!upstreamRes.ok) {
-      const errText = await upstreamRes.text();
-      if (isProviderBan(upstreamRes.status, errText)) {
-        entry.active = false;
-        const defaultSig = meterEngine.emitDefault(entry, entry.termsHashHex, DefaultReason.ProviderBan);
-        entry.signedPayloads.push(defaultSig);
-        return reply.status(502).send({
-          error: { type: "provider_banned", message: "Seller account/key was banned by provider." },
-          defaultPayload: defaultSig,
-        });
-      }
-      return reply.status(upstreamRes.status).send({ error: { type: "upstream_error", message: errText } });
-    }
-
-    const data: any = await upstreamRes.json();
-    if (data.usage) {
-      const reportedCost = typeof data.usage.cost === "number" && data.usage.cost > 0
-        ? data.usage.cost
-        : (typeof data.usage.total_cost === "number" && data.usage.total_cost > 0 ? data.usage.total_cost : undefined);
-
-      const usageCost = (reportedCost !== undefined && reportedCost > 0)
-        ? reportedCost
-        : calculateCost(requestedModel, data.usage.input_tokens || 0, data.usage.output_tokens || 0).costUsd;
-
-      entry.usedUsd = Math.min(entry.creditUsd, entry.usedUsd + usageCost);
-      if (entry.usedUsd >= entry.creditUsd) {
-        entry.active = false;
-      }
-      entry.tokensTotal += ((data.usage.input_tokens || 0) + (data.usage.output_tokens || 0));
-
-      const newStages = meterEngine.checkAndEmitStages(entry, entry.termsHashHex);
-      for (const stg of newStages) {
-        entry.signedPayloads.push(stg);
-      }
-    }
-    return reply.status(upstreamRes.status).send(data);
-  }
-
-  // Upstream is OpenAI or RedPill: translate Anthropic format to OpenAI format
-  const openAiMessages: Array<{ role: string; content: string }> = [];
-  if (body.system) {
-    openAiMessages.push({ role: "system", content: typeof body.system === "string" ? body.system : JSON.stringify(body.system) });
-  }
-  for (const m of body.messages || []) {
-    let content = "";
-    if (typeof m.content === "string") {
-      content = m.content;
-    } else if (Array.isArray(m.content)) {
-      content = m.content.map((c: any) => c.text || JSON.stringify(c)).join("\n");
-    }
-    openAiMessages.push({ role: m.role, content });
-  }
-
-  let upstreamUrl = "https://api.openai.com/v1/chat/completions";
-  if (entry.apiKey.startsWith("sk-rp-") || provLower === "redpill" || provLower === "phala") {
-    upstreamUrl = "https://api.redpill.ai/v1/chat/completions";
-  } else if (provLower === "openrouter") {
-    upstreamUrl = "https://openrouter.ai/api/v1/chat/completions";
+    const { handleMockChatCompletion } = await import(mockModulePath) as any;
+    return handleMockChatCompletion(req, reply, entry, model);
   }
 
   try {
-    const upstreamRes = await fetch(upstreamUrl, {
-      method: "POST",
-      headers: {
-        "Content-Type": "application/json",
-        Authorization: `Bearer ${entry.apiKey}`,
-      },
-      body: JSON.stringify({
-        model: requestedModel,
-        messages: openAiMessages,
-        max_tokens: body.max_tokens || 1024,
-        temperature: body.temperature,
-      }),
-    });
-
-    if (upstreamRes.status === 401 || upstreamRes.status === 403) {
-      const errText = await upstreamRes.text();
-      entry.active = false;
-      const reason = isProviderBan(upstreamRes.status, errText) ? DefaultReason.ProviderBan : DefaultReason.InvalidKey;
-      const defaultSig = meterEngine.emitDefault(entry, entry.termsHashHex, reason);
-      entry.signedPayloads.push(defaultSig);
-      return reply.status(502).send({
-        error: {
-          type: reason === DefaultReason.ProviderBan ? "provider_banned" : "seller_key_revoked",
-          message: reason === DefaultReason.ProviderBan ? "Seller account/key was banned or suspended by provider." : "Seller API key was revoked or invalid.",
-        },
-        defaultPayload: defaultSig,
+    const kind = providerKind(entry);
+    if (kind === "anthropic") {
+      const response = await fetchWithTransientBackoff("https://api.anthropic.com/v1/messages", {
+        method: "POST", headers: providerHeaders(entry, kind), body: JSON.stringify(openAiMessagesToAnthropic(body)),
+      });
+      if (!response.ok) return handleProviderFailure(response, entry, reply);
+      if (body.stream) return streamAnthropicResponse(response, reply, entry, model, inputTokens, true);
+      const data: any = await response.json();
+      const outputText = extractText(data.content);
+      const finalInput = Number(data.usage?.input_tokens || inputTokens);
+      const finalOutput = Number(data.usage?.output_tokens || countTextTokens(entry.provider, model, outputText));
+      const usage = recordUsage(entry, model, finalInput, finalOutput);
+      return reply.send({
+        id: `chatcmpl-${data.id || Date.now()}`, object: "chat.completion", created: Math.floor(Date.now() / 1000), model,
+        choices: [{ index: 0, message: { role: "assistant", content: outputText }, finish_reason: data.stop_reason === "max_tokens" ? "length" : "stop" }],
+        usage: { prompt_tokens: finalInput, completion_tokens: finalOutput, total_tokens: finalInput + finalOutput, conpi_cost_usd: usage.costUsd },
       });
     }
 
-    if (upstreamRes.status === 429) {
-      const text = await upstreamRes.text();
-      if (text.includes("insufficient_quota")) {
-        entry.active = false;
-        const defaultSig = meterEngine.emitDefault(entry, entry.termsHashHex, DefaultReason.InsufficientQuota);
-        entry.signedPayloads.push(defaultSig);
-        return reply.status(502).send({
-          error: { type: "insufficient_quota", message: "Seller account quota exhausted." },
-          defaultPayload: defaultSig,
-        });
-      }
-      return reply.status(429).send({ error: { type: "rate_limit_error", message: "Upstream rate limit exceeded." } });
+    const response = await fetchWithTransientBackoff(`${openAiBaseUrl(kind)}/chat/completions`, {
+      method: "POST", headers: providerHeaders(entry, kind),
+      body: JSON.stringify(body.stream ? { ...body, stream_options: { include_usage: true } } : body),
+    });
+    if (!response.ok) return handleProviderFailure(response, entry, reply);
+    if (body.stream) return streamOpenAiResponse(response, reply, entry, model, inputTokens);
+    const data: any = await response.json();
+    const outputText = extractText(data.choices?.[0]?.message?.content);
+    const finalInput = Number(data.usage?.prompt_tokens || inputTokens);
+    const finalOutput = Number(data.usage?.completion_tokens || countTextTokens(entry.provider, model, outputText));
+    const cachedTokens = Number(data.usage?.prompt_tokens_details?.cached_tokens || 0);
+    const usage = recordUsage(entry, model, finalInput, finalOutput, cachedTokens);
+    data.usage = { ...(data.usage || {}), prompt_tokens: finalInput, completion_tokens: finalOutput, total_tokens: finalInput + finalOutput, conpi_cost_usd: usage.costUsd };
+    return reply.status(response.status).send(data);
+  } catch (err: any) {
+    return reply.status(502).send({ error: { message: err.message, code: "proxy_error" } });
+  }
+}
+
+export async function handleAnthropicMessages(req: FastifyRequest, reply: FastifyReply) {
+  const entry = authenticate(req, reply);
+  if (!entry || !enforceRateLimit(entry, reply)) return;
+  const body = (req.body || {}) as any;
+  const model = String(body.model || "");
+  if (!model) return reply.status(400).send({ error: { type: "invalid_request_error", message: "model is required" } });
+  const inputTokens = countChatInputTokens(entry.provider, model, body.messages, body.system);
+  const maxOutputTokens = Math.max(1, Number(body.max_tokens ?? 1_000));
+  if (!enforceModelAndBudget(entry, model, inputTokens, maxOutputTokens, reply)) return;
+
+  if (entry.apiKey.startsWith("mock_") || entry.apiKey.startsWith("test_") || entry.apiKey.startsWith("sk-test")) {
+    if (process.env.NODE_ENV !== "test") return reply.status(403).send({ error: { type: "permission_error", message: "Mock keys are disabled" } });
+    const mockModulePath = "../../test/test-mock.js";
+    const { handleMockAnthropicMessage } = await import(mockModulePath) as any;
+    return handleMockAnthropicMessage(req, reply, entry, model);
+  }
+
+  try {
+    const kind = providerKind(entry);
+    if (kind === "anthropic") {
+      const response = await fetchWithTransientBackoff("https://api.anthropic.com/v1/messages", {
+        method: "POST", headers: providerHeaders(entry, kind), body: JSON.stringify(body),
+      });
+      if (!response.ok) return handleProviderFailure(response, entry, reply, true);
+      if (body.stream) return streamAnthropicResponse(response, reply, entry, model, inputTokens);
+      const data: any = await response.json();
+      const outputText = extractText(data.content);
+      const finalInput = Number(data.usage?.input_tokens || inputTokens);
+      const finalOutput = Number(data.usage?.output_tokens || countTextTokens(entry.provider, model, outputText));
+      const usage = recordUsage(entry, model, finalInput, finalOutput);
+      data.usage = { ...(data.usage || {}), input_tokens: finalInput, output_tokens: finalOutput, conpi_cost_usd: usage.costUsd };
+      return reply.send(data);
     }
 
-    if (!upstreamRes.ok) {
-      const errText = await upstreamRes.text();
-      if (isProviderBan(upstreamRes.status, errText)) {
-        entry.active = false;
-        const defaultSig = meterEngine.emitDefault(entry, entry.termsHashHex, DefaultReason.ProviderBan);
-        entry.signedPayloads.push(defaultSig);
-        return reply.status(502).send({
-          error: { type: "provider_banned", message: "Seller account/key was banned by provider." },
-          defaultPayload: defaultSig,
-        });
-      }
-      return reply.status(upstreamRes.status).send({ error: { type: "upstream_error", message: errText } });
-    }
-
-    const data: any = await upstreamRes.json();
-    const promptTokens = data.usage?.prompt_tokens ?? 0;
-    const completionTokens = data.usage?.completion_tokens ?? 0;
-
-    const reportedCost = typeof data.usage?.cost === "number" && data.usage.cost > 0
-      ? data.usage.cost
-      : (typeof data.usage?.total_cost === "number" && data.usage.total_cost > 0 ? data.usage.total_cost : undefined);
-
-    const usageCost = (reportedCost !== undefined && reportedCost > 0)
-      ? reportedCost
-      : calculateCost(requestedModel, promptTokens, completionTokens).costUsd;
-
-    entry.usedUsd = Math.min(entry.creditUsd, entry.usedUsd + usageCost);
-    if (entry.usedUsd >= entry.creditUsd) {
-      entry.active = false;
-    }
-    entry.tokensTotal += (promptTokens + completionTokens);
-
-    const newStages = meterEngine.checkAndEmitStages(entry, entry.termsHashHex);
-    for (const stg of newStages) {
-      entry.signedPayloads.push(stg);
-    }
-
-    // Return native Anthropic message format
-    return reply.status(200).send({
-      id: `msg_${data.id || Date.now()}`,
-      type: "message",
-      role: "assistant",
-      model: requestedModel,
-      content: [{ type: "text", text: data.choices?.[0]?.message?.content || "" }],
-      stop_reason: data.choices?.[0]?.finish_reason === "stop" ? "end_turn" : "max_tokens",
-      stop_sequence: null,
-      usage: {
-        input_tokens: promptTokens,
-        output_tokens: completionTokens,
-      },
+    const response = await fetchWithTransientBackoff(`${openAiBaseUrl(kind)}/chat/completions`, {
+      method: "POST", headers: providerHeaders(entry, kind), body: JSON.stringify(anthropicMessagesToOpenAi(body)),
+    });
+    if (!response.ok) return handleProviderFailure(response, entry, reply, true);
+    if (body.stream) return streamOpenAiResponse(response, reply, entry, model, inputTokens, true);
+    const data: any = await response.json();
+    const outputText = extractText(data.choices?.[0]?.message?.content);
+    const finalInput = Number(data.usage?.prompt_tokens || inputTokens);
+    const finalOutput = Number(data.usage?.completion_tokens || countTextTokens(entry.provider, model, outputText));
+    const usage = recordUsage(entry, model, finalInput, finalOutput);
+    return reply.send({
+      id: `msg_${data.id || Date.now()}`, type: "message", role: "assistant", model,
+      content: [{ type: "text", text: outputText }],
+      stop_reason: data.choices?.[0]?.finish_reason === "length" ? "max_tokens" : "end_turn", stop_sequence: null,
+      usage: { input_tokens: finalInput, output_tokens: finalOutput, conpi_cost_usd: usage.costUsd },
     });
   } catch (err: any) {
-    return reply.status(500).send({ error: { type: "api_error", message: err.message } });
+    return reply.status(502).send({ error: { type: "api_error", message: err.message } });
+  }
+}
+
+export async function handleEmbeddings(req: FastifyRequest, reply: FastifyReply) {
+  const entry = authenticate(req, reply);
+  if (!entry || !enforceRateLimit(entry, reply)) return;
+  const body = (req.body || {}) as any;
+  const model = String(body.model || "");
+  if (!model) return reply.status(400).send({ error: { message: "model is required", code: "invalid_request" } });
+  const inputTokens = countEmbeddingInputTokens(entry.provider, model, body.input);
+  if (!enforceModelAndBudget(entry, model, inputTokens, 0, reply)) return;
+  const kind = providerKind(entry);
+  if (kind === "anthropic") return reply.status(400).send({ error: { message: "Anthropic does not provide embeddings", code: "unsupported_provider_feature" } });
+  if (entry.apiKey.startsWith("mock_") || entry.apiKey.startsWith("test_") || entry.apiKey.startsWith("sk-test")) {
+    if (process.env.NODE_ENV !== "test") return reply.status(403).send({ error: { message: "Mock keys are disabled", code: "mock_forbidden" } });
+    const usage = recordUsage(entry, model, inputTokens, 0);
+    return reply.send({
+      object: "list",
+      data: [{ object: "embedding", index: 0, embedding: [0.125, -0.25, 0.5] }],
+      model,
+      usage: { prompt_tokens: inputTokens, total_tokens: inputTokens, conpi_cost_usd: usage.costUsd },
+    });
+  }
+  try {
+    const response = await fetchWithTransientBackoff(`${openAiBaseUrl(kind)}/embeddings`, {
+      method: "POST", headers: providerHeaders(entry, kind), body: JSON.stringify(body),
+    });
+    if (!response.ok) return handleProviderFailure(response, entry, reply);
+    const data: any = await response.json();
+    const finalInput = Number(data.usage?.prompt_tokens || data.usage?.total_tokens || inputTokens);
+    const usage = recordUsage(entry, model, finalInput, 0);
+    data.usage = { ...(data.usage || {}), prompt_tokens: finalInput, total_tokens: finalInput, conpi_cost_usd: usage.costUsd };
+    return reply.status(response.status).send(data);
+  } catch (err: any) {
+    return reply.status(502).send({ error: { message: err.message, code: "proxy_error" } });
   }
 }
 
 export async function handleModels(req: FastifyRequest, reply: FastifyReply) {
-  const proxyKey = getProxyKey(req);
-  if (!proxyKey) {
-    return reply.status(401).send({ error: { message: "Missing Authorization or x-api-key header" } });
-  }
-
-  const entry = keyVault.getByProxyKey(proxyKey);
-  if (!entry) {
-    return reply.status(403).send({ error: { message: "Invalid proxy key" } });
-  }
-
+  const entry = authenticate(req, reply);
+  if (!entry || !enforceRateLimit(entry, reply)) return;
   return reply.send({
     object: "list",
-    data: entry.models.map((m) => ({
-      id: m,
-      object: "model",
-      created: 1700000000,
-      owned_by: entry.provider.toLowerCase(),
+    data: entry.models.map((model) => ({
+      id: model, object: "model", created: Math.floor(new Date(entry.registeredAt).getTime() / 1_000),
+      owned_by: entry.provider.toLowerCase(), conpi_locked_pricing: entry.lockedPricing[model],
     })),
   });
 }

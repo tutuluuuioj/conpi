@@ -278,23 +278,17 @@ async function runTests() {
   }
   console.log("PASS: creditUsd, priceUsd, and creditAmountYocto successfully derived from on-chain deal state.");
 
-  // 10. OpenRouter Reported Cost Metering
-  console.log("\n[Test 10] Testing OpenRouter Reported Cost Metering...");
+  // 10. Locked Price Metering (provider-reported prices cannot mutate a deal)
+  console.log("\n[Test 10] Testing Locked Price Metering...");
   const entryForCost = keyVault.getByDealId(1)!;
-  const initialUsedUsd = entryForCost.usedUsd;
   const openRouterReportedCost = 0.000009747;
-  
-  // Directly simulate processing an upstream response with reported cost
-  const reportedCost = typeof openRouterReportedCost === "number" && openRouterReportedCost > 0
-    ? openRouterReportedCost
-    : calculateCost("meta-llama/llama-3.2-1b-instruct", 12, 10).costUsd;
-  entryForCost.usedUsd += reportedCost;
-  
-  console.log("  Cost recorded in meter:", reportedCost);
-  if (Math.abs(reportedCost - 0.000009747) > 0.000000001) {
-    throw new Error(`Meter did not use exact OpenRouter reported cost: ${reportedCost}`);
+  const lockedCost = calculateCost("gpt-4o", 12, 10, 0, entryForCost.lockedPricing).costUsd;
+  console.log("  Provider-reported cost (ignored):", openRouterReportedCost);
+  console.log("  Locked-table cost:", lockedCost);
+  if (Math.abs(lockedCost - openRouterReportedCost) < 0.000000001) {
+    throw new Error("Provider-reported price unexpectedly overrode the locked price table");
   }
-  console.log("PASS: Meter successfully records exact OpenRouter reported cost ($0.000009747).");
+  console.log("PASS: Meter prices exact provider token counts only against the immutable deal table.");
 
   // 11. Provider Ban Automatic Detection Test
   console.log("\n[Test 11] Testing Provider Ban Automatic Detection...");

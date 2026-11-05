@@ -8,10 +8,13 @@
     "dev": "tsx watch src/index.ts",
     "build": "tsc",
     "start": "node dist/index.js",
-    "test": "tsx test/index.test.ts"
+    "test": "tsx test/index.test.ts && tsx test/phase3.test.ts",
+    "test:phase3": "tsx test/phase3.test.ts"
   },
   "dependencies": {
-    "@fastify/cors": "^9.0.1",
+    "@anthropic-ai/tokenizer": "^0.0.4",
+    "@fastify/cors": "^11.4.0",
+    "@fastify/websocket": "^11.3.7",
     "@noble/curves": "^1.8.0",
     "@noble/hashes": "^1.7.0",
     "@phala/dstack-sdk": "^0.5.8",
@@ -19,9 +22,10 @@
     "borsh": "^2.0.0",
     "bs58": "^6.0.0",
     "dotenv": "^16.4.7",
-    "fastify": "^4.28.1",
-    "near-api-js": "^4.0.3",
-    "zod": "^3.23.8"
+    "fastify": "^5.12.8",
+    "js-tiktoken": "^1.0.21",
+    "near-api-js": "^7.4.0",
+    "zod": "^4.6.7"
   },
   "devDependencies": {
     "@types/node": "^22.9.0",

@@ -1,6 +1,7 @@
 import { FastifyRequest, FastifyReply } from "fastify";
 import { calculateCost, meterEngine } from "../src/proxy/meter.js";
 import { VaultEntry } from "../src/vault/preflight.js";
+import { meterEvents } from "../src/proxy/events.js";
 
 export function handleMockChatCompletion(
   req: FastifyRequest,
@@ -14,15 +15,17 @@ export function handleMockChatCompletion(
     ? body.messages.reduce((acc: number, m: any) => acc + (typeof m.content === "string" ? Math.max(1, m.content.trim().split(/\s+/).filter(Boolean).length) : 4), 0)
     : 15;
   const outputTokens = 12;
-  const usage = calculateCost(requestedModel, inputTokens, outputTokens);
+  const usage = calculateCost(requestedModel, inputTokens, outputTokens, 0, entry.lockedPricing);
 
-  entry.usedUsd += usage.costUsd;
+  entry.usedUsd = Math.min(entry.creditUsd, entry.usedUsd + usage.costUsd);
   entry.tokensTotal += (inputTokens + outputTokens);
 
   const newStages = meterEngine.checkAndEmitStages(entry, entry.termsHashHex);
   for (const stg of newStages) {
     entry.signedPayloads.push(stg);
   }
+  if (entry.usedUsd >= entry.creditUsd) entry.active = false;
+  meterEvents.publish(entry, newStages.length ? "stage" : "usage", newStages.map((stage) => stage.payload.stage));
 
   const testContent = `[Mock Test Engine]: ${Array.isArray(body.messages) ? (body.messages[body.messages.length - 1]?.content || "ok") : "ok"}`;
 
@@ -83,14 +86,16 @@ export function handleMockAnthropicMessage(
     ? body.messages.reduce((acc: number, m: any) => acc + (typeof m.content === "string" ? Math.max(1, m.content.trim().split(/\s+/).filter(Boolean).length) : 4), 0)
     : 15;
   const outputTokens = 12;
-  const usage = calculateCost(requestedModel, inputTokens, outputTokens);
-  entry.usedUsd += usage.costUsd;
+  const usage = calculateCost(requestedModel, inputTokens, outputTokens, 0, entry.lockedPricing);
+  entry.usedUsd = Math.min(entry.creditUsd, entry.usedUsd + usage.costUsd);
   entry.tokensTotal += (inputTokens + outputTokens);
 
   const newStages = meterEngine.checkAndEmitStages(entry, entry.termsHashHex);
   for (const stg of newStages) {
     entry.signedPayloads.push(stg);
   }
+  if (entry.usedUsd >= entry.creditUsd) entry.active = false;
+  meterEvents.publish(entry, newStages.length ? "stage" : "usage", newStages.map((stage) => stage.payload.stage));
 
   const testContent = `[Mock Test Engine]: ${Array.isArray(body.messages) ? (body.messages[body.messages.length - 1]?.content || "ok") : "ok"}`;
   return reply.send({

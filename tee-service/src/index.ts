@@ -1,5 +1,6 @@
 import Fastify from "fastify";
 import cors from "@fastify/cors";
+import websocket from "@fastify/websocket";
 import crypto from "crypto";
 import { CONFIG } from "./config.js";
 
@@ -9,8 +10,9 @@ import { enclaveKeys } from "./crypto/keys.js";
 import { attestationService } from "./attestation/tdx.js";
 import { negotiationService } from "./negotiation/matcher.js";
 import { keyVault } from "./vault/preflight.js";
-import { handleChatCompletions, handleModels, handleAnthropicMessages } from "./proxy/server.js";
+import { handleChatCompletions, handleModels, handleAnthropicMessages, handleEmbeddings } from "./proxy/server.js";
 import { meterEngine } from "./proxy/meter.js";
+import { meterEvents } from "./proxy/events.js";
 import { DefaultReason } from "./crypto/borsh.js";
 import { nearRelayer } from "./chain/relayer.js";
 
@@ -28,6 +30,7 @@ export async function buildApp() {
     origin: "*",
     methods: ["GET", "POST", "PUT", "DELETE", "OPTIONS"],
   });
+  await app.register(websocket);
 
   // Health check
   app.get("/health", async () => {
@@ -142,7 +145,47 @@ export async function buildApp() {
   // 4. OpenAI / Anthropic Reverse Proxy
   app.post("/v1/chat/completions", handleChatCompletions);
   app.post("/v1/messages", handleAnthropicMessages);
+  app.post("/v1/embeddings", handleEmbeddings);
   app.get("/v1/models", handleModels);
+
+  // Authenticated, real-time meter feed. Browser WebSocket clients authenticate
+  // in the first message so the cpk_live credential never appears in a URL.
+  app.get("/v1/deals/:id/ws", { websocket: true }, (socket, req) => {
+    const { id } = req.params as { id: string };
+    const dealId = parseInt(id, 10);
+    let unsubscribe: (() => void) | null = null;
+    let authenticated = false;
+    const authTimer = setTimeout(() => {
+      if (!authenticated) socket.close(1008, "Authentication timeout");
+    }, CONFIG.websocketAuthTimeoutMs);
+
+    socket.on("message", (raw: any) => {
+      if (authenticated) return;
+      let message: any;
+      try { message = JSON.parse(raw.toString()); } catch {
+        socket.close(1008, "Invalid authentication message");
+        return;
+      }
+      const proxyKey = typeof message?.proxyKey === "string" ? message.proxyKey : "";
+      const entry = keyVault.getByProxyKey(proxyKey);
+      if (!entry || entry.dealId !== dealId) {
+        socket.close(1008, "Invalid proxy key for deal");
+        return;
+      }
+      authenticated = true;
+      clearTimeout(authTimer);
+      socket.send(JSON.stringify({ type: "authenticated", dealId }));
+      socket.send(JSON.stringify(meterEvents.snapshot(entry)));
+      unsubscribe = meterEvents.subscribe(dealId, (event) => {
+        if (socket.readyState === socket.OPEN) socket.send(JSON.stringify(event));
+      });
+    });
+
+    socket.on("close", () => {
+      clearTimeout(authTimer);
+      unsubscribe?.();
+    });
+  });
 
   // 5. Live Meter Snapshot & SSE Stream
   app.get("/v1/deals/:id/meter", async (req, reply) => {
@@ -226,6 +269,7 @@ export async function buildApp() {
     if (reason === "ProviderBan") defReason = DefaultReason.ProviderBan;
     const defaultSig = meterEngine.emitDefault(entry, entry.termsHashHex, defReason);
     entry.signedPayloads.push(defaultSig);
+    meterEvents.publish(entry, "default");
     return {
       ok: true,
       dealId,

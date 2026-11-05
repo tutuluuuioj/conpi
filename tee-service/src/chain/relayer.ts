@@ -1,5 +1,5 @@
 import { CONFIG } from "../config.js";
-import { connect, keyStores, KeyPair } from "near-api-js";
+import { Account, JsonRpcProvider, KeyPairSigner } from "near-api-js";
 
 export class NearRelayer {
   private rpcUrl: string;
@@ -63,23 +63,15 @@ export class NearRelayer {
       throw new Error("Relayer account credentials not configured (RELAYER_ACCOUNT_ID and RELAYER_PRIVATE_KEY)");
     }
 
-    const keyStore = new keyStores.InMemoryKeyStore();
-    const keyPair = KeyPair.fromString(this.relayerPrivateKey as any);
-    await keyStore.setKey(CONFIG.networkId, this.relayerAccountId, keyPair);
-
-    const near = await connect({
-      networkId: CONFIG.networkId,
-      nodeUrl: this.rpcUrl,
-      keyStore,
-    });
-
-    const account = await near.account(this.relayerAccountId);
-    const result = await (account as any).functionCall({
+    const provider = new JsonRpcProvider({ url: this.rpcUrl });
+    const signer = KeyPairSigner.fromSecretKey(this.relayerPrivateKey as any);
+    const account = new Account(this.relayerAccountId, provider, signer);
+    const result: any = await account.callFunctionRaw({
       contractId: CONFIG.contractId,
       methodName,
       args,
       gas: BigInt(gasYocto),
-      attachedDeposit: BigInt(attachedDeposit),
+      deposit: BigInt(attachedDeposit),
     });
 
     return {
