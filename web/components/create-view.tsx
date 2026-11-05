@@ -21,7 +21,6 @@ export function CreateView() {
   const [price, setPrice] = useState(60);
   const [collateral, setCollateral] = useState(20);
   const [token, setToken] = useState<Asset>(app.defaultToken);
-  const [buyerAccount, setBuyerAccount] = useState("");
   const [error, setError] = useState("");
 
   const ratio = credit ? price / credit : 0;
@@ -57,7 +56,6 @@ export function CreateView() {
       collateralPct: collateral,
       buyerCollateralPct: 10,
       seller: app.account,
-      buyer: buyerAccount.trim() || undefined,
       reputation: 0,
       tee: true,
       token,
@@ -114,14 +112,6 @@ export function CreateView() {
         ) : null}
         {step === 1 ? (
           <div className="space-y-4">
-            <Field label="Buyer testnet account" hint="Target buyer testnet account (e.g. anastasia-buyer.testnet).">
-              <input
-                className={fieldClass}
-                placeholder="e.g. anastasia-buyer.testnet"
-                value={buyerAccount}
-                onChange={(event) => setBuyerAccount(event.target.value)}
-              />
-            </Field>
             <Field label="Price" hint={`Ratio ${ratioOf(price, credit)}.`}>
               <input className={`${fieldClass} tabular text-right`} type="number" inputMode="decimal" value={price} onChange={(event) => setPrice(Number(event.target.value))} />
             </Field>

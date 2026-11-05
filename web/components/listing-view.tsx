@@ -15,8 +15,8 @@ export function ListingView({ id }: { id: string }) {
     return <EmptyState icon={<Store className="h-6 w-6" />} title="Listing not found." body="It may have been cancelled." action={<Button href="/">Back to market</Button>} />;
   }
   const escrow = escrowOf({ price: listing.price, buyerCollateralPct: listing.buyerCollateralPct, sellerCollateralPct: listing.collateralPct, releasedUsd: 0 });
-  const open = () => {
-    const dealId = app.openTicket(listing.id);
+  const open = async () => {
+    const dealId = await app.openTicket(listing.id);
     if (dealId) router.push(`/deals/${dealId}/ticket`);
   };
   return (
@@ -48,7 +48,7 @@ export function ListingView({ id }: { id: string }) {
             <li className="flex justify-between"><span className="text-muted">Buyer collateral</span><span className="tabular">{usd(escrow.buyerCollateral)}</span></li>
             <li className="flex justify-between"><span className="text-muted">Seller collateral</span><span className="tabular">{usd(escrow.sellerCollateral)}</span></li>
           </ul>
-          <Button className="mt-5 w-full" onClick={open} disabled={!app.account || app.paused}>{listing.type === "sell" ? "Quick buy" : "Fill request"}</Button>
+          <Button className="mt-5 w-full" onClick={() => void open()} disabled={!app.account || app.paused}>{listing.type === "sell" ? "Quick buy" : "Fill request"}</Button>
           <p className="mt-3 text-xs text-muted">The seller key is collected after deposit, and only by the enclave.</p>
         </Card>
       </aside>

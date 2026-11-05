@@ -1,7 +1,7 @@
 "use client";
 
 import { createContext, useContext, useEffect, useMemo, useRef, useState } from "react";
-import { BASE_URL, CONFIG, CONTRACT_ID, MARKET_SNAPSHOT, TX } from "./chain";
+import { BASE_URL, CONFIG, CONTRACT_ID, MARKET_SNAPSHOT, TEE_SIGNER_PUBLIC_KEY, TX } from "./chain";
 import { KEY_CHECKS, MODELS, listingTerms } from "./data";
 import { maskKey, round2, sameTerms, usd } from "./format";
 import { escrowOf, settleComplete, settleRevoke, stageFor } from "./money";
@@ -88,7 +88,7 @@ interface Api {
   acceptConfirm: () => void;
   approveSign: () => void;
   rejectSign: () => void;
-  openTicket: (listingId: string) => string | null;
+  openTicket: (listingId: string) => Promise<string | null>;
   sendMessage: (dealId: string, text: string) => Promise<void>;
   updateBuyerTerms: (dealId: string, patch: Partial<Deal["buyerTerms"]>) => void;
   submitNegotiationTerms: (dealId: string) => Promise<void>;
@@ -117,6 +117,60 @@ interface Api {
 }
 
 const Ctx = createContext<(State & Api) | null>(null);
+const PUBLISHED_LISTINGS_KEY = "conpi-published-listings-v1";
+
+function dealParamsForListing(listing: Listing, buyer: string, seller: string) {
+  if (buyer.trim().toLowerCase() === seller.trim().toLowerCase()) {
+    throw new Error("Buyer and seller must use different NEAR accounts");
+  }
+
+  let tokenContract: string | null = null;
+  if (listing.token !== "NEAR") {
+    tokenContract = listing.tokenContract || (listing.token.includes(".") ? listing.token : null);
+    if (!tokenContract) throw new Error(`A valid NEP-141 token contract ID is required for ${listing.token}`);
+  }
+
+  const toYocto = (amount: number) => (BigInt(Math.round(amount * 1e6)) * BigInt(1e18)).toString();
+  return {
+    buyer,
+    seller,
+    token: tokenContract,
+    price: toYocto(listing.price),
+    credit_amount: toYocto(listing.credit),
+    buyer_collateral: toYocto(listing.price * (listing.buyerCollateralPct / 100)),
+    seller_collateral: toYocto(listing.price * (listing.collateralPct / 100)),
+    tee_pubkey: TEE_SIGNER_PUBLIC_KEY,
+    deposit_duration_sec: 172800,
+    key_duration_sec: 172800,
+    tee_liveness_timeout_sec: CONFIG.teeLivenessSec,
+    slash_bps_provider_ban: CONFIG.slashProviderBanBps,
+    slash_bps_revoke: CONFIG.slashRevokeBps,
+    slash_bps_buyer_breach: CONFIG.slashBuyerBreachBps,
+  };
+}
+
+function createdDealIdFromOutcome(outcome: any): number | null {
+  const statuses = [
+    outcome?.status,
+    outcome?.transaction_outcome?.outcome?.status,
+    ...(Array.isArray(outcome?.receipts_outcome)
+      ? outcome.receipts_outcome.map((receipt: any) => receipt?.outcome?.status)
+      : []),
+  ];
+
+  for (const status of statuses) {
+    const encoded = status?.SuccessValue;
+    if (typeof encoded !== "string" || !encoded) continue;
+    try {
+      const value = JSON.parse(Buffer.from(encoded, "base64").toString("utf8"));
+      const dealId = Number(value);
+      if (Number.isSafeInteger(dealId) && dealId > 0) return dealId;
+    } catch {
+      // Try the next receipt outcome when a wallet omits the top-level result.
+    }
+  }
+  return null;
+}
 
 let verifiedEncryptionKeyCache: { key: string; fetchedAt: number } | null = null;
 
@@ -314,6 +368,7 @@ export function Providers({ children }: { children: React.ReactNode }) {
         reputation: 15,
         tee: true,
         token: "NEAR",
+        published: false,
         rateLimit: "60 req/min",
         expectedTest: "One completion probe, max 32 tokens",
         createdAt: d.created_at ? new Date(Number(d.created_at) / 1e6).toISOString() : new Date().toISOString(),
@@ -396,14 +451,18 @@ export function Providers({ children }: { children: React.ReactNode }) {
         };
       });
 
-      setState((s) => ({
-        ...s,
-        deals: mappedDeals,
-        listings: generatedListings,
-        claims: userClaims,
-        proposals: mappedProposals,
-        isLoadingOnChain: false,
-      }));
+      setState((s) => {
+        const publishedListings = s.listings.filter((listing) => listing.published);
+        const publishedIds = new Set(publishedListings.map((listing) => listing.id));
+        return {
+          ...s,
+          deals: mappedDeals,
+          listings: [...publishedListings, ...generatedListings.filter((listing) => !publishedIds.has(listing.id))],
+          claims: userClaims,
+          proposals: mappedProposals,
+          isLoadingOnChain: false,
+        };
+      });
     } catch (err) {
       console.warn("Failed to load on-chain contract data:", err);
       setState((s) => ({ ...s, isLoadingOnChain: false }));
@@ -415,6 +474,20 @@ export function Providers({ children }: { children: React.ReactNode }) {
     const interval = setInterval(loadOnChainData, 12000);
     return () => clearInterval(interval);
   }, [state.account]);
+
+  useEffect(() => {
+    try {
+      const saved = JSON.parse(localStorage.getItem(PUBLISHED_LISTINGS_KEY) || "[]");
+      if (!Array.isArray(saved)) return;
+      const published = saved.filter((listing: any) => listing?.published && typeof listing?.id === "string");
+      setState((s) => {
+        const known = new Set(s.listings.map((listing) => listing.id));
+        return { ...s, listings: [...published.filter((listing: Listing) => !known.has(listing.id)), ...s.listings] };
+      });
+    } catch {
+      localStorage.removeItem(PUBLISHED_LISTINGS_KEY);
+    }
+  }, []);
 
   // Theme handling
   useEffect(() => {
@@ -540,18 +613,50 @@ export function Providers({ children }: { children: React.ReactNode }) {
         setState((s) => ({ ...s, signing: null, confirm: null }));
         pushToast({ kind: "error", title: "Transaction rejected in wallet" });
       },
-      openTicket: (listingId) => {
+      openTicket: async (listingId) => {
         const current = stateRef.current;
         if (!current.account) return null;
         const listing = current.listings.find((item) => item.id === listingId);
         if (!listing) return null;
         const existing = current.deals.find((deal) => deal.listingId === listingId && (deal.buyer === current.account || deal.seller === current.account) && deal.step === "negotiate");
         if (existing) return existing.id;
-        const id = String(Math.max(0, ...current.deals.map((deal) => Number(deal.id) || 0)) + 1);
+
         const agreed = listingTerms(listing);
         const role = listing.type === "sell" ? "buyer" : "seller";
         const buyer = role === "buyer" ? current.account : listing.seller;
         const seller = role === "seller" ? current.account : listing.seller;
+        if (buyer.trim().toLowerCase() === seller.trim().toLowerCase()) {
+          pushToast({ kind: "error", title: "Choose a different wallet", body: "Buyer and seller must be two different NEAR accounts." });
+          return null;
+        }
+
+        const pendingToast = pushToast({ kind: "pending", title: "Create deal on NEAR", body: `Confirm the transaction as buyer ${buyer}.` });
+        let outcome: any;
+        let id: string;
+        let txHash = "";
+        try {
+          const params = dealParamsForListing(listing, buyer, seller);
+          const beforeDeals = await fetchContractDeals(0, 100);
+          const previousMaxId = Math.max(0, ...beforeDeals.map((item) => Number(item.id) || 0));
+          outcome = await txCreateDeal(params);
+          txHash = outcome?.transaction?.hash || outcome?.transaction_outcome?.id || "";
+
+          let onChainId = createdDealIdFromOutcome(outcome);
+          for (let attempt = 0; onChainId === null && attempt < 5; attempt += 1) {
+            await new Promise((resolve) => window.setTimeout(resolve, 1_000));
+            const deals = await fetchContractDeals(0, 100);
+            const created = deals
+              .filter((item) => Number(item.id) > previousMaxId && item.buyer === buyer && item.seller === seller)
+              .sort((a, b) => Number(b.id) - Number(a.id))[0];
+            if (created) onChainId = Number(created.id);
+          }
+          if (onChainId === null) throw new Error("The transaction succeeded, but its on-chain deal ID could not be resolved");
+          id = String(onChainId);
+        } catch (err: any) {
+          replaceToast(pendingToast, { kind: "error", title: "Deal creation failed", body: err.message });
+          return null;
+        }
+
         const deal: Deal = {
           id,
           listingId,
@@ -592,7 +697,7 @@ export function Providers({ children }: { children: React.ReactNode }) {
           outcome: null,
           split: null,
           messages: [{ id: crypto.randomUUID(), sender: current.account, text: `Hello, opening deal #${id}`, time: "Just now" }],
-          activity: [{ id: crypto.randomUUID(), title: "Deal initiated", detail: "Ticket opened.", time: "Just now" }],
+          activity: [{ id: crypto.randomUUID(), title: "Deal created on NEAR", detail: `Buyer ${buyer} and seller ${seller}`, tx: txHash || undefined, time: "Just now" }],
           prices: [
             { model: listing.model, input: "$2.50 / 1M", output: "$10.00 / 1M" },
           ],
@@ -601,9 +706,24 @@ export function Providers({ children }: { children: React.ReactNode }) {
           pulseStage: null,
         };
         setState((s) => ({ ...s, deals: [deal, ...s.deals] }));
-        teeApi.initTicket(id, Number(id), buyer, seller)
-          .then((ticket) => applyTicketState(id, ticket))
-          .catch((err) => pushToast({ kind: "error", title: "TEE ticket initialization failed", body: err.message }));
+        try {
+          const ticket = await teeApi.initTicket(id, Number(id), buyer, seller);
+          applyTicketState(id, ticket);
+          replaceToast(pendingToast, {
+            kind: "success",
+            title: "Buyer and seller deal created",
+            body: `Deal #${id}: ${buyer} → ${seller}`,
+            href: txHash ? `https://testnet.nearblocks.io/txns/${txHash}` : undefined,
+          });
+        } catch (err: any) {
+          replaceToast(pendingToast, {
+            kind: "error",
+            title: "Deal created, but TEE ticket initialization failed",
+            body: err.message,
+            href: txHash ? `https://testnet.nearblocks.io/txns/${txHash}` : undefined,
+          });
+        }
+        setTimeout(loadOnChainData, 2_000);
         return id;
       },
       sendMessage: async (dealId, text) => {
@@ -961,58 +1081,37 @@ export function Providers({ children }: { children: React.ReactNode }) {
       createListing: async (listing) => {
         const current = stateRef.current;
         if (!current.account) return { ok: false, title: "Connect a wallet first" };
-
-        try {
-          const priceYocto = (BigInt(Math.round(listing.price * 1e6)) * BigInt(1e18)).toString();
-          const creditYocto = (BigInt(Math.round(listing.credit * 1e6)) * BigInt(1e18)).toString();
-          const buyerCollatYocto = (BigInt(Math.round(listing.price * (listing.buyerCollateralPct / 100) * 1e6)) * BigInt(1e18)).toString();
-          const sellerCollatYocto = (BigInt(Math.round(listing.price * (listing.collateralPct / 100) * 1e6)) * BigInt(1e18)).toString();
-
-          let ftToken: string | null = null;
-          if (listing.token !== "NEAR") {
-            ftToken = (listing as any).tokenContract || (listing.token && listing.token.includes(".") ? listing.token : null);
-            if (!ftToken) throw new Error(`A valid NEP-141 token contract ID is required for ${listing.token}`);
-          }
-
-          const buyerAccount = (listing as any).buyer || (listing.type === "buy" ? current.account : "buyer.testnet");
-          const sellerAccount = listing.type === "sell" ? current.account : (listing.seller || "seller.testnet");
-          const params = {
-            buyer: buyerAccount === sellerAccount ? (listing.type === "sell" ? "buyer.testnet" : "seller.testnet") : buyerAccount,
-            seller: sellerAccount,
-            token: ftToken,
-            price: priceYocto,
-            credit_amount: creditYocto,
-            buyer_collateral: buyerCollatYocto,
-            seller_collateral: sellerCollatYocto,
-            tee_pubkey: "ed25519:CLHhDLsLCCqFeTjz7g31NkfbtN1UqT2mJRmRZgcRPTj3",
-            deposit_duration_sec: 172800,
-            key_duration_sec: 172800,
-            tee_liveness_timeout_sec: 3600,
-            slash_bps_provider_ban: 5000,
-            slash_bps_revoke: 8000,
-            slash_bps_buyer_breach: 5000,
-          };
-
-          const outcome: any = await txCreateDeal(params);
-          const txHash = outcome?.transaction?.hash || outcome?.transaction_outcome?.id;
-          if (!txHash) throw new Error("Create deal transaction failed or rejected");
-
-          setState((s) => ({
-            ...s,
-            listings: [listing, ...s.listings],
-          }));
-
-          setTimeout(loadOnChainData, 2000);
-          return { ok: true, title: "Deal created on NEAR!", body: `Deal registered on contract ${CONTRACT_ID}`, href: `https://testnet.nearblocks.io/txns/${txHash}` };
-        } catch (err: any) {
-          return { ok: false, title: "Create deal transaction failed", body: err.message };
+        if (listing.seller.trim().toLowerCase() !== current.account.trim().toLowerCase()) {
+          return { ok: false, title: "Listing owner mismatch", body: "The connected seller wallet must own the listing." };
         }
+
+        const publishedListing: Listing = { ...listing, seller: current.account, published: true };
+        setState((s) => ({ ...s, listings: [publishedListing, ...s.listings.filter((item) => item.id !== listing.id)] }));
+        try {
+          const saved = JSON.parse(localStorage.getItem(PUBLISHED_LISTINGS_KEY) || "[]");
+          const existing = Array.isArray(saved) ? saved.filter((item: Listing) => item.id !== listing.id) : [];
+          localStorage.setItem(PUBLISHED_LISTINGS_KEY, JSON.stringify([publishedListing, ...existing]));
+        } catch {
+          localStorage.setItem(PUBLISHED_LISTINGS_KEY, JSON.stringify([publishedListing]));
+        }
+        return {
+          ok: true,
+          title: "Seller listing published",
+          body: "No on-chain deal exists yet. A different wallet will create it when Buy is confirmed.",
+        };
       },
       cancelMyListings: () => {
         const account = stateRef.current.account;
         const mine = stateRef.current.listings.filter((listing) => listing.seller === account && listing.type === "sell");
         if (!mine.length) return { ok: false, title: "You have no open listings" };
         setState((s) => ({ ...s, listings: s.listings.filter((listing) => !(listing.seller === account && listing.type === "sell")) }));
+        try {
+          const saved = JSON.parse(localStorage.getItem(PUBLISHED_LISTINGS_KEY) || "[]");
+          const remaining = Array.isArray(saved) ? saved.filter((listing: Listing) => listing.seller !== account) : [];
+          localStorage.setItem(PUBLISHED_LISTINGS_KEY, JSON.stringify(remaining));
+        } catch {
+          localStorage.removeItem(PUBLISHED_LISTINGS_KEY);
+        }
         return { ok: true, title: "Listings cancelled", body: `${mine.length} listing${mine.length === 1 ? "" : "s"} removed.` };
       },
       rotateKey: (dealId) => {

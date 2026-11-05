@@ -90,9 +90,9 @@ export function MarketView() {
     return `${provider} ${mid.toFixed(2)}×`;
   }).filter(Boolean);
 
-  const quick = (listing: Listing) => {
+  const quick = async (listing: Listing) => {
     if (!app.account) return;
-    const id = app.openTicket(listing.id);
+    const id = await app.openTicket(listing.id);
     if (id) router.push(`/deals/${id}/ticket`);
   };
 

@@ -42,6 +42,8 @@ export interface Listing {
   reputation: number;
   tee: boolean;
   token: Asset;
+  tokenContract?: string;
+  published?: boolean;
   rateLimit: string;
   expectedTest: string;
   createdAt: string;

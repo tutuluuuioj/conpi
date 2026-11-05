@@ -6,6 +6,7 @@ export const BASE_URL =
   process.env.NEXT_PUBLIC_TEE_BASE_URL ||
   "https://b1b35377079ac7b7937afc607481587bc6d22665-3000.dstack-pha-prod9.phala.network/v1";
 export const TERMS_HASH = "0x33759870ce50be53364c8f0d319519ebd61e19f7bc0fbe39294cb1baaf009bd5";
+export const TEE_SIGNER_PUBLIC_KEY = "ed25519:CLHhDLsLCCqFeTjz7g31NkfbtN1UqT2mJRmRZgcRPTj3";
 
 export const NETWORK = "testnet" as const;
 
