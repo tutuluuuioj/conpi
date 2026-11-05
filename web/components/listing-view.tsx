@@ -19,6 +19,7 @@ export function ListingView({ id }: { id: string }) {
     const dealId = await app.openTicket(listing.id);
     if (dealId) router.push(`/deals/${dealId}/ticket`);
   };
+  const isOwner = Boolean(app.account && app.account.toLowerCase() === listing.seller.toLowerCase());
   return (
     <div className="grid gap-6 lg:grid-cols-12">
       <div className="space-y-6 lg:col-span-8">
@@ -48,7 +49,19 @@ export function ListingView({ id }: { id: string }) {
             <li className="flex justify-between"><span className="text-muted">Buyer collateral</span><span className="tabular">{usd(escrow.buyerCollateral)}</span></li>
             <li className="flex justify-between"><span className="text-muted">Seller collateral</span><span className="tabular">{usd(escrow.sellerCollateral)}</span></li>
           </ul>
-          <Button className="mt-5 w-full" onClick={() => void open()} disabled={!app.account || app.paused}>{listing.type === "sell" ? "Quick buy" : "Fill request"}</Button>
+          {isOwner ? (
+            <div className="mt-4 rounded-md border border-line bg-surface-2 p-3 text-xs text-muted">
+              <p className="font-medium text-ink">You are connected as the Seller.</p>
+              <p className="mt-1">To buy this listing and create the on-chain deal, switch to your Buyer wallet.</p>
+              <Button className="mt-3 w-full" variant="secondary" onClick={() => app.connect()}>
+                Switch to Buyer Wallet
+              </Button>
+            </div>
+          ) : (
+            <Button className="mt-5 w-full" onClick={() => void open()} disabled={!app.account || app.paused}>
+              {listing.type === "sell" ? "Quick buy" : "Fill request"}
+            </Button>
+          )}
           <p className="mt-3 text-xs text-muted">The seller key is collected after deposit, and only by the enclave.</p>
         </Card>
       </aside>

@@ -167,3 +167,42 @@ export async function fetchContractPendingPayout(accountId: string, token: strin
     return "0";
   }
 }
+
+export async function fetchContractDealCreator(dealId: number): Promise<string | null> {
+  try {
+    const key = new Uint8Array(9);
+    key[0] = "c".charCodeAt(0);
+    const view = new DataView(key.buffer);
+    view.setBigUint64(1, BigInt(dealId), true);
+    const keyB64 = Buffer.from(key).toString("base64");
+
+    const urls = [NEAR_RPC_URL, FALLBACK_RPC_URL].filter(Boolean);
+    for (const url of urls) {
+      try {
+        const response = await fetch(url, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            jsonrpc: "2.0",
+            id: `creator_${dealId}`,
+            method: "query",
+            params: {
+              request_type: "view_state",
+              finality: "final",
+              account_id: CONTRACT_ID,
+              prefix_base64: keyB64,
+            },
+          }),
+        });
+        const json = await response.json();
+        const values = json.result?.values;
+        if (values && values.length > 0) {
+          const valBytes = Buffer.from(values[0].value, "base64");
+          const len = valBytes.readUInt32LE(0);
+          return valBytes.toString("utf8", 4, 4 + len);
+        }
+      } catch {}
+    }
+  } catch {}
+  return null;
+}

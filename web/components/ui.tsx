@@ -21,9 +21,9 @@ import {
   X,
 } from "lucide-react";
 import { cn } from "@/lib/cn";
-import { absoluteTime, countdown, maskKey, middle, usd } from "@/lib/format";
+import { absoluteTime, assetAmount, countdown, maskKey, middle, usd } from "@/lib/format";
 import { escrowOf, outcomeCopy } from "@/lib/money";
-import type { Deal, DealStatus, DealStep } from "@/lib/types";
+import type { Asset, Deal, DealStatus, DealStep } from "@/lib/types";
 import { explorerAccount, explorerTx } from "@/lib/chain";
 
 const STEPS: { id: DealStep; label: string }[] = [
@@ -317,8 +317,23 @@ export function Meter({
   );
 }
 
-export function StageTicks({ price, stage, pulse }: { price: number; stage: number; pulse?: number | null }) {
-  const amount = price / 4;
+export function StageTicks({
+  price,
+  priceUsd,
+  token,
+  stage,
+  pulse,
+}: {
+  price: number;
+  priceUsd?: number;
+  token?: Asset;
+  stage: number;
+  pulse?: number | null;
+}) {
+  const isNear = token === "NEAR";
+  const amountNear = price / 4;
+  const amountUsd = priceUsd ? priceUsd / 4 : amountNear * 4.02;
+
   return (
     <div className="mt-2 grid grid-cols-2 gap-2 sm:grid-cols-4">
       {[25, 50, 75, 100].map((tick) => {
@@ -329,7 +344,18 @@ export function StageTicks({ price, stage, pulse }: { price: number; stage: numb
               {done ? <Check className="h-3 w-3" /> : <span className="h-1.5 w-1.5 rounded-full bg-current opacity-50" />}
               {tick}%
             </div>
-            <div className="tabular mt-0.5">{usd(amount)} {done ? "released" : "pending"}</div>
+            <div className="tabular mt-0.5">
+              {isNear ? (
+                <span>
+                  {amountNear.toFixed(4)} NEAR
+                  <span className="block text-[11px] opacity-75">
+                    ({usd(amountUsd)}) {done ? "released" : "pending"}
+                  </span>
+                </span>
+              ) : (
+                <span>{usd(amountNear)} {done ? "released" : "pending"}</span>
+              )}
+            </div>
           </div>
         );
       })}
@@ -341,15 +367,19 @@ export function EscrowTable({ deal }: { deal: Deal }) {
   const escrow = escrowOf(deal);
   const live = deal.status === "Active" || deal.step === "live";
   const settled = deal.step === "settled" && deal.split;
+  const isNear = deal.token === "NEAR";
+  const fmtAsset = (amount: number) =>
+    isNear ? `${amount.toFixed(4)} NEAR` : usd(amount);
+
   const rows = [
-    ["Buyer price", usd(deal.price), "Locked"],
-    [`Buyer collateral (${deal.buyerCollateralPct}%)`, usd(escrow.buyerCollateral), settled ? "Settled" : "Locked, refunded on completion"],
-    [`Seller collateral (${deal.sellerCollateralPct}%)`, usd(escrow.sellerCollateral), settled ? "Settled" : "Locked, returned on completion"],
-    ["Total in escrow", usd(escrow.total), "NEAR contract"],
+    ["Buyer price", fmtAsset(deal.price), "Locked"],
+    [`Buyer collateral (${deal.buyerCollateralPct}%)`, fmtAsset(escrow.buyerCollateral), settled ? "Settled" : "Locked, refunded on completion"],
+    [`Seller collateral (${deal.sellerCollateralPct}%)`, fmtAsset(escrow.sellerCollateral), settled ? "Settled" : "Locked, returned on completion"],
+    ["Total in escrow", fmtAsset(escrow.total), "NEAR contract"],
   ];
   if (live || settled) {
-    rows.push(["Released", usd(deal.releasedUsd), "Paid to the seller"]);
-    rows.push(["Remaining", usd(Math.max(0, escrow.total - (deal.split ? deal.split.seller + (deal.outcome === "completed" ? 0 : deal.split.buyer) : deal.releasedUsd))), "Still in the contract"]);
+    rows.push(["Released", fmtAsset(deal.releasedUsd), "Paid to the seller"]);
+    rows.push(["Remaining", fmtAsset(Math.max(0, escrow.total - (deal.split ? deal.split.seller + (deal.outcome === "completed" ? 0 : deal.split.buyer) : deal.releasedUsd))), "Still in the contract"]);
   }
   return (
     <div>
@@ -384,7 +414,7 @@ export function EscrowTable({ deal }: { deal: Deal }) {
           </li>
         ))}
       </ul>
-      {settled && deal.split ? <SplitBar deal={deal} /> : live ? <LiveBar released={deal.releasedUsd} total={escrow.total} /> : <LockedBar />}
+      {settled && deal.split ? <SplitBar deal={deal} /> : live ? <LiveBar released={deal.releasedUsd} total={escrow.total} token={deal.token} /> : <LockedBar />}
     </div>
   );
 }
@@ -400,11 +430,12 @@ function LockedBar() {
   );
 }
 
-function LiveBar({ released, total }: { released: number; total: number }) {
+function LiveBar({ released, total, token }: { released: number; total: number; token: Asset }) {
   const rel = total ? (released / total) * 100 : 0;
+  const amount = (value: number) => token === "NEAR" ? assetAmount(value, "NEAR") : usd(value);
   return (
     <div className="mt-3">
-      <div className="flex h-3 overflow-hidden rounded-full bg-violet" role="img" aria-label={`${usd(released)} released, ${usd(Math.max(0, total - released))} still locked`}>
+      <div className="flex h-3 overflow-hidden rounded-full bg-violet" role="img" aria-label={`${amount(released)} released, ${amount(Math.max(0, total - released))} still locked`}>
         <div className="bg-mint" style={{ width: `${rel}%` }} />
       </div>
       <div className="mt-2 flex gap-3 text-[11px] text-muted">
@@ -419,6 +450,7 @@ export function SplitBar({ deal }: { deal: Deal }) {
   const escrow = escrowOf(deal);
   const split = deal.split;
   if (!split || escrow.total <= 0) return null;
+  const amount = (value: number) => deal.token === "NEAR" ? assetAmount(value, "NEAR") : usd(value);
   const refunded = Math.max(0, split.buyer - split.slashed);
   const parts = [
     { key: "released", width: (split.seller / escrow.total) * 100, className: "bg-mint" },
@@ -427,7 +459,7 @@ export function SplitBar({ deal }: { deal: Deal }) {
   ];
   return (
     <div className="mt-4">
-      <div className="flex h-3 overflow-hidden rounded-full bg-surface-2" role="img" aria-label={`Seller ${usd(split.seller)}, buyer ${usd(split.buyer)}${split.slashed ? `, ${usd(split.slashed)} slashed` : ""}`}>
+      <div className="flex h-3 overflow-hidden rounded-full bg-surface-2" role="img" aria-label={`Seller ${amount(split.seller)}, buyer ${amount(split.buyer)}${split.slashed ? `, ${amount(split.slashed)} slashed` : ""}`}>
         {parts.filter((part) => part.width > 0).map((part) => (
           <div key={part.key} className={part.className} style={{ width: `${part.width}%` }} />
         ))}
@@ -439,8 +471,8 @@ export function SplitBar({ deal }: { deal: Deal }) {
         <Legend swatch="pattern-refund" label="Refunded" />
       </div>
       <p className="mt-2 text-[13px] text-muted">
-        Seller {usd(split.seller)} · Buyer {usd(split.buyer)}
-        {split.slashed ? ` · ${usd(split.slashed)} slashed` : ""}
+        Seller {amount(split.seller)} · Buyer {amount(split.buyer)}
+        {split.slashed ? ` · ${amount(split.slashed)} slashed` : ""}
       </p>
     </div>
   );

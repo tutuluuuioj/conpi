@@ -35,7 +35,9 @@ export interface Listing {
   model: string;
   models: string[];
   credit: number;
+  creditUsd?: number;
   price: number;
+  priceUsd?: number;
   collateralPct: number;
   buyerCollateralPct: number;
   seller: string;
@@ -51,7 +53,9 @@ export interface Listing {
 
 export interface Terms {
   credit: number;
+  creditUsd?: number;
   price: number;
+  priceUsd?: number;
   buyerCollateralPct: number;
   sellerCollateralPct: number;
   token: Asset;
@@ -109,7 +113,9 @@ export interface Deal {
   model: string;
   models: string[];
   credit: number;
+  creditUsd?: number;
   price: number;
+  priceUsd?: number;
   buyerCollateralPct: number;
   sellerCollateralPct: number;
   token: Asset;

@@ -164,8 +164,11 @@ export const teeApi = {
     return res.json();
   },
 
-  async getMeter(dealId: number): Promise<MeterResponse> {
-    const res = await fetch(`${TEE_BASE_URL}/v1/deals/${dealId}/meter`);
+  async getMeter(dealId: number, proxyKey: string): Promise<MeterResponse> {
+    const res = await fetch(`${TEE_BASE_URL}/v1/deals/${dealId}/meter`, {
+      headers: { Authorization: `Bearer ${proxyKey}` },
+      cache: "no-store",
+    });
     if (!res.ok) throw new Error(`Failed to get meter: ${res.statusText}`);
     return res.json();
   },

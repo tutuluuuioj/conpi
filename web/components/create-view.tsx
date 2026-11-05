@@ -1,11 +1,12 @@
 "use client";
 
-import { useState } from "react";
+import { useEffect, useState } from "react";
 import { useRouter } from "next/navigation";
 import { MODELS } from "@/lib/data";
 import { ratioOf, usd } from "@/lib/format";
 import { escrowOf } from "@/lib/money";
 import { useApp } from "@/lib/store";
+import { getLiveNearPrice } from "@/lib/oracle";
 import type { Asset, Provider } from "@/lib/types";
 import { Button, Card, Field, Overline, fieldClass } from "./ui";
 
@@ -23,6 +24,15 @@ export function CreateView() {
   const [token, setToken] = useState<Asset>("NEAR");
   const [buyerAccount, setBuyerAccount] = useState("");
   const [error, setError] = useState("");
+  const [nearPrice, setNearPrice] = useState(4.02);
+
+  useEffect(() => {
+    getLiveNearPrice().then(setNearPrice).catch(() => {});
+    const interval = setInterval(() => {
+      getLiveNearPrice().then(setNearPrice).catch(() => {});
+    }, 30000);
+    return () => clearInterval(interval);
+  }, []);
 
   const ratio = credit ? price / credit : 0;
   const escrow = escrowOf({ price, buyerCollateralPct: 10, sellerCollateralPct: collateral, releasedUsd: 0 });
@@ -37,11 +47,7 @@ export function CreateView() {
       return;
     }
     if (step === 1) {
-      if (!buyerAccount.trim()) {
-        setError("Please enter your second testnet wallet for the Buyer (e.g. your-buyer.testnet).");
-        return;
-      }
-      if (app.account && buyerAccount.trim().toLowerCase() === app.account.toLowerCase()) {
+      if (buyerAccount.trim() && app.account && buyerAccount.trim().toLowerCase() === app.account.toLowerCase()) {
         setError(`Buyer wallet must be different from your connected seller wallet (${app.account}).`);
         return;
       }
@@ -56,8 +62,9 @@ export function CreateView() {
 
   const sign = () => {
     if (!app.account) return;
-    if (!buyerAccount.trim()) {
-      setError("Please enter your second testnet wallet for the Buyer.");
+    const buyerTrimmed = buyerAccount.trim();
+    if (buyerTrimmed && buyerTrimmed.toLowerCase() === app.account.toLowerCase()) {
+      setError(`Buyer wallet must be different from your connected seller wallet (${app.account}).`);
       setStep(1);
       return;
     }
@@ -72,7 +79,7 @@ export function CreateView() {
       collateralPct: collateral,
       buyerCollateralPct: 10,
       seller: app.account,
-      buyer: buyerAccount.trim(),
+      buyer: buyerTrimmed || undefined,
       reputation: 0,
       tee: true,
       token,
@@ -81,14 +88,17 @@ export function CreateView() {
       createdAt: new Date().toISOString(),
     };
     app.ask({
-      title: "Create Deal on NEAR",
-      body: `Create on-chain deal on NEAR: ${usd(credit)} of ${provider} credit at ${usd(price)} (${ratioOf(price, credit)}) with buyer ${buyerAccount.trim()}. A 0.05 NEAR storage deposit will be attached (excess refunded). Your wallet will now open for approval.`,
-      confirm: "Approve in Wallet",
+      title: buyerTrimmed ? "Create Deal on NEAR" : "Publish Public Listing",
+      body: buyerTrimmed
+        ? `Create direct on-chain deal on NEAR: ${usd(credit)}${token === "NEAR" ? ` (≈ ${(credit / nearPrice).toFixed(4)} NEAR @ $${nearPrice.toFixed(2)}/NEAR)` : ""} of ${provider} credit at ${usd(price)}${token === "NEAR" ? ` (≈ ${(price / nearPrice).toFixed(4)} NEAR)` : ""} (${ratioOf(price, credit)}) with buyer ${buyerTrimmed}. Your wallet will open for approval.`
+        : `Publish ${usd(credit)}${token === "NEAR" ? ` (≈ ${(credit / nearPrice).toFixed(4)} NEAR)` : ""} of ${provider} credit at ${usd(price)}${token === "NEAR" ? ` (≈ ${(price / nearPrice).toFixed(4)} NEAR)` : ""} on the public Marketplace. You will deposit ${token === "NEAR" ? `${(escrow.sellerDeposit / nearPrice).toFixed(4)} NEAR (${usd(escrow.sellerDeposit)})` : `${usd(escrow.sellerDeposit)} ${token}`} only after a buyer funds the deal.`,
+      confirm: buyerTrimmed ? "Approve in Wallet" : "Publish to Market",
       run: async () => {
         const result: any = await app.createListing(listing);
         if (result.ok) {
           if (result.dealId) router.push(`/deals/${result.dealId}`);
-          else router.push("/deals");
+          else if (result.listingId) router.push(`/listings/${result.listingId}`);
+          else router.push("/");
         }
         return result;
       },
@@ -125,7 +135,14 @@ export function CreateView() {
                 ))}
               </div>
             </div>
-            <Field label="Credit amount" hint="USD value of prepaid credit (min $0.10).">
+            <Field
+              label="Credit amount"
+              hint={
+                token === "NEAR"
+                  ? `USD value of prepaid credit (min $0.10). ≈ ${(credit / nearPrice).toFixed(4)} NEAR @ $${nearPrice.toFixed(2)}/NEAR`
+                  : "USD value of prepaid credit (min $0.10)."
+              }
+            >
               <input
                 className={`${fieldClass} tabular text-right`}
                 type="number"
@@ -147,15 +164,14 @@ export function CreateView() {
         ) : null}
         {step === 1 ? (
           <div className="space-y-4">
-            <Field label="Buyer testnet account" hint="Target buyer testnet account (e.g. anastasia-buyer.testnet). Leave blank for public listing.">
-              <input
-                className={fieldClass}
-                placeholder="e.g. anastasia-buyer.testnet"
-                value={buyerAccount}
-                onChange={(event) => setBuyerAccount(event.target.value)}
-              />
-            </Field>
-            <Field label="Price" hint={`Ratio ${ratioOf(price, credit)}.`}>
+            <Field
+              label="Price"
+              hint={
+                token === "NEAR"
+                  ? `Ratio ${ratioOf(price, credit)}. ≈ ${(price / nearPrice).toFixed(4)} NEAR @ $${nearPrice.toFixed(2)}/NEAR`
+                  : `Ratio ${ratioOf(price, credit)}.`
+              }
+            >
               <input
                 className={`${fieldClass} tabular text-right`}
                 type="number"
@@ -177,27 +193,88 @@ export function CreateView() {
               </select>
             </Field>
             <ul className="rounded-md border border-line bg-surface-2 p-3 text-sm">
-              <li className="flex justify-between"><span>Buyer pays</span><span className="tabular">{usd(escrow.buyerDeposit)}</span></li>
-              <li className="mt-1 flex justify-between"><span>You lock</span><span className="tabular">{usd(escrow.sellerDeposit)}</span></li>
-              <li className="mt-1 flex justify-between font-semibold"><span>Total escrow</span><span className="tabular">{usd(escrow.total)}</span></li>
+              <li className="flex justify-between">
+                <span>Buyer pays</span>
+                <span className="tabular">
+                  {usd(escrow.buyerDeposit)}
+                  {token === "NEAR" ? <span className="ml-1 text-xs text-muted">({(escrow.buyerDeposit / nearPrice).toFixed(4)} NEAR)</span> : null}
+                </span>
+              </li>
+              <li className="mt-1 flex justify-between">
+                <span>You lock</span>
+                <span className="tabular">
+                  {usd(escrow.sellerDeposit)}
+                  {token === "NEAR" ? <span className="ml-1 text-xs text-muted">({(escrow.sellerDeposit / nearPrice).toFixed(4)} NEAR)</span> : null}
+                </span>
+              </li>
+              <li className="mt-1 flex justify-between font-semibold">
+                <span>Total escrow</span>
+                <span className="tabular">
+                  {usd(escrow.total)}
+                  {token === "NEAR" ? <span className="ml-1 text-xs text-muted">({(escrow.total / nearPrice).toFixed(4)} NEAR)</span> : null}
+                </span>
+              </li>
+              {token === "NEAR" ? (
+                <li className="mt-2 border-t border-line/60 pt-2 text-[11px] text-mint flex items-center justify-between">
+                  <span>● Live Oracle Feed</span>
+                  <span className="font-mono font-medium">1 NEAR = ${nearPrice.toFixed(2)} USD</span>
+                </li>
+              ) : null}
             </ul>
+            <div className="border-t border-line/60 pt-3">
+              <Field label="Direct counterparty (optional)" hint="Leave blank to list publicly on the Market so ANY buyer can purchase.">
+                <input
+                  className={fieldClass}
+                  placeholder="Optional: leave blank for public marketplace listing"
+                  value={buyerAccount}
+                  onChange={(event) => setBuyerAccount(event.target.value)}
+                />
+              </Field>
+            </div>
           </div>
         ) : null}
         {step === 2 ? (
           <dl className="space-y-3 text-sm">
-            <div className="flex justify-between gap-4"><dt className="text-muted">Credit</dt><dd className="text-right">{provider} · {models.join(", ")} · {usd(credit)}</dd></div>
-            <div className="flex justify-between gap-4"><dt className="text-muted">Price</dt><dd className="tabular">{usd(price)} · {ratioOf(price, credit)}</dd></div>
-            <div className="flex justify-between gap-4"><dt className="text-muted">Collateral</dt><dd className="tabular">{collateral}% · {usd(escrow.sellerDeposit)} {token}</dd></div>
+            <div className="flex justify-between gap-4">
+              <dt className="text-muted">Credit</dt>
+              <dd className="text-right">
+                {provider} · {models.join(", ")} · {usd(credit)}
+                {token === "NEAR" ? <span className="block text-xs text-muted">≈ {(credit / nearPrice).toFixed(4)} NEAR on-chain</span> : null}
+              </dd>
+            </div>
+            <div className="flex justify-between gap-4">
+              <dt className="text-muted">Price</dt>
+              <dd className="tabular">
+                {usd(price)} · {ratioOf(price, credit)}
+                {token === "NEAR" ? <span className="block text-xs text-muted">≈ {(price / nearPrice).toFixed(4)} NEAR</span> : null}
+              </dd>
+            </div>
+            <div className="flex justify-between gap-4">
+              <dt className="text-muted">Collateral</dt>
+              <dd className="tabular">
+                {collateral}% · {token === "NEAR" ? `${(escrow.sellerDeposit / nearPrice).toFixed(4)} NEAR` : `${usd(escrow.sellerDeposit)} ${token}`}
+                {token === "NEAR" ? <span className="block text-xs text-muted">≈ {usd(escrow.sellerDeposit)}</span> : null}
+              </dd>
+            </div>
             <div className="flex justify-between gap-4"><dt className="text-muted">Seller</dt><dd className="font-mono">{app.account}</dd></div>
-            {buyerAccount ? (
-              <div className="flex justify-between gap-4"><dt className="text-muted">Buyer</dt><dd className="font-mono">{buyerAccount}</dd></div>
-            ) : null}
+            <div className="flex justify-between gap-4">
+              <dt className="text-muted">Target</dt>
+              <dd className="font-medium text-mint">
+                {buyerAccount.trim() ? `Direct deal with ${buyerAccount.trim()}` : "Public Market Listing (Any buyer)"}
+              </dd>
+            </div>
           </dl>
         ) : null}
         {error ? <p className="mt-3 text-xs font-medium text-danger">{error}</p> : null}
         <div className="mt-5 flex justify-between">
           <Button variant="ghost" onClick={() => setStep((value) => Math.max(0, value - 1))} disabled={step === 0}>Back</Button>
-          {step < 2 ? <Button onClick={next}>Continue</Button> : <Button onClick={sign} disabled={!app.account}>Sign listing</Button>}
+          {step < 2 ? (
+            <Button onClick={next}>Continue</Button>
+          ) : (
+            <Button onClick={sign} disabled={!app.account}>
+              {buyerAccount.trim() ? "Create deal on NEAR" : "Publish to Market"}
+            </Button>
+          )}
         </div>
       </Card>
     </div>

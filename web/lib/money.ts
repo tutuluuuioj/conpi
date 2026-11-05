@@ -1,5 +1,5 @@
 import { CONFIG } from "./chain";
-import { round2, usd } from "./format";
+import { assetAmount, round2, usd } from "./format";
 import type { Deal, Split, SplitLine } from "./types";
 
 export interface Escrow {
@@ -13,14 +13,20 @@ export interface Escrow {
   remaining: number;
 }
 
+function roundPrecise(n: number): number {
+  if (!n) return 0;
+  if (Math.abs(n) < 1) return Math.round(n * 10000) / 10000;
+  return round2(n);
+}
+
 export function escrowOf(deal: Pick<Deal, "price" | "buyerCollateralPct" | "sellerCollateralPct" | "releasedUsd">): Escrow {
-  const buyerCollateral = round2((deal.price * deal.buyerCollateralPct) / 100);
-  const sellerCollateral = round2((deal.price * deal.sellerCollateralPct) / 100);
-  const buyerDeposit = round2(deal.price + buyerCollateral);
-  const total = round2(buyerDeposit + sellerCollateral);
-  const stageSize = round2(deal.price / 4);
-  const released = round2(deal.releasedUsd);
-  const remaining = round2(Math.max(0, total - released));
+  const buyerCollateral = roundPrecise((deal.price * deal.buyerCollateralPct) / 100);
+  const sellerCollateral = roundPrecise((deal.price * deal.sellerCollateralPct) / 100);
+  const buyerDeposit = roundPrecise(deal.price + buyerCollateral);
+  const total = roundPrecise(buyerDeposit + sellerCollateral);
+  const stageSize = roundPrecise(deal.price / 4);
+  const released = roundPrecise(deal.releasedUsd);
+  const remaining = roundPrecise(Math.max(0, total - released));
   return { buyerCollateral, sellerCollateral, buyerDeposit, sellerDeposit: sellerCollateral, total, stageSize, released, remaining };
 }
 
@@ -35,7 +41,9 @@ export function stageFor(used: number, credit: number) {
 
 export function settleRevoke(deal: Deal): Split {
   const e = escrowOf(deal);
-  const fraction = deal.credit ? deal.usedUsd / deal.credit : 0;
+  const meteredCreditUsd = deal.creditUsd ?? deal.credit;
+  const fraction = meteredCreditUsd ? deal.usedUsd / meteredCreditUsd : 0;
+  const amount = (value: number) => deal.token === "NEAR" ? assetAmount(value, "NEAR") : usd(value);
   const sellerEarned = round2(fraction * deal.price);
   const already = round2(deal.releasedUsd);
   const priceOwed = round2(Math.max(0, sellerEarned - already));
@@ -47,8 +55,8 @@ export function settleRevoke(deal: Deal): Split {
   const sellerTotal = round2(already + toSeller);
   const lines: SplitLine[] = [
     { label: `Stage releases already paid`, amount: already, note: "Included in the seller total", tone: "mint" },
-    { label: "Seller settlement", amount: toSeller, note: `${usd(priceOwed)} usage still owed + ${usd(sellerColBack)} collateral returned`, tone: "mint" },
-    { label: "Buyer settlement", amount: toBuyer, note: `${usd(unused)} unused price + ${usd(e.buyerCollateral)} collateral + ${usd(slashed)} slash`, tone: "blue" },
+    { label: "Seller settlement", amount: toSeller, note: `${amount(priceOwed)} usage still owed + ${amount(sellerColBack)} collateral returned`, tone: "mint" },
+    { label: "Buyer settlement", amount: toBuyer, note: `${amount(unused)} unused price + ${amount(e.buyerCollateral)} collateral + ${amount(slashed)} slash`, tone: "blue" },
     { label: "Seller collateral slashed", amount: slashed, note: `${CONFIG.slashRevokeBps / 100}% of seller collateral, paid to the buyer`, tone: "orange" },
   ];
   return { seller: sellerTotal, buyer: toBuyer, slashed, lines };
@@ -75,12 +83,14 @@ export function cashMoves(split: Split) {
 
 export function outcomeCopy(deal: Deal) {
   const e = escrowOf(deal);
-  const usedPct = deal.credit ? Math.round((deal.usedUsd / deal.credit) * 100) : 0;
+  const amount = (value: number) => deal.token === "NEAR" ? assetAmount(value, "NEAR") : usd(value);
+  const meteredCreditUsd = deal.creditUsd ?? deal.credit;
+  const usedPct = meteredCreditUsd ? Math.round((deal.usedUsd / meteredCreditUsd) * 100) : 0;
   switch (deal.outcome) {
     case "completed":
-      return `Deal completed. ${usd(deal.price)} paid to the seller, collateral returned to both sides.`;
+      return `Deal completed. ${amount(deal.price)} paid to the seller, collateral returned to both sides.`;
     case "revoked":
-      return `The seller's key was revoked at ${usedPct}%. ${CONFIG.slashRevokeBps / 100}% of seller collateral (${usd(deal.split?.slashed ?? 0)}) was slashed.`;
+      return `The seller's key was revoked at ${usedPct}%. ${CONFIG.slashRevokeBps / 100}% of seller collateral (${amount(deal.split?.slashed ?? 0)}) was slashed.`;
     case "quota":
       return "The seller's credit ran out (insufficient_quota). Settled from the last checkpoint.";
     case "provider_ban":
@@ -94,7 +104,7 @@ export function outcomeCopy(deal: Deal) {
     case "deposit_timeout":
       return "The other side did not deposit in time. Your deposit was refunded.";
     default:
-      return `${usd(e.released)} released of ${usd(e.total)} locked.`;
+      return `${amount(e.released)} released of ${amount(e.total)} locked.`;
   }
 }
 

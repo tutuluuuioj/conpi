@@ -4,9 +4,9 @@ import type { Claim, Deal, Listing, Notice, Proposal, Terms } from "./types";
 export const MODELS = [
   "gpt-4o",
   "gpt-4o-mini",
+  "text-embedding-3-small",
   "text-embedding-3-large",
-  "claude-3-5-sonnet",
-  "claude-3-5-haiku",
+  "claude-sonnet-4-6",
   "meta-llama/llama-3-70b",
 ];
 
@@ -16,8 +16,7 @@ const prices = {
     { model: "gpt-4o-mini", input: "$0.15 / 1M", output: "$0.60 / 1M" },
   ],
   anthropic: [
-    { model: "claude-3-5-sonnet", input: "$3.00 / 1M", output: "$15.00 / 1M" },
-    { model: "claude-3-5-haiku", input: "$0.80 / 1M", output: "$4.00 / 1M" },
+    { model: "claude-sonnet-4-6", input: "$3.00 / 1M", output: "$15.00 / 1M" },
   ],
   router: [
     { model: "gpt-4o", input: "$2.50 / 1M", output: "$10.00 / 1M" },

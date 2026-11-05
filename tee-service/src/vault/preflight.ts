@@ -106,6 +106,7 @@ export interface VaultEntry {
   active: boolean;
   registeredAt: string;
   signedPayloads: Array<{ payload: any; signatureHex: string }>;
+  defaultPayload?: { payload: SignedPayloadDto; signatureHex: string };
 }
 
 class KeyVault {

@@ -2,7 +2,7 @@
 
 import Link from "next/link";
 import { ReceiptText } from "lucide-react";
-import { absoluteTime, usd } from "@/lib/format";
+import { absoluteTime, assetAmount, usd } from "@/lib/format";
 import { netFor } from "@/lib/money";
 import { useApp } from "@/lib/store";
 import { Card, EmptyState, StatusBadge } from "./ui";
@@ -31,15 +31,16 @@ export function HistoryView() {
           <tbody>
             {deals.map((deal) => {
               const net = netFor(deal);
+              const amount = (value: number) => deal.token === "NEAR" ? assetAmount(value, "NEAR") : usd(value);
               return (
                 <tr key={deal.id} className="border-t border-line hover:bg-surface-2">
                   <td className="px-4 py-3"><Link className="font-semibold" href={`/history/${deal.id}`}>{deal.id}</Link></td>
                   <td className="px-4 py-3 capitalize">{deal.role}</td>
                   <td className="px-4 py-3">{deal.provider}</td>
-                  <td className="px-4 py-3 text-right tabular">{usd(deal.credit)}</td>
-                  <td className="px-4 py-3 text-right tabular">{usd(deal.price)}</td>
+                  <td className="px-4 py-3 text-right tabular">{amount(deal.credit)}</td>
+                  <td className="px-4 py-3 text-right tabular">{amount(deal.price)}</td>
                   <td className="px-4 py-3"><StatusBadge status={deal.status} /></td>
-                  <td className="px-4 py-3 text-right tabular">{net === null ? "Open" : usd(net)}</td>
+                  <td className="px-4 py-3 text-right tabular">{net === null ? "Open" : amount(net)}</td>
                   <td className="px-4 py-3 text-muted">{absoluteTime(deal.createdAt)}</td>
                 </tr>
               );
@@ -50,12 +51,13 @@ export function HistoryView() {
       <div className="space-y-3 md:hidden">
         {deals.map((deal) => {
           const net = netFor(deal);
+          const amount = (value: number) => deal.token === "NEAR" ? assetAmount(value, "NEAR") : usd(value);
           return (
             <Link key={deal.id} href={`/history/${deal.id}`}>
               <Card>
                 <div className="flex items-center justify-between"><span className="font-semibold">Deal {deal.id}</span><StatusBadge status={deal.status} /></div>
-                <p className="mt-2 text-sm text-muted">{deal.role} · {deal.provider} · {usd(deal.credit)}</p>
-                <p className="mt-1 text-sm tabular">{net === null ? "Open" : `Net ${usd(net)}`}</p>
+                <p className="mt-2 text-sm text-muted">{deal.role} · {deal.provider} · {amount(deal.credit)}</p>
+                <p className="mt-1 text-sm tabular">{net === null ? "Open" : `Net ${amount(net)}`}</p>
               </Card>
             </Link>
           );

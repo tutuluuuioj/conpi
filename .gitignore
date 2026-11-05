@@ -6,6 +6,7 @@ target/
 scratch/
 
 node_modules/
+.pnpm-store/
 .next/
 out/
 build/
@@ -35,3 +36,9 @@ tee/credentials/
 **/.credentials/
 *.sock
 tunnel_url.txt
+
+# Local runtime stores (never commit browser/server session data)
+.deal-keys-store.json
+.listings-store.json
+**/.deal-keys-store.json
+**/.listings-store.json

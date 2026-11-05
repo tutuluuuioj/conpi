@@ -105,6 +105,7 @@ export class MeterEngine {
   }
 
   public emitDefault(entry: VaultEntry, termsHashHex: string, reason: DefaultReason): { payload: SignedPayloadDto; signatureHex: string } {
+    if (entry.defaultPayload) return entry.defaultPayload;
     entry.active = false;
     const usedMicro = BigInt(Math.min(
       Math.round(entry.creditUsd * 1_000_000),
@@ -137,10 +138,12 @@ export class MeterEngine {
     const payloadBytes = serializeSignedPayload(payload);
     const signature = enclaveKeys.sign(payloadBytes);
 
-    return {
+    const signed = {
       payload,
       signatureHex: Buffer.from(signature).toString("hex"),
     };
+    entry.defaultPayload = signed;
+    return signed;
   }
 }
 

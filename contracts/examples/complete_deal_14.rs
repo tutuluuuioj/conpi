@@ -8,7 +8,6 @@ use std::path::Path;
 const ESCROW_ID: &str = "dev-20261103062448-30583839049419.testnet";
 const CVM_BASE_URL: &str = "https://b1b35377079ac7b7937afc607481587bc6d22665-3000.dstack-pha-prod9.phala.network";
 const DEAL_ID: u64 = 14;
-const PROXY_KEY: &str = "cpk_live_96f2b017372be82bcf212f8c241fd389";
 
 #[derive(Deserialize)]
 struct KeyFile {

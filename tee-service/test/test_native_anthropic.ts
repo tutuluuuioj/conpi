@@ -1,3 +1,5 @@
+process.env.NODE_ENV = "test";
+
 import Fastify from "fastify";
 import { keyVault } from "../src/vault/preflight.js";
 import { handleAnthropicMessages } from "../src/proxy/server.js";
@@ -22,7 +24,7 @@ async function runAnthropicTest() {
   const envKey = process.env.ANTHROPIC_API_KEY;
   if (envKey && envKey.startsWith("sk-ant-")) {
     console.log("\n--- TEST CASE A: Real Live Anthropic Key from Environment ---");
-    const model = "claude-3-5-haiku-20241022";
+    const model = process.env.ANTHROPIC_MODEL || "claude-sonnet-4-6";
     const dealId = 9001;
     const termsHash = "22".repeat(32);
 
@@ -30,7 +32,7 @@ async function runAnthropicTest() {
       dealId,
       "anthropic",
       model,
-      [model, "claude-3-5-sonnet-20241022"],
+      [model],
       10.0,
       8.0,
       termsHash,
@@ -67,8 +69,8 @@ async function runAnthropicTest() {
     const probeRes = await keyVault.validateAndInjectKey(
       9002,
       "anthropic",
-      "claude-3-5-haiku-20241022",
-      ["claude-3-5-haiku-20241022"],
+      "claude-sonnet-4-6",
+      ["claude-sonnet-4-6"],
       10.0,
       8.0,
       "33".repeat(32),
@@ -83,7 +85,7 @@ async function runAnthropicTest() {
   console.log("\n--- TEST CASE B: Native Anthropic Protocol & Metering Pipeline ---");
   const testDealId = 9003;
   const testTermsHash = "44".repeat(32);
-  const testModel = "claude-3-5-sonnet-20241022";
+  const testModel = "claude-sonnet-4-6";
 
   const testInject = await keyVault.validateAndInjectKey(
     testDealId,

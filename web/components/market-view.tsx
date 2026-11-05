@@ -18,11 +18,11 @@ function readFilters(params: URLSearchParams) {
     side: params.get("side") === "buy" ? "buy" : "sell",
     providers,
     model: params.get("model") ?? "",
-    creditMin: Number(params.get("cmin") ?? 10),
+    creditMin: Number(params.get("cmin") ?? 0),
     creditMax: Number(params.get("cmax") ?? 1000),
     ratio: Number(params.get("ratio") ?? 1),
     token: params.get("token") ?? "",
-    sort: params.get("sort") ?? "ratio",
+    sort: params.get("sort") ?? "newest",
   };
 }
 
@@ -49,7 +49,7 @@ export function MarketView() {
     if (value.side === "buy") query.set("side", "buy");
     if (value.providers.length) query.set("provider", value.providers.join(","));
     if (value.model) query.set("model", value.model);
-    if (value.creditMin !== 10) query.set("cmin", String(value.creditMin));
+    if (value.creditMin > 0) query.set("cmin", String(value.creditMin));
     if (value.creditMax !== 1000) query.set("cmax", String(value.creditMax));
     if (value.ratio < 1) query.set("ratio", String(value.ratio));
     if (value.token) query.set("token", value.token);
@@ -115,7 +115,7 @@ export function MarketView() {
       </label>
       <div>
         <div className="mb-1 text-[13px] font-medium">Credit size</div>
-        <DualRange min={10} max={1000} step={10} value={[filters.creditMin, filters.creditMax]} onChange={([creditMin, creditMax]) => write({ creditMin, creditMax })} format={(n) => `$${n}`} />
+        <DualRange min={0} max={1000} step={1} value={[filters.creditMin, filters.creditMax]} onChange={([creditMin, creditMax]) => write({ creditMin, creditMax })} format={(n) => `$${n}`} />
       </div>
       <div>
         <div className="mb-1 flex justify-between text-[13px] font-medium"><span>Price ratio</span><span className="tabular">≤ {filters.ratio.toFixed(2)}×</span></div>

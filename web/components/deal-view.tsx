@@ -34,6 +34,30 @@ export function DealView({ id }: { id: string }) {
   const [key, setKey] = useState("");
   const [snippet, setSnippet] = useState<"curl" | "python" | "node">("curl");
   const [report, setReport] = useState("");
+  const [keyHidden, setKeyHidden] = useState<boolean>(false);
+  const [proxyKeyInput, setProxyKeyInput] = useState("");
+
+  useEffect(() => {
+    if (typeof window !== "undefined" && deal?.id) {
+      const isHidden = localStorage.getItem(`conpi:hide_proxy_key_${deal.id}`) === "true";
+      setKeyHidden(isHidden);
+    }
+  }, [deal?.id]);
+
+  const handleCopyAndHide = (keyToCopy: string) => {
+    app.copy(keyToCopy);
+    setKeyHidden(true);
+    if (typeof window !== "undefined" && deal?.id) {
+      localStorage.setItem(`conpi:hide_proxy_key_${deal.id}`, "true");
+    }
+  };
+
+  const handleRevealKey = () => {
+    setKeyHidden(false);
+    if (typeof window !== "undefined" && deal?.id) {
+      localStorage.removeItem(`conpi:hide_proxy_key_${deal.id}`);
+    }
+  };
 
   useEffect(() => {
     if (deal) setView(deal.step);
@@ -55,6 +79,15 @@ export function DealView({ id }: { id: string }) {
     );
   }, [deal?.id, deal?.status, deal?.proxyKey, app.applyMeterEvent, app.setHeartbeat]);
 
+  useEffect(() => {
+    if (!deal || deal.status !== "Active" || !deal.proxyKey) return;
+    app.syncMeterState(deal.id);
+    const interval = setInterval(() => {
+      app.syncMeterState(deal.id);
+    }, 5000);
+    return () => clearInterval(interval);
+  }, [deal?.id, deal?.status, deal?.proxyKey]);
+
   if (!deal) {
     return <EmptyState icon={<ArrowLeftRight className="h-6 w-6" />} title="Deal not found." body="Check the id, or switch back to testnet." action={<Button href="/deals">All deals</Button>} />;
   }
@@ -62,6 +95,17 @@ export function DealView({ id }: { id: string }) {
   const escrow = escrowOf(deal);
   const depositAmount = deal.role === "buyer" ? escrow.buyerDeposit : escrow.sellerDeposit;
   const myDeposited = deal.role === "buyer" ? deal.buyerDeposited : deal.sellerDeposited;
+
+  const isNear = deal.token === "NEAR";
+  const creditUsd = deal.creditUsd ?? (isNear ? deal.credit * 4.02 : deal.credit);
+  const priceUsd = deal.priceUsd ?? (isNear ? deal.price * 4.02 : deal.price);
+  const fmtDeposit = isNear ? `${depositAmount.toFixed(4)} NEAR` : usd(depositAmount);
+  const pctUsed = creditUsd > 0 ? ((deal.usedUsd / creditUsd) * 100).toFixed(2) : "0.00";
+  const tokensText = deal.tokens >= 1_000_000
+    ? `${(deal.tokens / 1_000_000).toFixed(2)}M`
+    : deal.tokens >= 1_000
+      ? `${(deal.tokens / 1_000).toFixed(1)}k`
+      : `${deal.tokens}`;
 
   const submitKey = (event: FormEvent) => {
     event.preventDefault();
@@ -71,12 +115,17 @@ export function DealView({ id }: { id: string }) {
     app.submitSellerKey(deal.id, submittedKey);
   };
 
+  const importProxyKey = async (event: FormEvent) => {
+    event.preventDefault();
+    if (await app.importProxyKey(deal.id, proxyKeyInput)) setProxyKeyInput("");
+  };
+
   const deposit = () => {
     app.ask({
-      title: `Deposit ${usd(depositAmount)} ${deal.token}`,
-      body: deal.token === "NEAR"
-        ? `This locks ${usd(depositAmount)} NEAR until settlement. Gas is paid in NEAR.`
-        : `This locks ${usd(depositAmount)} ${deal.token} with an NEP-141 ft_transfer_call. If the contract is not registered for the token, the wallet will also ask for a storage deposit.`,
+      title: `Deposit ${fmtDeposit}`,
+      body: isNear
+        ? `This locks ${fmtDeposit} until settlement. Gas is paid in NEAR.`
+        : `This locks ${fmtDeposit} with an NEP-141 ft_transfer_call. If the contract is not registered for the token, the wallet will also ask for a storage deposit.`,
       confirm: "Deposit",
       run: () => app.deposit(deal.id),
     });
@@ -99,7 +148,7 @@ export function DealView({ id }: { id: string }) {
     setReport("");
   };
 
-  const shownKey = deal.proxyKey ? maskKey(deal.proxyKey) : "cpk_••••••••";
+  const shownKey = deal.proxyKey ? (keyHidden ? "<YOUR_COPIED_KEY>" : deal.proxyKey) : "cpk_••••••••";
   const snippets = {
     curl: `curl ${deal.baseUrl || BASE_URL}/chat/completions \\\n  -H "Authorization: Bearer ${shownKey}" \\\n  -H "Content-Type: application/json" \\\n  -d '{"model":"${deal.model}","messages":[{"role":"user","content":"Hello"}]}'`,
     python: `from openai import OpenAI\nclient = OpenAI(base_url="${deal.baseUrl || BASE_URL}", api_key="${shownKey}")\nclient.chat.completions.create(model="${deal.model}", messages=[{"role":"user","content":"Hello"}])`,
@@ -107,7 +156,7 @@ export function DealView({ id }: { id: string }) {
   };
 
   const primary = view === "deposit" && !myDeposited
-    ? <Button className="w-full" onClick={deposit}>Deposit {usd(depositAmount)} {deal.token}</Button>
+    ? <Button className="w-full" onClick={deposit}>Deposit {fmtDeposit}</Button>
     : view === "key" && deal.keyStatus !== "verified"
       ? <Button className="w-full" type="submit" form="seller-key">Activate Deal via TEE</Button>
       : view === "negotiate"
@@ -119,7 +168,9 @@ export function DealView({ id }: { id: string }) {
       <div className="flex flex-wrap items-start justify-between gap-3">
         <div>
           <h1 className="text-2xl font-semibold tracking-tight md:text-[32px] md:leading-10">Deal {deal.id}</h1>
-          <p className="mt-1 text-sm text-muted">{deal.provider} {usd(deal.credit)} → {usd(deal.price)} · {ratioOf(deal.price, deal.credit)} · {deal.token}</p>
+          <p className="mt-1 text-sm text-muted">
+            {deal.provider} · {deal.credit} {deal.token} {isNear ? `($${creditUsd.toFixed(4)})` : ""} credit for {deal.price} {deal.token} {isNear ? `($${priceUsd.toFixed(4)})` : ""} · {ratioOf(deal.price, deal.credit)}
+          </p>
         </div>
         <StatusBadge status={deal.status} />
       </div>
@@ -153,19 +204,27 @@ export function DealView({ id }: { id: string }) {
               <p className="mt-2 text-sm text-muted">Token is fixed by the terms. Buyer deposits price plus collateral. Seller deposits collateral.</p>
               <div className="mt-4 grid gap-3 sm:grid-cols-2">
                 <div className="rounded-md border border-line p-3">
-                  <Overline>Buyer · {usd(escrow.buyerDeposit)}</Overline>
+                  <Overline>Buyer · {isNear ? `${escrow.buyerDeposit.toFixed(4)} NEAR` : usd(escrow.buyerDeposit)}</Overline>
                   <p className="mt-2 text-sm font-semibold">{deal.buyerDeposited ? "Deposited" : "Waiting"}</p>
                 </div>
                 <div className="rounded-md border border-line p-3">
-                  <Overline>Seller · {usd(escrow.sellerDeposit)}</Overline>
+                  <Overline>Seller · {isNear ? `${escrow.sellerDeposit.toFixed(4)} NEAR` : usd(escrow.sellerDeposit)}</Overline>
                   <p className="mt-2 text-sm font-semibold">{deal.sellerDeposited ? "Deposited" : "Waiting"}</p>
                 </div>
               </div>
               <p className="mt-4 text-sm">Deposit timeout <Countdown until={deal.depositDeadline} /></p>
               {!myDeposited && deal.step !== "settled" ? (
                 <Button className="mt-4" onClick={deposit}>
-                  {deal.role === "buyer" && !deal.counterpartyAccepted ? `Accept & Deposit ${usd(depositAmount)} ${deal.token}` : `Deposit ${usd(depositAmount)} ${deal.token}`}
+                  Deposit {fmtDeposit}
                 </Button>
+              ) : null}
+              {!deal.counterpartyAccepted && deal.termsHash ? (
+                <div className="mt-4 pt-2 border-t border-line/60">
+                  <p className="text-xs text-muted mb-2">Counterparty confirmation needed on-chain:</p>
+                  <Button variant="secondary" onClick={() => app.acceptDeal(deal.id)}>
+                    Accept Deal Terms on NEAR
+                  </Button>
+                </div>
               ) : null}
             </Card>
           ) : null}
@@ -181,6 +240,11 @@ export function DealView({ id }: { id: string }) {
                   <Button type="submit">Activate Deal via TEE</Button>
                 </form>
               ) : <p className="mt-2 text-sm text-muted">The provider key was verified by the TEE and the deal is activated on NEAR.</p>}
+              {deal.keyStatus === "verified" ? (
+                <div className="mt-4">
+                  <Button onClick={() => setView("live")}>Go to Live Proxy & Usage</Button>
+                </div>
+              ) : null}
               <ul className="mt-4 space-y-2 text-sm">
                 {(deal.keyChecks.length ? deal.keyChecks : [{ label: "Waiting for TEE verification", ok: false }]).map((check) => (
                   <li key={check.label} className="flex items-center gap-2">
@@ -205,8 +269,70 @@ export function DealView({ id }: { id: string }) {
                     </div>
                   </div>
                   <div>
-                    <Overline>API key</Overline>
-                    <div className="mt-1">{deal.proxyKey ? <SecretKey value={deal.proxyKey} revoked={deal.proxyRevoked} onCopy={app.copy} /> : <p className="text-sm text-muted">The proxy key appears after the key check.</p>}</div>
+                    <div className="flex items-center justify-between">
+                      <Overline>API key</Overline>
+                      {deal.proxyKey && keyHidden ? (
+                        <button
+                          type="button"
+                          className="text-xs font-semibold text-brand hover:underline"
+                          onClick={handleRevealKey}
+                        >
+                          Reveal key
+                        </button>
+                      ) : null}
+                    </div>
+                    <div className="mt-1">
+                      {deal.proxyKey ? (
+                        keyHidden ? (
+                          <div className="flex items-center justify-between gap-2 rounded-md border border-line bg-surface-2 px-3 py-2 text-xs">
+                            <div className="flex items-center gap-2 min-w-0">
+                              <span className="inline-block h-2 w-2 shrink-0 rounded-full bg-mint" />
+                              <span className="font-mono text-muted truncate">cpk_live_••••••••••••••••••••••••••••••••</span>
+                            </div>
+                            <span className="shrink-0 rounded bg-surface px-2 py-0.5 text-[11px] font-medium text-mint">
+                              Copied & Hidden from UI
+                            </span>
+                          </div>
+                        ) : (
+                          <div className="space-y-2">
+                            <div className="flex flex-col sm:flex-row items-stretch sm:items-center gap-2">
+                              <div className="flex-1 min-w-0">
+                                <SecretKey
+                                  value={deal.proxyKey}
+                                  revoked={deal.proxyRevoked}
+                                  onCopy={handleCopyAndHide}
+                                />
+                              </div>
+                              <Button
+                                type="button"
+                                className="shrink-0 text-xs py-2 px-3 whitespace-nowrap"
+                                onClick={() => handleCopyAndHide(deal.proxyKey)}
+                              >
+                                Copy & Hide Key
+                              </Button>
+                            </div>
+                            <p className="text-[11px] text-muted">
+                              Clicking copy will copy the key to your clipboard and remove it from the screen for safety.
+                            </p>
+                          </div>
+                        )
+                      ) : (
+                        <form className="space-y-2" onSubmit={importProxyKey}>
+                          <p className="text-sm text-muted">Paste this deal&apos;s TEE-issued buyer key to authenticate the private live meter.</p>
+                          <div className="flex flex-col gap-2 sm:flex-row">
+                            <input
+                              className={`${fieldClass} flex-1 font-mono`}
+                              type="password"
+                              autoComplete="off"
+                              placeholder="cpk_live_…"
+                              value={proxyKeyInput}
+                              onChange={(event) => setProxyKeyInput(event.target.value)}
+                            />
+                            <Button type="submit">Connect meter</Button>
+                          </div>
+                        </form>
+                      )}
+                    </div>
                   </div>
                 </div>
                 <div className="mt-4 flex gap-2 text-sm">
@@ -221,13 +347,35 @@ export function DealView({ id }: { id: string }) {
                   <h2 className="text-lg font-semibold">Usage</h2>
                   <span className="text-xs text-muted">Updated {clockTime(deal.lastUpdate)}</span>
                 </div>
-                <p className="mt-2 text-sm tabular">{usd(deal.usedUsd)} of {usd(deal.credit)} · {(deal.tokens / 1_000_000).toFixed(1)}M tokens</p>
-                <div className="mt-3"><Meter used={deal.usedUsd} credit={deal.credit} stage={deal.stage} pulse={deal.pulseStage} /></div>
-                <StageTicks price={deal.price} stage={deal.stage} pulse={deal.pulseStage} />
-                <p className="mt-3 text-xs text-muted">Next release at {deal.stage >= 100 ? "settlement" : `${deal.stage + 25}% (${usd(deal.price / 4)})`}.</p>
+                <div className="mt-2 flex flex-wrap items-baseline justify-between gap-2">
+                  <p className="text-sm tabular">
+                    <span className="font-semibold text-ink">${deal.usedUsd.toFixed(4)}</span>
+                    {" "}of{" "}
+                    <span className="font-semibold text-ink">${creditUsd.toFixed(4)} USD</span>
+                    {isNear ? (
+                      <span className="ml-1 text-xs text-muted">({deal.credit} NEAR on-chain)</span>
+                    ) : null}
+                    {" "}· {tokensText} tokens
+                  </p>
+                  <span className="text-xs font-semibold tabular text-brand">
+                    {pctUsed}% consumed
+                  </span>
+                </div>
+                <div className="mt-3">
+                  <Meter used={deal.usedUsd} credit={creditUsd} stage={deal.stage} pulse={deal.pulseStage} />
+                </div>
+                <StageTicks price={deal.price} priceUsd={priceUsd} token={deal.token} stage={deal.stage} pulse={deal.pulseStage} />
+                <p className="mt-3 text-xs text-muted">
+                  Next release at {deal.stage >= 100 ? "settlement" : `${deal.stage < 25 ? 25 : deal.stage < 50 ? 50 : deal.stage < 75 ? 75 : 100}% (${(deal.price / 4).toFixed(4)} ${deal.token}${isNear ? ` · $${(priceUsd / 4).toFixed(4)}` : ""})`}.
+                </p>
                 <div className="mt-4 flex flex-wrap gap-2">
                   <Button variant="secondary" onClick={() => app.syncMeterState(deal.id)}>Sync meter</Button>
                   <Button onClick={() => app.releaseStagePayout(deal.id)}>Release stage payout</Button>
+                  {deal.status === "Active" ? (
+                    <Button variant="ghost" className="text-danger" onClick={() => app.triggerDefaultSettlement(deal.id, "InvalidKey")}>
+                      Settle Default & Refund
+                    </Button>
+                  ) : null}
                 </div>
               </Card>
               <Card>

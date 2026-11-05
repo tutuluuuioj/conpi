@@ -3,11 +3,15 @@ export function round2(n: number) {
 }
 
 export function usd(n: number) {
+  if (n !== 0 && Math.abs(n) < 0.05) {
+    return `$${n.toFixed(4)}`;
+  }
   return n.toLocaleString("en-US", { style: "currency", currency: "USD" });
 }
 
 export function assetAmount(n: number, asset: string) {
-  const text = n.toLocaleString("en-US", { minimumFractionDigits: 2, maximumFractionDigits: 2 });
+  const digits = Math.abs(n) < 1 && n !== 0 ? 4 : 2;
+  const text = n.toLocaleString("en-US", { minimumFractionDigits: digits, maximumFractionDigits: digits });
   return `${text} ${asset}`;
 }
 

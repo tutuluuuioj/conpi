@@ -1,7 +1,7 @@
 "use client";
 
 import { CODE_HASH, CONTRACT_ID } from "@/lib/chain";
-import { usd } from "@/lib/format";
+import { assetAmount, usd } from "@/lib/format";
 import { cashMoves, escrowOf } from "@/lib/money";
 import { useApp } from "@/lib/store";
 import { Button, EmptyState } from "./ui";
@@ -16,6 +16,7 @@ export function ReceiptView({ id }: { id: string }) {
   const escrow = escrowOf(deal);
   const locked = (deal.buyerDeposited ? escrow.buyerDeposit : 0) + (deal.sellerDeposited ? escrow.sellerDeposit : 0) || escrow.total;
   const moves = deal.split ? cashMoves(deal.split) : 0;
+  const amount = (value: number) => deal.token === "NEAR" ? assetAmount(value, "NEAR") : usd(value);
   const payload = {
     deal: deal.id,
     buyer: deal.buyer,
@@ -68,28 +69,28 @@ export function ReceiptView({ id }: { id: string }) {
             {deal.split.lines.map((line) => (
               <tr key={line.label} className="border-t border-[#e2e5ec]">
                 <td className="py-2">{line.label}<div className="text-xs text-[#5c6578]">{line.note}</div></td>
-                <td className="py-2 text-right tabular">{usd(line.amount)}</td>
+                <td className="py-2 text-right tabular">{amount(line.amount)}</td>
               </tr>
             ))}
             <tr className="border-t border-[#e2e5ec]">
               <td className="py-2">Seller total<div className="text-xs text-[#5c6578]">Stage releases plus this settlement</div></td>
-              <td className="py-2 text-right tabular">{usd(deal.split.seller)}</td>
+              <td className="py-2 text-right tabular">{amount(deal.split.seller)}</td>
             </tr>
             <tr className="border-t border-[#e2e5ec]">
               <td className="py-2">Buyer total<div className="text-xs text-[#5c6578]">Includes the slashed collateral</div></td>
-              <td className="py-2 text-right tabular">{usd(deal.split.buyer)}</td>
+              <td className="py-2 text-right tabular">{amount(deal.split.buyer)}</td>
             </tr>
             <tr className="border-t border-[#12141A] font-semibold">
               <td className="py-2">Cash moved</td>
-              <td className="py-2 text-right tabular">{usd(moves)}</td>
+              <td className="py-2 text-right tabular">{amount(moves)}</td>
             </tr>
             <tr>
               <td className="py-2">Escrow</td>
-              <td className="py-2 text-right tabular">{usd(locked || escrow.total)}</td>
+              <td className="py-2 text-right tabular">{amount(locked || escrow.total)}</td>
             </tr>
           </tbody>
         </table>
-      ) : <p className="mt-2 text-sm">This deal is still open. Escrow locked: {usd(escrow.total)}.</p>}
+      ) : <p className="mt-2 text-sm">This deal is still open. Escrow locked: {amount(escrow.total)}.</p>}
       {deal.split && Math.abs(moves - (locked || escrow.total)) > 0.02 ? <p className="mt-3 text-sm text-[#b02a30]">The split does not match the escrow. Do not treat this receipt as final.</p> : deal.split ? <p className="mt-3 text-sm">The cash lines sum to the escrow.</p> : null}
       <p className="mt-8 font-mono text-xs text-[#5c6578]">Contract {CONTRACT_ID}<br />Code hash {CODE_HASH}</p>
     </article>

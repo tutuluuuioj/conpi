@@ -9,9 +9,12 @@ import type { Asset, Claim, Deal, DealStatus, DealStep, Listing, Notice, Proposa
 import { teeApi, MeterStreamEvent } from "./tee-api";
 import { encryptApiKeyToEnclave, encryptPayloadToEnclave } from "./crypto";
 import { verifyLiveAttestation } from "./attestation-verifier";
+import { getLiveNearPrice } from "./oracle";
 import {
   OnChainDeal,
   fetchContractDeals,
+  fetchContractDeal,
+  fetchContractDealCreator,
   fetchContractConfig,
   fetchContractStagedProposals,
   fetchContractPendingPayout,
@@ -99,6 +102,7 @@ interface Api {
   releaseStagePayout: (dealId: string) => Promise<SignResult>;
   triggerDefaultSettlement: (dealId: string, reason?: string) => Promise<SignResult>;
   syncMeterState: (dealId: string) => Promise<void>;
+  importProxyKey: (dealId: string, proxyKey: string) => Promise<boolean>;
   applyMeterEvent: (dealId: string, event: MeterStreamEvent) => void;
   setHeartbeat: (dealId: string, heartbeat: "live" | "stale") => void;
   claimOne: (id: string) => Promise<SignResult>;
@@ -119,26 +123,66 @@ interface Api {
 const Ctx = createContext<(State & Api) | null>(null);
 const PUBLISHED_LISTINGS_KEY = "conpi-published-listings-v1";
 
-function dealParamsForListing(listing: Listing, buyer: string, seller: string) {
+function toYoctoNear(nearAmount: number): string {
+  if (!nearAmount || isNaN(nearAmount) || nearAmount <= 0) return "0";
+  // Safe 12-decimal string parsing into 24-decimal yocto to prevent IEEE 754 precision loss
+  const fixed = nearAmount.toFixed(12);
+  const [whole, dec = ""] = fixed.split(".");
+  const wholePart = BigInt(whole) * BigInt("1000000000000000000000000");
+  const decPart = BigInt(dec.padEnd(24, "0").slice(0, 24));
+  return (wholePart + decPart).toString();
+}
+
+function toMicroUnits(tokenAmount: number): string {
+  if (!tokenAmount || isNaN(tokenAmount) || tokenAmount <= 0) return "0";
+  return BigInt(Math.round(tokenAmount * 1e6)).toString();
+}
+
+async function dealParamsForListing(listing: Listing, buyer: string, seller: string, liveNearPrice?: number) {
   if (buyer.trim().toLowerCase() === seller.trim().toLowerCase()) {
     throw new Error("Buyer and seller must use different NEAR accounts");
   }
 
   let tokenContract: string | null = null;
-  if (listing.token !== "NEAR") {
+  const isNear = (listing.token === null || listing.token === "NEAR");
+  if (!isNear) {
     tokenContract = listing.tokenContract || (listing.token.includes(".") ? listing.token : null);
     if (!tokenContract) throw new Error(`A valid NEP-141 token contract ID is required for ${listing.token}`);
   }
 
-  const toYocto = (amount: number) => (BigInt(Math.round(amount * 1e6)) * BigInt(1e18)).toString();
+  let priceUnits: string;
+  let creditUnits: string;
+  let buyerCollateralUnits: string;
+  let sellerCollateralUnits: string;
+
+  if (isNear) {
+    const nearPrice = (liveNearPrice && liveNearPrice > 0) ? liveNearPrice : await getLiveNearPrice();
+    // Precise Live Oracle Conversion: USD -> NEAR
+    // listing.price and listing.credit are entered in USD
+    const priceNear = listing.price / nearPrice;
+    const creditNear = listing.credit / nearPrice;
+    const buyerCollateralNear = (listing.price * (listing.buyerCollateralPct / 100)) / nearPrice;
+    const sellerCollateralNear = (listing.price * (listing.collateralPct / 100)) / nearPrice;
+
+    priceUnits = toYoctoNear(priceNear);
+    creditUnits = toYoctoNear(creditNear);
+    buyerCollateralUnits = toYoctoNear(buyerCollateralNear);
+    sellerCollateralUnits = toYoctoNear(sellerCollateralNear);
+  } else {
+    priceUnits = toMicroUnits(listing.price);
+    creditUnits = toMicroUnits(listing.credit);
+    buyerCollateralUnits = toMicroUnits(listing.price * (listing.buyerCollateralPct / 100));
+    sellerCollateralUnits = toMicroUnits(listing.price * (listing.collateralPct / 100));
+  }
+
   return {
     buyer,
     seller,
     token: tokenContract,
-    price: toYocto(listing.price),
-    credit_amount: toYocto(listing.credit),
-    buyer_collateral: toYocto(listing.price * (listing.buyerCollateralPct / 100)),
-    seller_collateral: toYocto(listing.price * (listing.collateralPct / 100)),
+    price: priceUnits,
+    credit_amount: creditUnits,
+    buyer_collateral: buyerCollateralUnits,
+    seller_collateral: sellerCollateralUnits,
     tee_pubkey: TEE_SIGNER_PUBLIC_KEY,
     deposit_duration_sec: 172800,
     key_duration_sec: 172800,
@@ -345,13 +389,69 @@ export function Providers({ children }: { children: React.ReactNode }) {
   // 2. Fetch live data from contract
   const loadOnChainData = async () => {
     try {
-      const [onChainDeals, stagedProposals] = await Promise.all([
+      const [onChainDeals, stagedProposals, liveNearPrice] = await Promise.all([
         fetchContractDeals(0, 100),
         fetchContractStagedProposals(),
+        getLiveNearPrice().catch(() => 4.02),
       ]);
 
+      // Proxy credentials remain in this browser only; never expose them from a shared server route.
+      const storedKeys: Record<string, string> = {};
+      if (typeof window !== "undefined") {
+        try {
+          const raw = localStorage.getItem("conpi:deal_keys");
+          if (raw) Object.assign(storedKeys, JSON.parse(raw));
+        } catch {}
+      }
+
+      // For any deal in Active status, fetch live TEE meter!
+      const activeDeals = onChainDeals.filter((d) => String(d.status) === "Active");
+      const meterMap = new Map<number, any>();
+      await Promise.all(
+        activeDeals.map(async (d) => {
+          const proxyKey = storedKeys[String(d.id)] || stateRef.current.deals.find((item) => item.id === String(d.id))?.proxyKey;
+          if (!proxyKey) return;
+          try {
+            const res = await fetch(`${BASE_URL}/deals/${d.id}/meter`, {
+              headers: { Authorization: `Bearer ${proxyKey}` },
+              cache: "no-store",
+            });
+            if (res.ok) {
+              const data = await res.json();
+              meterMap.set(Number(d.id), data);
+            }
+          } catch {}
+        })
+      );
+
       const currentAccount = stateRef.current.account;
-      const mappedDeals = onChainDeals.map((d) => mapOnChainDeal(d, currentAccount));
+      const mappedDeals = onChainDeals.map((d) => {
+        const mapped = mapOnChainDeal(d, currentAccount);
+        const existing = stateRef.current.deals.find((item) => item.id === String(d.id));
+        const resolvedProxyKey = existing?.proxyKey || storedKeys[String(d.id)] || "";
+        const liveMeter = meterMap.get(Number(d.id));
+
+        const creditUsd = Number(liveMeter?.creditUsd) || existing?.creditUsd || (mapped.token === "NEAR" ? mapped.credit * liveNearPrice : mapped.credit);
+        const priceUsd = Number(liveMeter?.priceUsd) || existing?.priceUsd || (mapped.token === "NEAR" ? mapped.price * liveNearPrice : mapped.price);
+        const usedUsd = Number(liveMeter?.usedUsd ?? existing?.usedUsd ?? mapped.usedUsd);
+        const tokens = Number(liveMeter?.tokensTotal ?? existing?.tokens ?? mapped.tokens);
+        const stage = creditUsd > 0 ? Math.min(100, Math.floor((usedUsd / creditUsd) * 100)) : mapped.stage;
+        const lastUpdate = liveMeter?.timestamp
+          ? `TEE Enclave (${new Date(liveMeter.timestamp).toLocaleTimeString()})`
+          : existing?.lastUpdate || mapped.lastUpdate;
+
+        return {
+          ...mapped,
+          proxyKey: resolvedProxyKey,
+          usedUsd,
+          tokens,
+          creditUsd,
+          priceUsd,
+          stage,
+          lastUpdate,
+          heartbeat: liveMeter?.active ? "live" : mapped.heartbeat,
+        };
+      });
 
       // Generate listings from models and active offers
       const generatedListings: Listing[] = onChainDeals.map((d, index) => ({
@@ -476,18 +576,34 @@ export function Providers({ children }: { children: React.ReactNode }) {
   }, [state.account]);
 
   useEffect(() => {
-    try {
-      const saved = JSON.parse(localStorage.getItem(PUBLISHED_LISTINGS_KEY) || "[]");
-      if (!Array.isArray(saved)) return;
-      const published = saved.filter((listing: any) => listing?.published && typeof listing?.id === "string");
-      setState((s) => {
-        const known = new Set(s.listings.map((listing) => listing.id));
-        return { ...s, listings: [...published.filter((listing: Listing) => !known.has(listing.id)), ...s.listings] };
-      });
-    } catch {
-      localStorage.removeItem(PUBLISHED_LISTINGS_KEY);
-    }
-  }, []);
+    const loadSharedListings = async () => {
+      try {
+        const saved = JSON.parse(localStorage.getItem(PUBLISHED_LISTINGS_KEY) || "[]");
+        const localPub = Array.isArray(saved) ? saved.filter((listing: any) => listing?.published && typeof listing?.id === "string") : [];
+
+        let serverPub: any[] = [];
+        try {
+          const res = await fetch("/api/listings");
+          if (res.ok) {
+            const data = await res.json();
+            if (data.ok && Array.isArray(data.listings)) serverPub = data.listings;
+          }
+        } catch {}
+
+        const allPub = [...localPub, ...serverPub];
+        if (allPub.length > 0) {
+          setState((s) => {
+            const known = new Set(s.listings.map((listing) => listing.id));
+            const unique = allPub.filter((listing: Listing) => !known.has(listing.id));
+            return { ...s, listings: [...unique, ...s.listings] };
+          });
+        }
+      } catch {
+        localStorage.removeItem(PUBLISHED_LISTINGS_KEY);
+      }
+    };
+    loadSharedListings();
+  }, [state.account]);
 
   // Theme handling
   useEffect(() => {
@@ -635,7 +751,7 @@ export function Providers({ children }: { children: React.ReactNode }) {
         let id: string;
         let txHash = "";
         try {
-          const params = dealParamsForListing(listing, buyer, seller);
+          const params = await dealParamsForListing(listing, buyer, seller);
           const beforeDeals = await fetchContractDeals(0, 100);
           const previousMaxId = Math.max(0, ...beforeDeals.map((item) => Number(item.id) || 0));
           outcome = await txCreateDeal(params);
@@ -827,19 +943,48 @@ export function Providers({ children }: { children: React.ReactNode }) {
 
         try {
           if (deal.token === "NEAR") {
-            const yocto = BigInt(Math.round(amount * 1e6)) * BigInt(1e18);
+            let yocto: string;
+            const onChain = await fetchContractDeal(Number(dealId));
+            if (onChain) {
+              if (isBuyer) {
+                const req = BigInt(onChain.price) + BigInt(onChain.buyer_collateral);
+                const cur = BigInt(onChain.buyer_deposited || 0);
+                yocto = (req > cur ? req - cur : BigInt(0)).toString();
+              } else {
+                const req = BigInt(onChain.seller_collateral);
+                const cur = BigInt(onChain.seller_deposited || 0);
+                yocto = (req > cur ? req - cur : BigInt(0)).toString();
+              }
+            } else {
+              const livePrice = (await getLiveNearPrice().catch(() => 4.02)) || 4.02;
+              const priceNear = deal.price / livePrice;
+              const priceYocto = BigInt(toYoctoNear(priceNear));
+              if (isBuyer) {
+                const col = (priceYocto * BigInt(deal.buyerCollateralPct)) / BigInt(100);
+                yocto = (priceYocto + col).toString();
+              } else {
+                yocto = ((priceYocto * BigInt(deal.sellerCollateralPct)) / BigInt(100)).toString();
+              }
+            }
+            const exactNearAmount = (Number(BigInt(yocto) / BigInt(1e15)) / 1e9).toString();
+            const creator = await fetchContractDealCreator(Number(dealId));
+            const currentAccount = stateRef.current.account;
+            const isCounterparty = creator && currentAccount
+              ? creator.trim().toLowerCase() !== currentAccount.trim().toLowerCase()
+              : false;
+
             let outcome: any;
-            if (isBuyer && !deal.counterpartyAccepted && deal.termsHash) {
+            if (isCounterparty && !deal.counterpartyAccepted && deal.termsHash) {
               const cleanHex = deal.termsHash.replace(/^0x/, "");
               const hashBytes = Array.from(Buffer.from(cleanHex, "hex"));
               try {
-                outcome = await txAcceptAndDepositNear(Number(dealId), hashBytes, yocto.toString());
+                outcome = await txAcceptAndDepositNear(Number(dealId), hashBytes, yocto);
               } catch {
                 await txAcceptDeal(Number(dealId), hashBytes);
-                outcome = await txDepositNear(Number(dealId), yocto.toString());
+                outcome = await txDepositNear(Number(dealId), yocto);
               }
             } else {
-              outcome = await txDepositNear(Number(dealId), yocto.toString());
+              outcome = await txDepositNear(Number(dealId), yocto);
             }
             const txHash = outcome?.transaction?.hash || outcome?.transaction_outcome?.id;
             if (!txHash) throw new Error("Deposit transaction was not confirmed");
@@ -850,10 +995,10 @@ export function Providers({ children }: { children: React.ReactNode }) {
               sellerDeposited: !isBuyer ? true : item.sellerDeposited,
               step: "key",
               status: "Funded",
-              activity: [{ id: crypto.randomUUID(), title: "Escrow deposited", detail: `${amount} NEAR locked on-chain.`, tx: txHash, time: "Now" }, ...item.activity],
+              activity: [{ id: crypto.randomUUID(), title: "Escrow deposited", detail: `${exactNearAmount} NEAR locked on-chain.`, tx: txHash, time: "Now" }, ...item.activity],
             }));
             setTimeout(loadOnChainData, 2000);
-            return { ok: true, title: "Deposit confirmed on NEAR", body: `${amount} NEAR locked in escrow.`, href: `https://testnet.nearblocks.io/txns/${txHash}` };
+            return { ok: true, title: "Deposit confirmed on NEAR", body: `${exactNearAmount} NEAR locked in escrow.`, href: `https://testnet.nearblocks.io/txns/${txHash}` };
           } else {
             const tokenContract = (deal as any).tokenContract || (deal.token && deal.token.includes(".") ? deal.token : null);
             if (!tokenContract) throw new Error(`FT token contract address required for token: ${deal.token}`);
@@ -879,12 +1024,42 @@ export function Providers({ children }: { children: React.ReactNode }) {
         pushToast({ kind: "pending", title: "Validating key in TEE Enclave..." });
 
         try {
+          let provider = (deal.provider || "OpenAI").toLowerCase();
+          let model = deal.model || "gpt-4o";
+          let models = deal.models || ["gpt-4o", "gpt-4o-mini"];
+
+          if (plainApiKey.startsWith("sk-or-v1-") || plainApiKey.startsWith("sk-or-")) {
+            provider = "openrouter";
+            model = "meta-llama/llama-3.2-1b-instruct";
+            models = ["meta-llama/llama-3.2-1b-instruct"];
+          } else if (plainApiKey.startsWith("sk-ant-")) {
+            provider = "anthropic";
+            model = "claude-sonnet-4-6";
+            models = ["claude-sonnet-4-6"];
+          } else if (plainApiKey.startsWith("sk-rp-")) {
+            provider = "redpill";
+          }
+
+          // If counterparty hasn't accepted yet on-chain, accept first to transition deal to Funded
+          const onChain = await fetchContractDeal(Number(dealId));
+          if (onChain && !onChain.counterparty_accepted && deal.termsHash) {
+            pushToast({ kind: "pending", title: "Accepting deal on NEAR to fund escrow..." });
+            const cleanHex = deal.termsHash.replace(/^0x/, "");
+            const hashBytes = Array.from(Buffer.from(cleanHex, "hex"));
+            try {
+              await txAcceptDeal(Number(dealId), hashBytes);
+              await new Promise((r) => setTimeout(r, 1500));
+            } catch (err: any) {
+              console.warn("Auto-accept failed, proceeding:", err);
+            }
+          }
+
           const enclaveKey = await getVerifiedEncryptionKey();
           const encryptedEnvelope = encryptApiKeyToEnclave(plainApiKey, enclaveKey);
           const res = await teeApi.submitKey(Number(dealId), {
-            provider: deal.provider.toLowerCase(),
-            model: deal.model,
-            models: deal.models,
+            provider,
+            model,
+            models,
             creditUsd: deal.credit,
             priceUsd: deal.price,
             termsHashHex: deal.termsHash ? deal.termsHash.replace(/^0x/, "") : "00".repeat(32),
@@ -906,6 +1081,17 @@ export function Providers({ children }: { children: React.ReactNode }) {
           const txHash = outcome?.transaction?.hash || outcome?.transaction_outcome?.id;
           if (!txHash) {
             throw new Error("Activation transaction was rejected or failed on-chain");
+          }
+
+          if (res.proxyKey) {
+            if (typeof window !== "undefined") {
+              try {
+                const raw = localStorage.getItem("conpi:deal_keys");
+                const parsed = raw ? JSON.parse(raw) : {};
+                parsed[String(dealId)] = res.proxyKey;
+                localStorage.setItem("conpi:deal_keys", JSON.stringify(parsed));
+              } catch {}
+            }
           }
 
           patchDeal(dealId, (item) => ({
@@ -947,12 +1133,19 @@ export function Providers({ children }: { children: React.ReactNode }) {
           if (stagePayloads.length === 0) {
             const mRes = await fetch(`${BASE_URL}/deals/${dealId}/meter`);
             const mData = mRes.ok ? await mRes.json() : null;
-            const used = mData?.usedUsd ?? deal.usedUsd;
-            const pct = deal.credit > 0 ? Math.round((used / deal.credit) * 100) : 0;
+            const used = Number(mData?.usedUsd ?? deal.usedUsd ?? 0);
+            const creditUsd = Number(mData?.creditUsd || deal.creditUsd || (deal.token === "NEAR" ? deal.credit * 4.02 : deal.credit));
+            const pct = creditUsd > 0 ? ((used / creditUsd) * 100).toFixed(1) : "0.0";
+            const target25 = (creditUsd * 0.25).toFixed(4);
+            pushToast({
+              kind: "error",
+              title: "Stage 25% payout not ready",
+              body: `Current usage is $${used.toFixed(4)} (${pct}%). The TEE hardware signs the 25% release payload once usage reaches 25% ($${target25} USD).`,
+            });
             return {
               ok: false,
               title: "No new stage payload available yet",
-              body: `Current usage is $${used.toFixed(2)} (${pct}%). The TEE signs a stage release payload once usage reaches 25%, 50%, 75%, or 100%.`,
+              body: `Current usage is $${used.toFixed(4)} (${pct}%). The TEE signs a stage release payload once usage reaches 25%, 50%, 75%, or 100%.`,
             };
           }
 
@@ -965,6 +1158,12 @@ export function Providers({ children }: { children: React.ReactNode }) {
           if (!txHash) throw new Error("Stage release transaction failed");
 
           setTimeout(loadOnChainData, 2000);
+          pushToast({
+            kind: "success",
+            title: `Stage ${stg}% released on NEAR!`,
+            body: `Stage payout executed on escrow contract.`,
+            href: `https://testnet.nearblocks.io/txns/${txHash}`,
+          });
           return {
             ok: true,
             title: `Stage ${stg}% released on NEAR!`,
@@ -972,35 +1171,57 @@ export function Providers({ children }: { children: React.ReactNode }) {
             href: `https://testnet.nearblocks.io/txns/${txHash}`,
           };
         } catch (err: any) {
+          pushToast({ kind: "error", title: "Stage release failed", body: err.message });
           return { ok: false, title: "Stage release failed", body: err.message };
         }
       },
       triggerDefaultSettlement: async (dealId, reason = "SellerSelfDrain") => {
         const deal = stateRef.current.deals.find((item) => item.id === dealId);
         if (!deal) return { ok: false, title: "Deal not found" };
-        pushToast({ kind: "pending", title: "Requesting signed default payload from TEE..." });
+        pushToast({ kind: "pending", title: "Checking signed default payload from TEE..." });
 
         try {
-          const res = await fetch(`${BASE_URL}/deals/${dealId}/default`, {
-            method: "POST",
-            headers: { "Content-Type": "application/json" },
-            body: JSON.stringify({ reason }),
-          });
+          let payloadToSubmit: any = null;
+          let signatureHexToSubmit: string | null = null;
 
-          if (!res.ok) {
-            throw new Error(`Failed to get default payload from TEE: ${res.statusText}`);
+          // 1. Check if TEE enclave already emitted a signed default payload (kind === 4)
+          try {
+            const payloadsRes = await fetch(`${BASE_URL}/deals/${dealId}/payloads`);
+            if (payloadsRes.ok) {
+              const data = await payloadsRes.json();
+              const found = (data.signedPayloads || []).find((item: any) => item.payload.kind === 4);
+              if (found) {
+                payloadToSubmit = found.payload;
+                signatureHexToSubmit = found.signatureHex;
+              }
+            }
+          } catch {}
+
+          // 2. If not found, request the default payload from TEE
+          if (!payloadToSubmit || !signatureHexToSubmit) {
+            const res = await fetch(`${BASE_URL}/deals/${dealId}/default`, {
+              method: "POST",
+              headers: { "Content-Type": "application/json" },
+              body: JSON.stringify({ reason }),
+            });
+            if (res.ok) {
+              const data = await res.json();
+              if (data.defaultPayload) {
+                payloadToSubmit = data.defaultPayload.payload;
+                signatureHexToSubmit = data.defaultPayload.signatureHex;
+              }
+            }
           }
 
-          const data = await res.json();
-          if (!data.defaultPayload) {
-            throw new Error("No default payload returned by TEE");
+          if (!payloadToSubmit || !signatureHexToSubmit) {
+            throw new Error("No signed default payload returned by TEE enclave");
           }
 
           pushToast({ kind: "pending", title: "Submitting default settlement on NEAR..." });
           const outcome: any = await txSettleDefault(
             Number(dealId),
-            data.defaultPayload.payload,
-            data.defaultPayload.signatureHex
+            payloadToSubmit,
+            signatureHexToSubmit
           );
           const txHash = outcome?.transaction?.hash || outcome?.transaction_outcome?.id;
           if (!txHash) throw new Error("Default settlement transaction failed");
@@ -1017,33 +1238,85 @@ export function Providers({ children }: { children: React.ReactNode }) {
         }
       },
       syncMeterState: async (dealId) => {
+        const deal = stateRef.current.deals.find((item) => item.id === dealId);
+        if (!deal?.proxyKey) {
+          pushToast({ kind: "error", title: "Proxy key required", body: "Import or copy this deal's cpk_live_ key to view its private meter." });
+          return;
+        }
         try {
-          const res = await fetch(`${BASE_URL}/deals/${dealId}/meter`);
+          const res = await fetch(`${BASE_URL}/deals/${dealId}/meter`, {
+            headers: { Authorization: `Bearer ${deal.proxyKey}` },
+            cache: "no-store",
+          });
           if (res.ok) {
             const data = await res.json();
-            patchDeal(dealId, (item) => ({
-              ...item,
-              usedUsd: data.usedUsd ?? item.usedUsd,
-              tokens: data.tokensTotal ?? item.tokens,
-              stage: item.credit > 0 ? Math.min(100, Math.floor(((data.usedUsd ?? item.usedUsd) / item.credit) * 100)) : item.stage,
-              lastUpdate: new Date().toLocaleTimeString(),
-            }));
-            pushToast({ kind: "success", title: "Meter synced with TEE enclave" });
+            patchDeal(dealId, (item) => {
+              const creditUsd = Number(data.creditUsd) || item.creditUsd || (item.token === "NEAR" ? item.credit * 4.02 : item.credit);
+              const priceUsd = Number(data.priceUsd) || item.priceUsd || (item.token === "NEAR" ? item.price * 4.02 : item.price);
+              const usedUsd = Number(data.usedUsd ?? item.usedUsd);
+              const tokens = Number(data.tokensTotal ?? item.tokens);
+              const stage = creditUsd > 0 ? Math.min(100, Math.floor((usedUsd / creditUsd) * 100)) : item.stage;
+              return {
+                ...item,
+                usedUsd,
+                tokens,
+                creditUsd,
+                priceUsd,
+                stage,
+                lastUpdate: `TEE Enclave (${new Date().toLocaleTimeString()})`,
+                heartbeat: data.active ? "live" : item.heartbeat,
+              };
+            });
+            pushToast({
+              kind: "success",
+              title: "Meter synced with TEE enclave",
+              body: `$${Number(data.usedUsd || 0).toFixed(4)} USD · ${Number(data.tokensTotal || 0).toLocaleString()} tokens`,
+            });
+          } else {
+            pushToast({ kind: "error", title: "Failed to sync meter", body: `Enclave returned HTTP ${res.status}` });
           }
         } catch (err: any) {
           console.warn("Meter sync error:", err);
+          pushToast({ kind: "error", title: "Meter sync failed", body: err.message });
+        }
+      },
+      importProxyKey: async (dealId, candidate) => {
+        const proxyKey = candidate.trim();
+        if (!/^cpk_live_[A-Za-z0-9_-]{16,}$/.test(proxyKey)) {
+          pushToast({ kind: "error", title: "Invalid proxy key", body: "Paste the cpk_live_ key issued by the TEE for this deal." });
+          return false;
+        }
+        try {
+          await teeApi.getMeter(Number(dealId), proxyKey);
+          const raw = localStorage.getItem("conpi:deal_keys");
+          const stored = raw ? JSON.parse(raw) : {};
+          stored[String(dealId)] = proxyKey;
+          localStorage.setItem("conpi:deal_keys", JSON.stringify(stored));
+          patchDeal(dealId, (deal) => ({ ...deal, proxyKey, heartbeat: "live" }));
+          pushToast({ kind: "success", title: "Private live meter connected", body: "Authenticated WebSocket updates are now enabled for this browser." });
+          return true;
+        } catch (err: any) {
+          pushToast({ kind: "error", title: "Proxy key rejected", body: err.message });
+          return false;
         }
       },
       applyMeterEvent: (dealId, event) => {
-        patchDeal(dealId, (deal) => ({
-          ...deal,
-          usedUsd: event.usedUsd,
-          tokens: event.tokensTotal,
-          stage: Math.max(deal.stage, ...event.stages, Math.min(100, Math.floor(event.percent))),
-          heartbeat: event.active ? "live" : deal.heartbeat,
-          pulseStage: event.stages.length ? event.stages[event.stages.length - 1] : deal.pulseStage,
-          lastUpdate: new Date(event.timestamp).toLocaleTimeString(),
-        }));
+        patchDeal(dealId, (deal) => {
+          const creditUsd = Number(event.creditUsd) || deal.creditUsd || (deal.token === "NEAR" ? deal.credit * 4.02 : deal.credit);
+          const priceUsd = Number(event.priceUsd) || deal.priceUsd || (deal.token === "NEAR" ? deal.price * 4.02 : deal.price);
+          const stage = creditUsd > 0 ? Math.max(deal.stage, ...event.stages, Math.min(100, Math.floor((event.usedUsd / creditUsd) * 100))) : deal.stage;
+          return {
+            ...deal,
+            usedUsd: event.usedUsd,
+            tokens: event.tokensTotal,
+            creditUsd,
+            priceUsd,
+            stage,
+            heartbeat: event.active ? "live" : deal.heartbeat,
+            pulseStage: event.stages.length ? event.stages[event.stages.length - 1] : deal.pulseStage,
+            lastUpdate: `TEE Enclave (${new Date(event.timestamp).toLocaleTimeString()})`,
+          };
+        });
       },
       setHeartbeat: (dealId, heartbeat) => patchDeal(dealId, (deal) => ({ ...deal, heartbeat })),
       claimOne: async (id) => {
@@ -1086,45 +1359,63 @@ export function Providers({ children }: { children: React.ReactNode }) {
         }
 
         const buyer = (listing as any).buyer?.trim();
-        if (!buyer) {
-          return {
-            ok: false,
-            title: "Buyer wallet required",
-            body: "Please enter your buyer testnet wallet (e.g. anastasia-buyer.testnet) in Step 2.",
-          };
-        }
-        if (buyer.toLowerCase() === current.account.toLowerCase()) {
-          return {
-            ok: false,
-            title: "Buyer and seller must differ",
-            body: "You cannot create a deal with yourself. Please enter your second testnet wallet for the Buyer.",
-          };
-        }
-
-        pushToast({ kind: "pending", title: "Awaiting wallet approval to create deal..." });
-        try {
-          const params = dealParamsForListing(listing, buyer, current.account);
-          const outcome: any = await txCreateDeal(params);
-          const txHash = outcome?.transaction?.hash || outcome?.transaction_outcome?.id;
-          let dealId = createdDealIdFromOutcome(outcome);
-          if (!dealId) {
-            await new Promise((r) => setTimeout(r, 1500));
-            const deals = await fetchContractDeals(0, 100);
-            const latest = deals.filter((d) => d.buyer === buyer && d.seller === current.account).sort((a, b) => Number(b.id) - Number(a.id))[0];
-            if (latest) dealId = Number(latest.id);
+        // If buyer is explicitly provided and different from seller, create direct deal on-chain
+        if (buyer) {
+          if (buyer.toLowerCase() === current.account.toLowerCase()) {
+            return {
+              ok: false,
+              title: "Buyer and seller must differ",
+              body: "You cannot create a deal with yourself. Please enter your second testnet wallet for the Buyer, or leave blank to publish publicly.",
+            };
           }
 
-          setTimeout(loadOnChainData, 2000);
-          return {
-            ok: true,
-            title: "Deal created on NEAR!",
-            body: dealId ? `Deal #${dealId} created on-chain.` : "Deal registered on escrow contract.",
-            href: txHash ? `https://testnet.nearblocks.io/txns/${txHash}` : undefined,
-            dealId: dealId ? String(dealId) : undefined,
-          } as any;
-        } catch (err: any) {
-          return { ok: false, title: "Create deal transaction rejected or failed", body: err.message };
+          pushToast({ kind: "pending", title: "Awaiting wallet approval to create deal on NEAR..." });
+          try {
+            const params = await dealParamsForListing(listing, buyer, current.account);
+            const outcome: any = await txCreateDeal(params);
+            const txHash = outcome?.transaction?.hash || outcome?.transaction_outcome?.id;
+            let dealId = createdDealIdFromOutcome(outcome);
+            if (!dealId) {
+              await new Promise((r) => setTimeout(r, 1500));
+              const deals = await fetchContractDeals(0, 100);
+              const latest = deals.filter((d) => d.buyer === buyer && d.seller === current.account).sort((a, b) => Number(b.id) - Number(a.id))[0];
+              if (latest) dealId = Number(latest.id);
+            }
+
+            setTimeout(loadOnChainData, 2000);
+            return {
+              ok: true,
+              title: "Deal created on NEAR!",
+              body: dealId ? `Deal #${dealId} created on-chain.` : "Deal registered on escrow contract.",
+              href: txHash ? `https://testnet.nearblocks.io/txns/${txHash}` : undefined,
+              dealId: dealId ? String(dealId) : undefined,
+            } as any;
+          } catch (err: any) {
+            return { ok: false, title: "Create deal transaction rejected or failed", body: err.message };
+          }
         }
+
+        // Public marketplace listing - NO specific buyer needed!
+        const publishedListing: Listing = { ...listing, seller: current.account, published: true };
+        setState((s) => ({ ...s, listings: [publishedListing, ...s.listings.filter((item) => item.id !== listing.id)] }));
+        try {
+          const saved = JSON.parse(localStorage.getItem(PUBLISHED_LISTINGS_KEY) || "[]");
+          const existing = Array.isArray(saved) ? saved.filter((item: Listing) => item.id !== listing.id) : [];
+          localStorage.setItem(PUBLISHED_LISTINGS_KEY, JSON.stringify([publishedListing, ...existing]));
+          fetch("/api/listings", {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify(publishedListing),
+          }).catch(() => {});
+        } catch {
+          localStorage.setItem(PUBLISHED_LISTINGS_KEY, JSON.stringify([publishedListing]));
+        }
+        return {
+          ok: true,
+          title: "Listing published to Market!",
+          body: `Your offer for $${listing.credit} credit is now live on the Market. Switch to your buyer wallet to Quick Buy.`,
+          listingId: publishedListing.id,
+        } as any;
       },
       cancelMyListings: () => {
         const account = stateRef.current.account;

@@ -20,6 +20,7 @@ export const PRICING_TABLE: LockedPricingTable = Object.freeze({
   "claude-3-5-sonnet-20241022": Object.freeze({ inputPerMillion: 3, outputPerMillion: 15, cachedInputPerMillion: 0.3 }),
   "claude-3-5-haiku": Object.freeze({ inputPerMillion: 0.8, outputPerMillion: 4, cachedInputPerMillion: 0.08 }),
   "claude-3-5-haiku-20241022": Object.freeze({ inputPerMillion: 0.8, outputPerMillion: 4, cachedInputPerMillion: 0.08 }),
+  "claude-sonnet-4-6": Object.freeze({ inputPerMillion: 3, outputPerMillion: 15, cachedInputPerMillion: 0.3 }),
   "meta-llama/llama-3-70b": Object.freeze({ inputPerMillion: 0.59, outputPerMillion: 0.79 }),
   "meta-llama/llama-3.2-1b-instruct": Object.freeze({ inputPerMillion: 0.04, outputPerMillion: 0.16 }),
   "meta-llama/llama-3.2-1b": Object.freeze({ inputPerMillion: 0.04, outputPerMillion: 0.16 }),

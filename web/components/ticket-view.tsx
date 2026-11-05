@@ -3,7 +3,7 @@
 import { FormEvent, useEffect, useState } from "react";
 import { useRouter } from "next/navigation";
 import { Fingerprint, Lock, MessagesSquare, Send } from "lucide-react";
-import { differingFields, ratioOf, sameTerms, usd } from "@/lib/format";
+import { assetAmount, differingFields, ratioOf, sameTerms, usd } from "@/lib/format";
 import { escrowOf } from "@/lib/money";
 import { useApp } from "@/lib/store";
 import type { Asset } from "@/lib/types";
@@ -29,6 +29,7 @@ export function TicketView({ id }: { id: string }) {
   const escrow = escrowOf(deal);
   const account = app.account ?? "";
   const ownTerms = deal.role === "buyer" ? deal.buyerTerms : deal.sellerTerms;
+  const formatSettlementAmount = (amount: number) => deal.token === "NEAR" ? assetAmount(amount, "NEAR") : usd(amount);
 
   const send = (event: FormEvent) => {
     event.preventDefault();
@@ -91,7 +92,7 @@ export function TicketView({ id }: { id: string }) {
               </select>
             </Field>
             <p className="text-xs text-muted">Allowlist: {ownTerms.models.join(", ")}. Deadline {ownTerms.deadline}.</p>
-            <p className="text-sm">You lock {usd(deal.role === "buyer" ? escrow.buyerDeposit : escrow.sellerDeposit)} {deal.token} if these terms match.</p>
+            <p className="text-sm">You lock {formatSettlementAmount(deal.role === "buyer" ? escrow.buyerDeposit : escrow.sellerDeposit)} if these terms match.</p>
           </div>
           {waiting ? <p className="mt-4 flex items-center gap-2 text-sm text-blue"><span className="h-3.5 w-3.5 animate-spin rounded-full border-2 border-blue/30 border-t-blue" /> TEE matching</p> : null}
           {mismatch ? <p className="mt-4 text-sm text-warning">These fields differ: {fields.join(", ")}. The other side's values stay hidden.</p> : null}

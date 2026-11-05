@@ -73,14 +73,31 @@ export function isProviderBan(status: number, errTextOrData: unknown): boolean {
 
 export function classifyProviderError(status: number, body: unknown): ProviderErrorKind {
   const lower = (typeof body === "string" ? body : JSON.stringify(body || "")).toLowerCase();
+  if (status === 401) return "invalid_key";
   if (isProviderBan(status, body)) return "provider_ban";
-  if (
-    lower.includes("insufficient_quota") || lower.includes("billing_hard_limit_reached") ||
-    lower.includes("credit balance is too low") || lower.includes("quota_exhausted")
-  ) return "insufficient_quota";
-  if (status === 401 || lower.includes("invalid_api_key") || lower.includes("invalid x-api-key")) return "invalid_key";
+  const quotaFailure = [
+    "insufficient_quota",
+    "billing_hard_limit_reached",
+    "credit balance is too low",
+    "quota_exhausted",
+    "insufficient credits",
+    "insufficient credit",
+    "key limit exceeded",
+  ].some((marker) => lower.includes(marker));
+  if ((status === 402 || status === 403 || status === 429) && quotaFailure) return "insufficient_quota";
+  if (lower.includes("invalid_api_key") || lower.includes("invalid x-api-key")) return "invalid_key";
   if (status === 429) return "transient_rate_limit";
   return "upstream";
+}
+
+export function extractProviderErrorCode(body: unknown): string {
+  let data: any = body;
+  if (typeof body === "string") {
+    try { data = JSON.parse(body); } catch { data = null; }
+  }
+  const raw = data?.error?.code ?? data?.error?.type ?? data?.code ?? data?.type;
+  if (raw === null || raw === undefined || raw === "") return "unknown";
+  return String(raw).replace(/[^a-zA-Z0-9_.:-]/g, "_").slice(0, 80) || "unknown";
 }
 
 function authenticate(req: FastifyRequest, reply: FastifyReply): VaultEntry | null {
@@ -92,6 +109,20 @@ function authenticate(req: FastifyRequest, reply: FastifyReply): VaultEntry | nu
   const entry = keyVault.getByProxyKey(proxyKey);
   if (!entry || !entry.active) {
     reply.status(403).send({ error: { message: "Invalid or inactive proxy key", code: "key_inactive" } });
+    return null;
+  }
+  return entry;
+}
+
+export function authenticateDealRequest(req: FastifyRequest, reply: FastifyReply, dealId: number): VaultEntry | null {
+  const proxyKey = getProxyKey(req);
+  if (!proxyKey) {
+    reply.status(401).send({ error: { message: "Missing proxy API key", code: "unauthorized" } });
+    return null;
+  }
+  const entry = keyVault.getByProxyKey(proxyKey);
+  if (!entry || entry.dealId !== dealId) {
+    reply.status(403).send({ error: { message: "Proxy key is not authorized for this deal", code: "deal_forbidden" } });
     return null;
   }
   return entry;
@@ -149,14 +180,16 @@ function recordUsage(entry: VaultEntry, model: string, inputTokens: number, outp
   return { ...usage, stages };
 }
 
-function emitDefault(entry: VaultEntry, reason: DefaultReason) {
+export function emitDefaultOnce(entry: VaultEntry, reason: DefaultReason) {
+  if (entry.defaultPayload) return entry.defaultPayload;
   const signed = meterEngine.emitDefault(entry, entry.termsHashHex, reason);
+  entry.defaultPayload = signed;
   entry.signedPayloads.push(signed);
   meterEvents.publish(entry, "default");
   return signed;
 }
 
-function publicSignedPayload(item: { payload: any; signatureHex: string }) {
+export function publicSignedPayload(item: { payload: any; signatureHex: string }) {
   return {
     payload: {
       domain: item.payload.domain,
@@ -192,6 +225,14 @@ async function fetchWithTransientBackoff(url: string, init: RequestInit): Promis
 async function handleProviderFailure(response: Response, entry: VaultEntry, reply: FastifyReply, anthropicFormat = false) {
   const text = await response.text();
   const kind = classifyProviderError(response.status, text);
+  const upstreamCode = extractProviderErrorCode(text);
+  console.warn("[conpi:upstream-error]", {
+    dealId: entry.dealId,
+    provider: providerKind(entry),
+    status: response.status,
+    code: upstreamCode,
+    classification: kind,
+  });
   if (kind === "transient_rate_limit") {
     reply.header("Retry-After", response.headers.get("retry-after") || "1");
     return reply.status(429).send({
@@ -203,7 +244,7 @@ async function handleProviderFailure(response: Response, entry: VaultEntry, repl
   if (kind === "invalid_key" || kind === "provider_ban" || kind === "insufficient_quota") {
     const reason = kind === "provider_ban" ? DefaultReason.ProviderBan
       : kind === "invalid_key" ? DefaultReason.InvalidKey : DefaultReason.SellerSelfDrain;
-    const defaultPayload = emitDefault(entry, reason);
+    const defaultPayload = emitDefaultOnce(entry, reason);
     const code = kind === "insufficient_quota" ? "seller_self_drain" : kind;
     return reply.status(502).send({
       error: anthropicFormat
@@ -265,6 +306,7 @@ async function streamOpenAiResponse(response: Response, reply: FastifyReply, ent
   let inputTokens = 0;
   let outputTokens = 0;
   let cachedTokens = 0;
+  let providerUsageSeen = false;
 
   if (transformToAnthropic) {
     reply.raw.write(`event: message_start\ndata: ${JSON.stringify({ type: "message_start", message: { id: `msg_${Date.now()}`, type: "message", role: "assistant", model, content: [], stop_reason: null, usage: { input_tokens: fallbackInputTokens, output_tokens: 0 } } })}\n\n`);
@@ -295,6 +337,7 @@ async function streamOpenAiResponse(response: Response, reply: FastifyReply, ent
       }
       if (!transformToAnthropic) reply.raw.write(`data: ${raw}\n\n`);
       if (data.usage) {
+        providerUsageSeen = true;
         inputTokens = Number(data.usage.prompt_tokens || inputTokens);
         outputTokens = Number(data.usage.completion_tokens || outputTokens);
         cachedTokens = Number(data.usage.prompt_tokens_details?.cached_tokens || cachedTokens);
@@ -308,9 +351,9 @@ async function streamOpenAiResponse(response: Response, reply: FastifyReply, ent
   if (transformToAnthropic) {
     reply.raw.write(`event: content_block_stop\ndata: ${JSON.stringify({ type: "content_block_stop", index: 0 })}\n\n`);
     reply.raw.write(`event: message_delta\ndata: ${JSON.stringify({ type: "message_delta", delta: { stop_reason: "end_turn", stop_sequence: null }, usage: { output_tokens: outputTokens } })}\n\n`);
-    reply.raw.write(`event: message_stop\ndata: ${JSON.stringify({ type: "message_stop", conpi_cost_usd: usage.costUsd })}\n\n`);
+    reply.raw.write(`event: message_stop\ndata: ${JSON.stringify({ type: "message_stop", conpi_cost_usd: usage.costUsd, conpi_usage_source: providerUsageSeen ? "provider" : "tokenizer" })}\n\n`);
   } else {
-    reply.raw.write(`data: ${JSON.stringify({ object: "conpi.meter", usage: { prompt_tokens: inputTokens, completion_tokens: outputTokens, total_tokens: inputTokens + outputTokens, conpi_cost_usd: usage.costUsd }, stages: usage.stages })}\n\n`);
+    reply.raw.write(`data: ${JSON.stringify({ object: "conpi.meter", usage: { prompt_tokens: inputTokens, completion_tokens: outputTokens, total_tokens: inputTokens + outputTokens, conpi_cost_usd: usage.costUsd, conpi_usage_source: providerUsageSeen ? "provider" : "tokenizer" }, stages: usage.stages })}\n\n`);
     reply.raw.write("data: [DONE]\n\n");
   }
   return reply.raw.end();
@@ -324,6 +367,7 @@ async function streamAnthropicResponse(response: Response, reply: FastifyReply, 
   let outputText = "";
   let inputTokens = 0;
   let outputTokens = 0;
+  let providerUsageSeen = false;
   const reader = response.body?.getReader();
   if (!reader) throw new Error("Provider streaming response has no body");
   const decoder = new TextDecoder();
@@ -341,6 +385,7 @@ async function streamAnthropicResponse(response: Response, reply: FastifyReply, 
       if (!raw) continue;
       let data: any;
       try { data = JSON.parse(raw); } catch { continue; }
+      if (data.message?.usage || data.usage) providerUsageSeen = true;
       inputTokens = Number(data.message?.usage?.input_tokens || data.usage?.input_tokens || inputTokens);
       outputTokens = Number(data.usage?.output_tokens || outputTokens);
       const text = data.delta?.text;
@@ -356,7 +401,7 @@ async function streamAnthropicResponse(response: Response, reply: FastifyReply, 
   outputTokens ||= countTextTokens(entry.provider, model, outputText);
   const usage = recordUsage(entry, model, inputTokens, outputTokens);
   if (transformToOpenAi) {
-    reply.raw.write(`data: ${JSON.stringify({ id: `chatcmpl-${Date.now()}`, object: "chat.completion.chunk", created: Math.floor(Date.now() / 1000), model, choices: [{ index: 0, delta: {}, finish_reason: "stop" }], usage: { prompt_tokens: inputTokens, completion_tokens: outputTokens, total_tokens: inputTokens + outputTokens, conpi_cost_usd: usage.costUsd } })}\n\n`);
+    reply.raw.write(`data: ${JSON.stringify({ id: `chatcmpl-${Date.now()}`, object: "chat.completion.chunk", created: Math.floor(Date.now() / 1000), model, choices: [{ index: 0, delta: {}, finish_reason: "stop" }], usage: { prompt_tokens: inputTokens, completion_tokens: outputTokens, total_tokens: inputTokens + outputTokens, conpi_cost_usd: usage.costUsd, conpi_usage_source: providerUsageSeen ? "provider" : "tokenizer" } })}\n\n`);
     reply.raw.write("data: [DONE]\n\n");
   }
   return reply.raw.end();
@@ -389,13 +434,14 @@ export async function handleChatCompletions(req: FastifyRequest, reply: FastifyR
       if (body.stream) return streamAnthropicResponse(response, reply, entry, model, inputTokens, true);
       const data: any = await response.json();
       const outputText = extractText(data.content);
+      const providerUsageSeen = data.usage?.input_tokens !== undefined && data.usage?.output_tokens !== undefined;
       const finalInput = Number(data.usage?.input_tokens || inputTokens);
       const finalOutput = Number(data.usage?.output_tokens || countTextTokens(entry.provider, model, outputText));
       const usage = recordUsage(entry, model, finalInput, finalOutput);
       return reply.send({
         id: `chatcmpl-${data.id || Date.now()}`, object: "chat.completion", created: Math.floor(Date.now() / 1000), model,
         choices: [{ index: 0, message: { role: "assistant", content: outputText }, finish_reason: data.stop_reason === "max_tokens" ? "length" : "stop" }],
-        usage: { prompt_tokens: finalInput, completion_tokens: finalOutput, total_tokens: finalInput + finalOutput, conpi_cost_usd: usage.costUsd },
+        usage: { prompt_tokens: finalInput, completion_tokens: finalOutput, total_tokens: finalInput + finalOutput, conpi_cost_usd: usage.costUsd, conpi_usage_source: providerUsageSeen ? "provider" : "tokenizer" },
       });
     }
 
@@ -407,11 +453,12 @@ export async function handleChatCompletions(req: FastifyRequest, reply: FastifyR
     if (body.stream) return streamOpenAiResponse(response, reply, entry, model, inputTokens);
     const data: any = await response.json();
     const outputText = extractText(data.choices?.[0]?.message?.content);
+    const providerUsageSeen = data.usage?.prompt_tokens !== undefined && data.usage?.completion_tokens !== undefined;
     const finalInput = Number(data.usage?.prompt_tokens || inputTokens);
     const finalOutput = Number(data.usage?.completion_tokens || countTextTokens(entry.provider, model, outputText));
     const cachedTokens = Number(data.usage?.prompt_tokens_details?.cached_tokens || 0);
     const usage = recordUsage(entry, model, finalInput, finalOutput, cachedTokens);
-    data.usage = { ...(data.usage || {}), prompt_tokens: finalInput, completion_tokens: finalOutput, total_tokens: finalInput + finalOutput, conpi_cost_usd: usage.costUsd };
+    data.usage = { ...(data.usage || {}), prompt_tokens: finalInput, completion_tokens: finalOutput, total_tokens: finalInput + finalOutput, conpi_cost_usd: usage.costUsd, conpi_usage_source: providerUsageSeen ? "provider" : "tokenizer" };
     return reply.status(response.status).send(data);
   } catch (err: any) {
     return reply.status(502).send({ error: { message: err.message, code: "proxy_error" } });
@@ -445,10 +492,11 @@ export async function handleAnthropicMessages(req: FastifyRequest, reply: Fastif
       if (body.stream) return streamAnthropicResponse(response, reply, entry, model, inputTokens);
       const data: any = await response.json();
       const outputText = extractText(data.content);
+      const providerUsageSeen = data.usage?.input_tokens !== undefined && data.usage?.output_tokens !== undefined;
       const finalInput = Number(data.usage?.input_tokens || inputTokens);
       const finalOutput = Number(data.usage?.output_tokens || countTextTokens(entry.provider, model, outputText));
       const usage = recordUsage(entry, model, finalInput, finalOutput);
-      data.usage = { ...(data.usage || {}), input_tokens: finalInput, output_tokens: finalOutput, conpi_cost_usd: usage.costUsd };
+      data.usage = { ...(data.usage || {}), input_tokens: finalInput, output_tokens: finalOutput, conpi_cost_usd: usage.costUsd, conpi_usage_source: providerUsageSeen ? "provider" : "tokenizer" };
       return reply.send(data);
     }
 
@@ -459,6 +507,7 @@ export async function handleAnthropicMessages(req: FastifyRequest, reply: Fastif
     if (body.stream) return streamOpenAiResponse(response, reply, entry, model, inputTokens, true);
     const data: any = await response.json();
     const outputText = extractText(data.choices?.[0]?.message?.content);
+    const providerUsageSeen = data.usage?.prompt_tokens !== undefined && data.usage?.completion_tokens !== undefined;
     const finalInput = Number(data.usage?.prompt_tokens || inputTokens);
     const finalOutput = Number(data.usage?.completion_tokens || countTextTokens(entry.provider, model, outputText));
     const usage = recordUsage(entry, model, finalInput, finalOutput);
@@ -466,7 +515,7 @@ export async function handleAnthropicMessages(req: FastifyRequest, reply: Fastif
       id: `msg_${data.id || Date.now()}`, type: "message", role: "assistant", model,
       content: [{ type: "text", text: outputText }],
       stop_reason: data.choices?.[0]?.finish_reason === "length" ? "max_tokens" : "end_turn", stop_sequence: null,
-      usage: { input_tokens: finalInput, output_tokens: finalOutput, conpi_cost_usd: usage.costUsd },
+      usage: { input_tokens: finalInput, output_tokens: finalOutput, conpi_cost_usd: usage.costUsd, conpi_usage_source: providerUsageSeen ? "provider" : "tokenizer" },
     });
   } catch (err: any) {
     return reply.status(502).send({ error: { type: "api_error", message: err.message } });
@@ -499,9 +548,10 @@ export async function handleEmbeddings(req: FastifyRequest, reply: FastifyReply)
     });
     if (!response.ok) return handleProviderFailure(response, entry, reply);
     const data: any = await response.json();
+    const providerUsageSeen = data.usage?.prompt_tokens !== undefined || data.usage?.total_tokens !== undefined;
     const finalInput = Number(data.usage?.prompt_tokens || data.usage?.total_tokens || inputTokens);
     const usage = recordUsage(entry, model, finalInput, 0);
-    data.usage = { ...(data.usage || {}), prompt_tokens: finalInput, total_tokens: finalInput, conpi_cost_usd: usage.costUsd };
+    data.usage = { ...(data.usage || {}), prompt_tokens: finalInput, total_tokens: finalInput, conpi_cost_usd: usage.costUsd, conpi_usage_source: providerUsageSeen ? "provider" : "tokenizer" };
     return reply.status(response.status).send(data);
   } catch (err: any) {
     return reply.status(502).send({ error: { message: err.message, code: "proxy_error" } });
