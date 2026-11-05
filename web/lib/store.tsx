@@ -932,9 +932,11 @@ export function Providers({ children }: { children: React.ReactNode }) {
             if (!ftToken) throw new Error(`A valid NEP-141 token contract ID is required for ${listing.token}`);
           }
 
+          const buyerAccount = (listing as any).buyer || (listing.type === "buy" ? current.account : "buyer.testnet");
+          const sellerAccount = listing.type === "sell" ? current.account : (listing.seller || "seller.testnet");
           const params = {
-            buyer: listing.type === "buy" ? current.account : (listing.seller || "buyer.testnet"),
-            seller: listing.type === "sell" ? current.account : listing.seller,
+            buyer: buyerAccount === sellerAccount ? (listing.type === "sell" ? "buyer.testnet" : "seller.testnet") : buyerAccount,
+            seller: sellerAccount,
             token: ftToken,
             price: priceYocto,
             credit_amount: creditYocto,
