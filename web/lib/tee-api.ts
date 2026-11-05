@@ -52,7 +52,52 @@ export interface MeterResponse {
   timestamp: string;
 }
 
+export interface MeterStreamEvent extends MeterResponse {
+  type: "meter.update";
+  reason: "snapshot" | "usage" | "stage" | "default";
+  percent: number;
+  stages: number[];
+}
+
 export const teeApi = {
+  openMeterStream(
+    dealId: number,
+    proxyKey: string,
+    onUpdate: (event: MeterStreamEvent) => void,
+    onStatus?: (status: "connected" | "disconnected") => void
+  ): () => void {
+    let stopped = false;
+    let socket: WebSocket | null = null;
+    let reconnectTimer: number | null = null;
+    const wsBase = TEE_BASE_URL.replace(/^http:/, "ws:").replace(/^https:/, "wss:");
+
+    const connect = () => {
+      if (stopped) return;
+      socket = new WebSocket(`${wsBase}/v1/deals/${dealId}/ws`);
+      socket.onopen = () => socket?.send(JSON.stringify({ proxyKey }));
+      socket.onmessage = (message) => {
+        try {
+          const event = JSON.parse(String(message.data));
+          if (event.type === "authenticated") onStatus?.("connected");
+          if (event.type === "meter.update") onUpdate(event as MeterStreamEvent);
+        } catch {
+          // Ignore malformed frames; the authenticated channel remains open.
+        }
+      };
+      socket.onclose = () => {
+        onStatus?.("disconnected");
+        if (!stopped) reconnectTimer = window.setTimeout(connect, 2_000);
+      };
+    };
+
+    connect();
+    return () => {
+      stopped = true;
+      if (reconnectTimer !== null) window.clearTimeout(reconnectTimer);
+      socket?.close();
+    };
+  },
+
   async getAttestation(): Promise<TeeAttestation> {
     const res = await fetch(`${TEE_BASE_URL}/v1/attestation`);
     if (!res.ok) throw new Error(`TEE attestation failed: ${res.statusText}`);

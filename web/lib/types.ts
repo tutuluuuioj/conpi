@@ -115,6 +115,7 @@ export interface Deal {
   seller: string;
   deadline: string;
   termsHash: string | null;
+  counterpartyAccepted?: boolean;
   buyerSubmitted: boolean;
   sellerSubmitted: boolean;
   termDiffFields?: string[];

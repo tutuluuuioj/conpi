@@ -149,6 +149,34 @@ export async function txAcceptDeal(dealId: number, expectedHashBytes: number[]) 
   return signAndSendCall("accept_deal", { deal_id: dealId, expected_hash: expectedHashBytes }, "50000000000000");
 }
 
+// 2b. Atomic Accept & Deposit Native NEAR
+export async function txAcceptAndDepositNear(dealId: number, expectedHashBytes: number[], depositYocto: string) {
+  const ws = await getWalletSelector();
+  if (!ws) throw new Error("Wallet selector not initialized");
+
+  const state = ws.selector.store.getState();
+  const walletId = state.selectedWalletId || "browser-account-wallet";
+  const wallet = await ws.selector.wallet(walletId);
+
+  const action1 = transactions.functionCall(
+    "accept_deal",
+    Buffer.from(JSON.stringify({ deal_id: dealId, expected_hash: expectedHashBytes })),
+    BigInt("30000000000000"), // 30 TGas
+    BigInt(0)
+  );
+  const action2 = transactions.functionCall(
+    "deposit",
+    Buffer.from(JSON.stringify({ deal_id: dealId })),
+    BigInt("40000000000000"), // 40 TGas
+    BigInt(depositYocto)
+  );
+
+  return wallet.signAndSendTransaction({
+    receiverId: CONTRACT_ID,
+    actions: [action1 as any, action2 as any],
+  });
+}
+
 // 3. Deposit Native NEAR for Deal
 export async function txDepositNear(dealId: number, depositYocto: string) {
   return signAndSendCall("deposit", { deal_id: dealId }, "50000000000000", depositYocto);
@@ -221,6 +249,7 @@ if (typeof window !== "undefined") {
     signAndSendCall,
     txCreateDeal,
     txAcceptDeal,
+    txAcceptAndDepositNear,
     txDepositNear,
     txDepositFt,
     txActivateDeal,

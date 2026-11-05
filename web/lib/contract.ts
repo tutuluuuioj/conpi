@@ -1,33 +1,52 @@
 import { CONTRACT_ID } from "./chain";
 
-export const NEAR_RPC_URL = process.env.NEXT_PUBLIC_NEAR_RPC || "https://rpc.testnet.near.org";
+export const NEAR_RPC_URL = process.env.NEXT_PUBLIC_NEAR_RPC || "https://test.rpc.fastnear.com";
+const FALLBACK_RPC_URL = "https://rpc.testnet.near.org";
 
 export interface OnChainDeal {
   id: number;
   buyer: string;
   seller: string;
   token: string | null;
-  price: string;
-  credit_amount: string;
-  seller_collateral: string;
-  buyer_collateral: string;
-  terms_hash: number[];
-  terms_submitted_by_buyer: boolean;
-  terms_submitted_by_seller: boolean;
-  buyer_deposited: boolean;
-  seller_deposited: boolean;
-  deposit_duration: number;
-  usage_duration: number;
-  tee_liveness_timeout: number;
-  slash_bps: number;
-  status: "Created" | "Deposited" | "Active" | "Settled" | "Defaulted" | "Cancelled";
-  created_at: number;
-  activated_at: number | null;
-  current_stage: number;
-  metered_value: string;
-  released_amount: string;
-  last_checkpoint_time: number | null;
-  auto_release_requested_at: number | null;
+  price: string | number;
+  credit_amount: string | number;
+  seller_collateral: string | number;
+  buyer_collateral: string | number;
+  terms_hash: number[] | null;
+  tee_pubkey?: string;
+  deposit_deadline?: number;
+  key_deadline?: number;
+  usage_deadline?: number;
+  notice_deadline?: number | null;
+  tee_liveness_timeout?: number;
+  slash_bps_provider_ban?: number;
+  slash_bps_revoke?: number;
+  slash_bps_buyer_breach?: number;
+  buyer_deposited: string | number | boolean;
+  seller_deposited: string | number | boolean;
+  released_to_seller?: string | number;
+  stage_reached?: number;
+  last_signed?: {
+    stage: number;
+    metered_value: string | number;
+    nonce: number;
+    issued_at: number;
+  } | null;
+  last_nonce?: number;
+  last_tee_seen?: number;
+  status: "Created" | "Funded" | "Active" | "Completed" | "Defaulted" | "Cancelled" | "SettledTimeout" | "Deposited" | "Settled";
+  counterparty_accepted?: boolean;
+  terms_submitted_by_buyer?: boolean;
+  terms_submitted_by_seller?: boolean;
+  deposit_duration?: number;
+  usage_duration?: number;
+  created_at?: number;
+  activated_at?: number | null;
+  current_stage?: number;
+  metered_value?: string;
+  released_amount?: string;
+  last_checkpoint_time?: number | null;
+  auto_release_requested_at?: number | null;
 }
 
 export interface OnChainConfig {
@@ -49,39 +68,51 @@ export interface OnChainTeeSigner {
 
 export async function callNearRpc<T>(methodName: string, args: Record<string, any> = {}): Promise<T> {
   const argsBase64 = Buffer.from(JSON.stringify(args)).toString("base64");
-  const response = await fetch(NEAR_RPC_URL, {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({
-      jsonrpc: "2.0",
-      id: `query_${methodName}_${Date.now()}`,
-      method: "query",
-      params: {
-        request_type: "call_function",
-        finality: "final",
-        account_id: CONTRACT_ID,
-        method_name: methodName,
-        args_base64: argsBase64,
-      },
-    }),
-  });
+  const urls = [NEAR_RPC_URL, FALLBACK_RPC_URL].filter(Boolean);
 
-  if (!response.ok) {
-    throw new Error(`NEAR RPC error: ${response.statusText}`);
+  let lastError: any = null;
+  for (const url of urls) {
+    try {
+      const response = await fetch(url, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          jsonrpc: "2.0",
+          id: `query_${methodName}_${Date.now()}`,
+          method: "query",
+          params: {
+            request_type: "call_function",
+            finality: "final",
+            account_id: CONTRACT_ID,
+            method_name: methodName,
+            args_base64: argsBase64,
+          },
+        }),
+      });
+
+      if (!response.ok) {
+        throw new Error(`NEAR RPC error: ${response.statusText}`);
+      }
+
+      const json = await response.json();
+      if (json.error) {
+        throw new Error(json.error.message || JSON.stringify(json.error));
+      }
+
+      const rawBytes = json.result?.result;
+      if (!rawBytes || !Array.isArray(rawBytes)) {
+        throw new Error(`Invalid response bytes for ${methodName}`);
+      }
+
+      const decodedStr = new TextDecoder().decode(new Uint8Array(rawBytes));
+      return JSON.parse(decodedStr) as T;
+    } catch (err) {
+      lastError = err;
+      continue;
+    }
   }
 
-  const json = await response.json();
-  if (json.error) {
-    throw new Error(json.error.message || JSON.stringify(json.error));
-  }
-
-  const rawBytes = json.result?.result;
-  if (!rawBytes || !Array.isArray(rawBytes)) {
-    throw new Error(`Invalid response bytes for ${methodName}`);
-  }
-
-  const decodedStr = new TextDecoder().decode(new Uint8Array(rawBytes));
-  return JSON.parse(decodedStr) as T;
+  throw lastError || new Error(`Failed to call ${methodName} on all RPCs`);
 }
 
 export async function fetchContractDeals(fromIndex = 0, limit = 100): Promise<OnChainDeal[]> {

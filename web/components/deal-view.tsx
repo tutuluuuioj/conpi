@@ -7,6 +7,7 @@ import { BASE_URL } from "@/lib/chain";
 import { clockTime, maskKey, ratioOf, usd } from "@/lib/format";
 import { escrowOf } from "@/lib/money";
 import { useApp } from "@/lib/store";
+import { teeApi } from "@/lib/tee-api";
 import type { DealStep } from "@/lib/types";
 import {
   Button,
@@ -43,6 +44,16 @@ export function DealView({ id }: { id: string }) {
     const timer = window.setTimeout(() => app.clearPulse(deal.id), 800);
     return () => window.clearTimeout(timer);
   }, [deal?.pulseStage, deal?.id, app]);
+
+  useEffect(() => {
+    if (!deal || deal.status !== "Active" || !deal.proxyKey) return;
+    return teeApi.openMeterStream(
+      Number(deal.id),
+      deal.proxyKey,
+      (event) => app.applyMeterEvent(deal.id, event),
+      (status) => app.setHeartbeat(deal.id, status === "connected" ? "live" : "stale")
+    );
+  }, [deal?.id, deal?.status, deal?.proxyKey, app.applyMeterEvent, app.setHeartbeat]);
 
   if (!deal) {
     return <EmptyState icon={<ArrowLeftRight className="h-6 w-6" />} title="Deal not found." body="Check the id, or switch back to testnet." action={<Button href="/deals">All deals</Button>} />;
@@ -97,8 +108,8 @@ export function DealView({ id }: { id: string }) {
 
   const primary = view === "deposit" && !myDeposited
     ? <Button className="w-full" onClick={deposit}>Deposit {usd(depositAmount)} {deal.token}</Button>
-    : view === "key" && deal.role === "seller" && deal.keyStatus !== "verified"
-      ? <Button className="w-full" type="submit" form="seller-key">Submit to TEE</Button>
+    : view === "key" && deal.keyStatus !== "verified"
+      ? <Button className="w-full" type="submit" form="seller-key">Activate Deal via TEE</Button>
       : view === "negotiate"
         ? <Button className="w-full" href={`/deals/${deal.id}/ticket`}>Open ticket</Button>
         : null;
@@ -151,23 +162,27 @@ export function DealView({ id }: { id: string }) {
                 </div>
               </div>
               <p className="mt-4 text-sm">Deposit timeout <Countdown until={deal.depositDeadline} /></p>
-              {!myDeposited && deal.step !== "settled" ? <Button className="mt-4" onClick={deposit}>Deposit {usd(depositAmount)} {deal.token}</Button> : null}
+              {!myDeposited && deal.step !== "settled" ? (
+                <Button className="mt-4" onClick={deposit}>
+                  {deal.role === "buyer" && !deal.counterpartyAccepted ? `Accept & Deposit ${usd(depositAmount)} ${deal.token}` : `Deposit ${usd(depositAmount)} ${deal.token}`}
+                </Button>
+              ) : null}
             </Card>
           ) : null}
           {view === "key" ? (
             <Card>
               <h2 className="text-lg font-semibold">Key check</h2>
-              {deal.role === "seller" && deal.keyStatus !== "verified" ? (
+              {deal.keyStatus !== "verified" ? (
                 <form id="seller-key" className="mt-4 space-y-3" onSubmit={submitKey}>
                   <label className="block text-[13px] font-medium text-ink">Provider key
-                    <input className={`${fieldClass} mt-1.5 font-mono`} type="password" autoComplete="off" value={key} onChange={(event) => setKey(event.target.value)} placeholder="Sent only to the enclave" />
+                    <input className={`${fieldClass} mt-1.5 font-mono`} type="password" autoComplete="off" value={key} onChange={(event) => setKey(event.target.value)} placeholder="Sent only to the enclave (e.g. OpenAI / OpenRouter key)" />
                   </label>
-                  <p className="text-xs text-muted">This value is not stored in the browser and is not written to the contract.</p>
-                  <Button type="submit">Submit to TEE</Button>
+                  <p className="text-xs text-muted">This value is sent directly to the hardware enclave to verify quota and activate the proxy key. Not stored in browser or written on-chain.</p>
+                  <Button type="submit">Activate Deal via TEE</Button>
                 </form>
-              ) : <p className="mt-2 text-sm text-muted">{deal.role === "buyer" ? "The seller submits the provider key. You only see the checklist." : "The key was accepted."}</p>}
+              ) : <p className="mt-2 text-sm text-muted">The provider key was verified by the TEE and the deal is activated on NEAR.</p>}
               <ul className="mt-4 space-y-2 text-sm">
-                {(deal.keyChecks.length ? deal.keyChecks : [{ label: "Waiting for the seller", ok: false }]).map((check) => (
+                {(deal.keyChecks.length ? deal.keyChecks : [{ label: "Waiting for TEE verification", ok: false }]).map((check) => (
                   <li key={check.label} className="flex items-center gap-2">
                     <span className={`h-2 w-2 rounded-full ${check.ok ? "bg-mint" : "bg-line"}`} />
                     {check.label}
@@ -210,6 +225,10 @@ export function DealView({ id }: { id: string }) {
                 <div className="mt-3"><Meter used={deal.usedUsd} credit={deal.credit} stage={deal.stage} pulse={deal.pulseStage} /></div>
                 <StageTicks price={deal.price} stage={deal.stage} pulse={deal.pulseStage} />
                 <p className="mt-3 text-xs text-muted">Next release at {deal.stage >= 100 ? "settlement" : `${deal.stage + 25}% (${usd(deal.price / 4)})`}.</p>
+                <div className="mt-4 flex flex-wrap gap-2">
+                  <Button variant="secondary" onClick={() => app.syncMeterState(deal.id)}>Sync meter</Button>
+                  <Button onClick={() => app.releaseStagePayout(deal.id)}>Release stage payout</Button>
+                </div>
               </Card>
               <Card>
                 <h2 className="text-lg font-semibold">Locked prices</h2>

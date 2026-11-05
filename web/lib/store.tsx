@@ -6,7 +6,7 @@ import { KEY_CHECKS, MODELS, listingTerms } from "./data";
 import { maskKey, round2, sameTerms, usd } from "./format";
 import { escrowOf, settleComplete, settleRevoke, stageFor } from "./money";
 import type { Asset, Claim, Deal, DealStatus, DealStep, Listing, Notice, Proposal, SignResult, Terms, ThemeMode, Toast, WalletName } from "./types";
-import { teeApi } from "./tee-api";
+import { teeApi, MeterStreamEvent } from "./tee-api";
 import { encryptApiKeyToEnclave, encryptPayloadToEnclave } from "./crypto";
 import { verifyLiveAttestation } from "./attestation-verifier";
 import {
@@ -23,6 +23,7 @@ import {
   signAndSendCall,
   txCreateDeal,
   txAcceptDeal,
+  txAcceptAndDepositNear,
   txDepositNear,
   txDepositFt,
   txStorageDeposit,
@@ -98,6 +99,7 @@ interface Api {
   releaseStagePayout: (dealId: string) => Promise<SignResult>;
   triggerDefaultSettlement: (dealId: string, reason?: string) => Promise<SignResult>;
   syncMeterState: (dealId: string) => Promise<void>;
+  applyMeterEvent: (dealId: string, event: MeterStreamEvent) => void;
   setHeartbeat: (dealId: string, heartbeat: "live" | "stale") => void;
   claimOne: (id: string) => Promise<SignResult>;
   claimAll: () => Promise<SignResult>;
@@ -140,32 +142,48 @@ export function useApp() {
 }
 
 function mapOnChainDeal(d: OnChainDeal, currentAccount: string | null): Deal {
+  const raw = d as any;
+  const chainStatus = String(d.status);
+  const balanceIsPositive = (value: string | number | boolean | undefined): boolean => {
+    if (typeof value === "boolean") return value;
+    if (value === undefined || value === null || value === "") return false;
+    try { return BigInt(value) > BigInt(0); } catch { return Number(value) > 0; }
+  };
   const priceNear = Number(d.price) / 1e24;
   const creditNear = Number(d.credit_amount) / 1e24;
-  const meteredNear = Number(d.metered_value) / 1e24;
-  const releasedNear = Number(d.released_amount) / 1e24;
+  const meteredNear = Number(d.metered_value ?? raw.last_signed?.metered_value ?? 0) / 1e24;
+  const releasedNear = Number(d.released_amount ?? raw.released_to_seller ?? 0) / 1e24;
+  const buyerDeposited = balanceIsPositive(d.buyer_deposited);
+  const sellerDeposited = balanceIsPositive(d.seller_deposited);
+  const buyerSubmitted = Boolean(d.terms_submitted_by_buyer ?? d.terms_hash?.length);
+  const sellerSubmitted = Boolean(d.terms_submitted_by_seller ?? raw.counterparty_accepted);
+  const currentStage = Number(d.current_stage ?? raw.stage_reached ?? raw.last_signed?.stage ?? 0);
 
   const isSeller = Boolean(currentAccount && d.seller.toLowerCase() === currentAccount.toLowerCase());
   const role: "buyer" | "seller" = isSeller ? "seller" : "buyer";
   const token: Asset = d.token ? (d.token.toLowerCase().includes("usdt") ? "USDT" : "USDC") : "NEAR";
 
   let status: DealStatus = "Created";
-  if (d.status === "Deposited") status = "Funded";
-  else if (d.status === "Active") status = "Active";
-  else if (d.status === "Settled") status = "Completed";
-  else if (d.status === "Defaulted") status = "Defaulted";
-  else if (d.status === "Cancelled") status = "Cancelled";
+  if (chainStatus === "Deposited" || chainStatus === "Funded") status = "Funded";
+  else if (chainStatus === "Active") status = "Active";
+  else if (chainStatus === "Settled" || chainStatus === "Completed") status = "Completed";
+  else if (chainStatus === "Defaulted") status = "Defaulted";
+  else if (chainStatus === "Cancelled") status = "Cancelled";
+
+  const counterpartyAccepted = Boolean(d.counterparty_accepted);
 
   let step: DealStep = "negotiate";
-  if (d.status === "Active") step = "live";
-  else if (d.status === "Settled" || d.status === "Defaulted" || d.status === "Cancelled") step = "settled";
-  else if (d.status === "Deposited" || (d.buyer_deposited && d.seller_deposited)) step = "key";
-  else if (d.terms_submitted_by_buyer && d.terms_submitted_by_seller) step = "deposit";
-  else if (d.terms_submitted_by_buyer || d.terms_submitted_by_seller) step = "terms";
+  if (chainStatus === "Active") step = "live";
+  else if (["Settled", "Completed", "Defaulted", "Cancelled", "SettledTimeout"].includes(chainStatus)) step = "settled";
+  else if (chainStatus === "Deposited" || chainStatus === "Funded" || (buyerDeposited && sellerDeposited)) step = "key";
+  else if (d.terms_hash && d.terms_hash.length > 0) step = "deposit";
+  else if (buyerSubmitted && sellerSubmitted) step = "deposit";
+  else if (buyerSubmitted || sellerSubmitted) step = "terms";
 
   const termsHashHex = d.terms_hash && d.terms_hash.length ? "0x" + Buffer.from(d.terms_hash).toString("hex") : null;
-  const buyerCollateralPct = d.price !== "0" ? Math.round((Number(d.buyer_collateral) / Number(d.price)) * 100) : 10;
-  const sellerCollateralPct = d.price !== "0" ? Math.round((Number(d.seller_collateral) / Number(d.price)) * 100) : 20;
+  const rawPrice = Number(d.price);
+  const buyerCollateralPct = rawPrice > 0 ? Math.round((Number(d.buyer_collateral) / rawPrice) * 100) : 10;
+  const sellerCollateralPct = rawPrice > 0 ? Math.round((Number(d.seller_collateral) / rawPrice) * 100) : 20;
 
   const defaultTerms: Terms = {
     credit: creditNear || 10,
@@ -195,33 +213,34 @@ function mapOnChainDeal(d: OnChainDeal, currentAccount: string | null): Deal {
     seller: d.seller,
     deadline: defaultTerms.deadline,
     termsHash: termsHashHex,
-    buyerSubmitted: d.terms_submitted_by_buyer,
-    sellerSubmitted: d.terms_submitted_by_seller,
+    counterpartyAccepted,
+    buyerSubmitted,
+    sellerSubmitted,
     buyerTerms: defaultTerms,
     sellerTerms: defaultTerms,
-    buyerDeposited: d.buyer_deposited,
-    sellerDeposited: d.seller_deposited,
+    buyerDeposited,
+    sellerDeposited,
     depositDeadline: new Date(Date.now() + 86400000 * 2).toISOString(),
-    keyStatus: d.status === "Active" || d.status === "Settled" ? "verified" : "idle",
-    keyChecks: KEY_CHECKS.map((label) => ({ label, ok: d.status === "Active" || d.status === "Settled" })),
-    proxyKey: d.status === "Active" ? "cpk_live_phala_tee_proxy" : "",
-    proxyRevoked: d.status === "Defaulted" || d.status === "Cancelled",
+    keyStatus: ["Active", "Settled", "Completed"].includes(chainStatus) ? "verified" : "idle",
+    keyChecks: KEY_CHECKS.map((label) => ({ label, ok: ["Active", "Settled", "Completed"].includes(chainStatus) })),
+    proxyKey: "",
+    proxyRevoked: chainStatus === "Defaulted" || chainStatus === "Cancelled",
     baseUrl: BASE_URL,
     usedUsd: meteredNear,
     tokens: Math.round(meteredNear * 100000),
-    stage: d.current_stage || 0,
+    stage: currentStage,
     releasedUsd: releasedNear,
     lastUpdate: "On-chain NEAR Testnet",
     heartbeat: "live",
     lastCheckpoint: d.last_checkpoint_time ? new Date(Number(d.last_checkpoint_time) / 1e6).toLocaleTimeString() : "Recent",
-    outcome: d.status === "Settled" ? "completed" : d.status === "Defaulted" ? "revoked" : null,
+    outcome: chainStatus === "Settled" || chainStatus === "Completed" ? "completed" : chainStatus === "Defaulted" ? "revoked" : null,
     split: null,
     messages: [
       { id: "m1", sender: d.seller, text: `Created on-chain deal #${d.id} for ${priceNear} NEAR`, time: "On-chain" },
       { id: "m2", sender: d.buyer, text: `Escrow terms recorded at ${termsHashHex ? termsHashHex.slice(0, 12) + "..." : "pending"}`, time: "On-chain" },
     ],
     activity: [
-      { id: "a1", title: `On-chain Deal #${d.id} ${d.status}`, detail: `Status: ${d.status} · Stage: ${d.current_stage}% · Metered: ${meteredNear} NEAR`, time: "Live" }
+      { id: "a1", title: `On-chain Deal #${d.id} ${d.status}`, detail: `Status: ${d.status} · Stage: ${currentStage}% · Metered: ${meteredNear} NEAR`, time: "Live" }
     ],
     prices: [
       { model: "gpt-4o", input: "$2.50 / 1M", output: "$10.00 / 1M" },
@@ -230,10 +249,10 @@ function mapOnChainDeal(d: OnChainDeal, currentAccount: string | null): Deal {
     steps: {
       negotiate: { time: "Completed" },
       terms: { time: "Completed" },
-      deposit: d.buyer_deposited && d.seller_deposited ? { time: "Confirmed" } : undefined,
-      key: d.status === "Active" || d.status === "Settled" ? { time: "Verified" } : undefined,
-      live: d.status === "Active" ? { time: "Active" } : undefined,
-      settled: d.status === "Settled" || d.status === "Defaulted" ? { time: "Settled" } : undefined,
+      deposit: buyerDeposited && sellerDeposited ? { time: "Confirmed" } : undefined,
+      key: ["Active", "Settled", "Completed"].includes(chainStatus) ? { time: "Verified" } : undefined,
+      live: chainStatus === "Active" ? { time: "Active" } : undefined,
+      settled: ["Settled", "Completed", "Defaulted", "SettledTimeout"].includes(chainStatus) ? { time: "Settled" } : undefined,
     },
     createdAt: d.created_at ? new Date(Number(d.created_at) / 1e6).toISOString() : new Date().toISOString(),
     pulseStage: null,
@@ -689,7 +708,19 @@ export function Providers({ children }: { children: React.ReactNode }) {
         try {
           if (deal.token === "NEAR") {
             const yocto = BigInt(Math.round(amount * 1e6)) * BigInt(1e18);
-            const outcome: any = await txDepositNear(Number(dealId), yocto.toString());
+            let outcome: any;
+            if (isBuyer && !deal.counterpartyAccepted && deal.termsHash) {
+              const cleanHex = deal.termsHash.replace(/^0x/, "");
+              const hashBytes = Array.from(Buffer.from(cleanHex, "hex"));
+              try {
+                outcome = await txAcceptAndDepositNear(Number(dealId), hashBytes, yocto.toString());
+              } catch {
+                await txAcceptDeal(Number(dealId), hashBytes);
+                outcome = await txDepositNear(Number(dealId), yocto.toString());
+              }
+            } else {
+              outcome = await txDepositNear(Number(dealId), yocto.toString());
+            }
             const txHash = outcome?.transaction?.hash || outcome?.transaction_outcome?.id;
             if (!txHash) throw new Error("Deposit transaction was not confirmed");
 
@@ -882,6 +913,17 @@ export function Providers({ children }: { children: React.ReactNode }) {
         } catch (err: any) {
           console.warn("Meter sync error:", err);
         }
+      },
+      applyMeterEvent: (dealId, event) => {
+        patchDeal(dealId, (deal) => ({
+          ...deal,
+          usedUsd: event.usedUsd,
+          tokens: event.tokensTotal,
+          stage: Math.max(deal.stage, ...event.stages, Math.min(100, Math.floor(event.percent))),
+          heartbeat: event.active ? "live" : deal.heartbeat,
+          pulseStage: event.stages.length ? event.stages[event.stages.length - 1] : deal.pulseStage,
+          lastUpdate: new Date(event.timestamp).toLocaleTimeString(),
+        }));
       },
       setHeartbeat: (dealId, heartbeat) => patchDeal(dealId, (deal) => ({ ...deal, heartbeat })),
       claimOne: async (id) => {
