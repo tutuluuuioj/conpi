@@ -17,6 +17,10 @@ export class NearRelayer {
     this.relayerPrivateKey = privateKey;
   }
 
+  public isConfigured(): boolean {
+    return Boolean(this.relayerAccountId && this.relayerPrivateKey);
+  }
+
   public async callView(methodName: string, args: Record<string, any> = {}): Promise<any> {
     const argsBase64 = Buffer.from(JSON.stringify(args)).toString("base64");
     const response = await fetch(this.rpcUrl, {
@@ -130,6 +134,33 @@ export class NearRelayer {
     return this.submitFunctionCall("release_stage", {
       deal_id: dealId,
       stage,
+      payload,
+      sig: sigBytes,
+    });
+  }
+
+  public async submitCheckpoint(dealId: number, payloadDto: any, signatureHex: string) {
+    const termsHashBytes = Array.from(
+      Buffer.isBuffer(payloadDto.termsHash) ? payloadDto.termsHash : Buffer.from(payloadDto.termsHashHex, "hex")
+    );
+    const sigBytes = Array.from(Buffer.from(signatureHex, "hex"));
+
+    const payload = {
+      domain: payloadDto.domain,
+      contract_id: payloadDto.contractId,
+      chain_id: payloadDto.chainId,
+      deal_id: Number(dealId),
+      terms_hash: termsHashBytes,
+      kind: "Checkpoint",
+      stage: Number(payloadDto.stage || 0),
+      metered_value: payloadDto.meteredValueYocto ? payloadDto.meteredValueYocto.toString() : "0",
+      reason: null,
+      nonce: Number(payloadDto.nonce),
+      issued_at: Number(payloadDto.issuedAtNs),
+    };
+
+    return this.submitFunctionCall("checkpoint", {
+      deal_id: dealId,
       payload,
       sig: sigBytes,
     });

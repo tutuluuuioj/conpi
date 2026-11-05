@@ -4,6 +4,7 @@ import { serializeSignedPayload, PayloadKind, SignedPayloadDto } from "../crypto
 import { enclaveKeys } from "../crypto/keys.js";
 import { CONFIG } from "../config.js";
 import { lockPricingTable, LockedPricingTable } from "../proxy/pricing.js";
+import { meterEngine } from "../proxy/meter.js";
 
 export function parseBalance(val: any): bigint {
   if (typeof val === "bigint") return val;
@@ -107,6 +108,19 @@ export interface VaultEntry {
   registeredAt: string;
   signedPayloads: Array<{ payload: any; signatureHex: string }>;
   defaultPayload?: { payload: SignedPayloadDto; signatureHex: string };
+  lastCheckpointAt: number;
+  relayReceipts: RelayReceipt[];
+  onChainStatus?: string;
+}
+
+export interface RelayReceipt {
+  kind: "stage" | "checkpoint" | "default";
+  nonce: string;
+  state: "queued" | "awaiting_credentials" | "submitted" | "applied" | "failed";
+  attempts: number;
+  transactionHash?: string;
+  error?: string;
+  updatedAt: string;
 }
 
 class KeyVault {
@@ -122,6 +136,10 @@ class KeyVault {
     const dealId = this.proxyKeyToDealId.get(proxyKey);
     if (dealId === undefined) return undefined;
     return this.entries.get(dealId);
+  }
+
+  public listActive(): VaultEntry[] {
+    return [...this.entries.values()].filter((entry) => entry.active);
   }
 
   public async validateAndInjectKey(
@@ -187,6 +205,9 @@ class KeyVault {
     let resolvedCreditUsd: number = 0;
     let resolvedPriceUsd: number = 0;
     let resolvedTermsHashHex: string = termsHashHex || "";
+    let resolvedLastNonce = 0;
+    let resolvedStage = 0;
+    let resolvedStatus = "Funded";
 
     // Strictly resolve creditUsd, priceUsd and creditAmountYocto from on-chain deal state
     try {
@@ -211,6 +232,9 @@ class KeyVault {
         if (Array.isArray(deal.terms_hash)) {
           resolvedTermsHashHex = Buffer.from(deal.terms_hash).toString("hex");
         }
+        resolvedLastNonce = Number(deal.last_nonce || 0);
+        resolvedStage = Number(deal.stage_reached || 0);
+        resolvedStatus = String(deal.status || "Funded");
       } else if (process.env.NODE_ENV === "test") {
         // Fallback for isolated offline unit testing when deal is not found
         resolvedCreditYocto = creditAmountYocto || "2000000000000000000000000";
@@ -247,10 +271,19 @@ class KeyVault {
       active: true,
       registeredAt: new Date().toISOString(),
       signedPayloads: [],
+      lastCheckpointAt: Date.now(),
+      relayReceipts: [],
+      onChainStatus: resolvedStatus,
     };
 
     this.entries.set(dealId, entry);
     this.proxyKeyToDealId.set(proxyKey, dealId);
+
+    // Continue the on-chain per-deal nonce sequence. A fresh funded deal starts at
+    // zero, while a recovered enclave instance resumes after the latest accepted
+    // payload instead of creating replayed signatures.
+    meterEngine.seedNonce(dealId, BigInt(resolvedLastNonce));
+    meterEngine.seedStage(dealId, resolvedStage);
 
     // Build ACTIVATE SignedPayload
     const termsHashBytes = Buffer.from(resolvedTermsHashHex, "hex");
@@ -266,7 +299,7 @@ class KeyVault {
       stage: 0,
       meteredValueYocto: 0n,
       reason: null,
-      nonce: 1n,
+      nonce: meterEngine.getNextNonce(dealId),
       issuedAtNs: nowNs,
     };
 

@@ -8,8 +8,10 @@
     "dev": "tsx watch src/index.ts",
     "build": "tsc",
     "start": "node dist/index.js",
-    "test": "tsx test/index.test.ts && tsx test/phase3.test.ts",
-    "test:phase3": "tsx test/phase3.test.ts"
+    "test": "tsx test/index.test.ts && tsx test/phase3.test.ts && tsx test/phase4.test.ts",
+    "test:phase3": "tsx test/phase3.test.ts",
+    "test:phase4": "tsx test/phase4.test.ts",
+    "provision:relayer": "node scripts/provision-relayer.mjs"
   },
   "dependencies": {
     "@anthropic-ai/tokenizer": "^0.0.4",

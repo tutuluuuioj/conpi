@@ -30,11 +30,37 @@ export class MeterEngine {
   private lastStageEmitted = new Map<number, number>();
   private nonceMap = new Map<number, bigint>();
 
+  public seedNonce(dealId: number, lastAcceptedNonce: bigint | number): void {
+    const seed = BigInt(lastAcceptedNonce);
+    const current = this.nonceMap.get(dealId) || 0n;
+    if (seed > current) this.nonceMap.set(dealId, seed);
+  }
+
+  public seedStage(dealId: number, lastReleasedStage: number): void {
+    const stage = Math.max(0, Math.min(100, Math.floor(lastReleasedStage)));
+    const current = this.lastStageEmitted.get(dealId) || 0;
+    if (stage > current) this.lastStageEmitted.set(dealId, stage);
+  }
+
   public getNextNonce(dealId: number): bigint {
-    const current = this.nonceMap.get(dealId) || 1n;
+    const current = this.nonceMap.get(dealId) || 0n;
     const next = current + 1n;
     this.nonceMap.set(dealId, next);
     return next;
+  }
+
+  private meteredValue(entry: VaultEntry): bigint {
+    const usedMicro = BigInt(Math.min(
+      Math.round(entry.creditUsd * 1_000_000),
+      Math.round(entry.usedUsd * 1_000_000)
+    ));
+    if (entry.creditAmountYocto) {
+      const totalCredit = toBigIntYocto(entry.creditAmountYocto);
+      const totalMicro = BigInt(Math.max(1, Math.round(entry.creditUsd * 1_000_000)));
+      const rawMetered = (usedMicro * totalCredit) / totalMicro;
+      return rawMetered > totalCredit ? totalCredit : rawMetered;
+    }
+    return usedMicro * 1_000_000_000_000_000_000n;
   }
 
   public reset(dealId?: number): void {
@@ -59,19 +85,7 @@ export class MeterEngine {
 
         // Unit scaling: if creditAmountYocto is present, scale to contract's deal.credit_amount
         // Strictly capped at deal.credit_amount (100%) to prevent overspending
-        const usedMicro = BigInt(Math.min(
-          Math.round(entry.creditUsd * 1_000_000),
-          Math.round(entry.usedUsd * 1_000_000)
-        ));
-        let meteredYocto: bigint;
-        if (entry.creditAmountYocto) {
-          const totalCredit = toBigIntYocto(entry.creditAmountYocto);
-          const totalMicro = BigInt(Math.max(1, Math.round(entry.creditUsd * 1_000_000)));
-          const rawMetered = (usedMicro * totalCredit) / totalMicro;
-          meteredYocto = rawMetered > totalCredit ? totalCredit : rawMetered;
-        } else {
-          meteredYocto = usedMicro * 1_000_000_000_000_000_000n;
-        }
+        const meteredYocto = this.meteredValue(entry);
 
         const payload: SignedPayloadDto = {
           domain: "conpi:v1",
@@ -104,22 +118,28 @@ export class MeterEngine {
     return stages.length > 0 ? stages[0] : null;
   }
 
+  public emitCheckpoint(entry: VaultEntry, termsHashHex: string): { payload: SignedPayloadDto; signatureHex: string } {
+    const payload: SignedPayloadDto = {
+      domain: "conpi:v1",
+      contractId: CONFIG.contractId,
+      chainId: CONFIG.networkId,
+      dealId: entry.dealId,
+      termsHash: Buffer.from(termsHashHex, "hex"),
+      kind: PayloadKind.Checkpoint,
+      stage: Math.min(100, Math.floor((entry.usedUsd / Math.max(entry.creditUsd, Number.EPSILON)) * 100)),
+      meteredValueYocto: this.meteredValue(entry),
+      reason: null,
+      nonce: this.getNextNonce(entry.dealId),
+      issuedAtNs: BigInt(Date.now()) * 1_000_000n,
+    };
+    const signature = enclaveKeys.sign(serializeSignedPayload(payload));
+    return { payload, signatureHex: Buffer.from(signature).toString("hex") };
+  }
+
   public emitDefault(entry: VaultEntry, termsHashHex: string, reason: DefaultReason): { payload: SignedPayloadDto; signatureHex: string } {
     if (entry.defaultPayload) return entry.defaultPayload;
     entry.active = false;
-    const usedMicro = BigInt(Math.min(
-      Math.round(entry.creditUsd * 1_000_000),
-      Math.round(entry.usedUsd * 1_000_000)
-    ));
-    let meteredYocto: bigint;
-    if (entry.creditAmountYocto) {
-      const totalCredit = toBigIntYocto(entry.creditAmountYocto);
-      const totalMicro = BigInt(Math.max(1, Math.round(entry.creditUsd * 1_000_000)));
-      const rawMetered = (usedMicro * totalCredit) / totalMicro;
-      meteredYocto = rawMetered > totalCredit ? totalCredit : rawMetered;
-    } else {
-      meteredYocto = usedMicro * 1_000_000_000_000_000_000n;
-    }
+    const meteredYocto = this.meteredValue(entry);
 
     const payload: SignedPayloadDto = {
       domain: "conpi:v1",

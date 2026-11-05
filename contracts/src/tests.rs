@@ -244,7 +244,9 @@ mod tests {
         let deal = contract.get_deal(deal_id).unwrap();
         assert_eq!(deal.status, DealStatus::Active);
 
-        // Release 25%, 50%, 75%, 100%
+        // Release 25%, 50%, 75%, 100%, with a signed checkpoint between
+        // milestones to prove the offline fallback state is persisted.
+        let mut nonce = 2u64;
         for (i, stage) in [25, 50, 75, 100].iter().enumerate() {
             let metered = (credit_amount * (*stage as u128)) / 100;
             let payload = SignedPayload {
@@ -257,11 +259,34 @@ mod tests {
                 stage: *stage,
                 metered_value: U128(metered),
                 reason: None,
-                nonce: (i as u64) + 2,
+                nonce,
                 issued_at: 1000 + ((i as u64) + 1) * 1000,
             };
             let sig = sign_payload(&tee_sk, &payload);
             contract.release_stage(deal_id, *stage, payload, sig);
+            nonce += 1;
+
+            if *stage == 25 {
+                let checkpoint_payload = SignedPayload {
+                    domain: "conpi:v1".to_string(),
+                    contract_id: contract_id.clone(),
+                    chain_id: "testnet".to_string(),
+                    deal_id,
+                    terms_hash,
+                    kind: PayloadKind::Checkpoint,
+                    stage: 30,
+                    metered_value: U128((credit_amount * 30) / 100),
+                    reason: None,
+                    nonce,
+                    issued_at: 2500,
+                };
+                let checkpoint_sig = sign_payload(&tee_sk, &checkpoint_payload);
+                contract.checkpoint(deal_id, checkpoint_payload, checkpoint_sig);
+                nonce += 1;
+
+                let checkpointed = contract.get_deal(deal_id).unwrap();
+                assert_eq!(checkpointed.last_signed.unwrap().metered_value.0, (credit_amount * 30) / 100);
+            }
         }
 
         let completed = contract.get_deal(deal_id).unwrap();

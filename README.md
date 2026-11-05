@@ -126,10 +126,10 @@ confi/
 ```bash
 cd contracts
 
-# Run all unit & math tests (19 tests)
+# Run all unit, settlement math, checkpoint, and governance tests (29 tests)
 cargo test
 
-# Run near-workspaces integration tests (4 tests: multisig DAO, timelocked governance, pull-claim, lifecycle)
+# Run near-workspaces integration tests (6 tests)
 cargo test --test workspaces_tests -- --nocapture
 
 # Compile reproducible WASM binary with embedded ABI
@@ -145,3 +145,22 @@ npm run build
 npm run dev
 # Open http://localhost:3000
 ```
+
+### TEE Service and Automated Settlement:
+```bash
+cd tee-service
+npm ci
+npm test
+npm run build
+```
+
+Phase 4 automatically relays hardware-signed 25/50/75/100 stage releases,
+periodic checkpoints, and deterministic defaults. Transactions are serialized
+per deal, checked against on-chain state before retry, and remain available for
+manual wallet submission if the relayer is temporarily unavailable.
+
+The production CVM expects `RELAYER_ACCOUNT_ID` and `RELAYER_PRIVATE_KEY` as
+Phala encrypted secrets. The relayer key must be a function-call key restricted
+to the escrow contract methods `release_stage`, `checkpoint`, and
+`settle_default`. `CHECKPOINT_INTERVAL_MS` defaults to five minutes and must
+remain below the deal's TEE liveness timeout.

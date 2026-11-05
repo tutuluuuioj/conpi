@@ -176,6 +176,10 @@ async function runTests() {
   if (Math.abs(cost1.costUsd - 0.0075) > 0.0001) throw new Error("Cost calculation mismatch");
 
   const entry = keyVault.getByDealId(1)!;
+  // Isolate milestone emission from any historical stage already present on
+  // the public testnet deal used for the on-chain parameter lookup.
+  meterEngine.reset(1);
+  meterEngine.seedNonce(1, 1);
   entry.usedUsd = entry.creditUsd * 0.25; // 25% of on-chain creditUsd
   const stage25 = meterEngine.checkAndEmitStage(entry, ticketMatched.termsHashHex);
   console.log("  Stage 25% emitted:", stage25?.payload.stage === 25);

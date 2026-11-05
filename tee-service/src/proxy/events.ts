@@ -1,7 +1,7 @@
 import { EventEmitter } from "node:events";
 import type { VaultEntry } from "../vault/preflight.js";
 
-export type MeterEventReason = "snapshot" | "usage" | "stage" | "default";
+export type MeterEventReason = "snapshot" | "usage" | "stage" | "checkpoint" | "default";
 
 export interface MeterEvent {
   type: "meter.update";

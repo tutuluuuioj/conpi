@@ -22,6 +22,7 @@ import {
 import { meterEvents } from "./proxy/events.js";
 import { DefaultReason } from "./crypto/borsh.js";
 import { nearRelayer } from "./chain/relayer.js";
+import { settlementEngine } from "./settlement/engine.js";
 
 export const app = Fastify({ logger: false });
 
@@ -45,6 +46,7 @@ export async function buildApp() {
       status: "healthy",
       service: "conpi-tee-service",
       contractId: CONFIG.contractId,
+      settlement: settlementEngine.status(),
       timestamp: new Date().toISOString(),
     };
   });
@@ -208,6 +210,8 @@ export async function buildApp() {
       creditUsd: entry.creditUsd,
       priceUsd: entry.priceUsd,
       registeredAt: entry.registeredAt,
+      lastCheckpointAt: new Date(entry.lastCheckpointAt).toISOString(),
+      relayReceipts: entry.relayReceipts,
       timestamp: new Date().toISOString(),
     };
   });
@@ -224,6 +228,8 @@ export async function buildApp() {
       dealId,
       termsHashHex: entry.termsHashHex,
       count: entry.signedPayloads.length,
+      relayerConfigured: nearRelayer.isConfigured(),
+      relayReceipts: entry.relayReceipts,
       signedPayloads: entry.signedPayloads.map((item) => ({
         payload: {
           domain: item.payload.domain,
@@ -309,6 +315,9 @@ export async function buildApp() {
     const { id } = req.params as { id: string };
     return nearRelayer.getDeal(parseInt(id, 10));
   });
+
+  settlementEngine.start(() => keyVault.listActive());
+  app.addHook("onClose", async () => settlementEngine.stop());
 
   return app;
 }

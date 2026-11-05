@@ -2,6 +2,7 @@ import { FastifyRequest, FastifyReply } from "fastify";
 import { calculateCost, meterEngine } from "../src/proxy/meter.js";
 import { VaultEntry } from "../src/vault/preflight.js";
 import { meterEvents } from "../src/proxy/events.js";
+import { settlementEngine } from "../src/settlement/engine.js";
 
 export function handleMockChatCompletion(
   req: FastifyRequest,
@@ -24,6 +25,7 @@ export function handleMockChatCompletion(
   for (const stg of newStages) {
     entry.signedPayloads.push(stg);
   }
+  if (newStages.length) void settlementEngine.relayStages(entry, newStages);
   if (entry.usedUsd >= entry.creditUsd) entry.active = false;
   meterEvents.publish(entry, newStages.length ? "stage" : "usage", newStages.map((stage) => stage.payload.stage));
 
@@ -94,6 +96,7 @@ export function handleMockAnthropicMessage(
   for (const stg of newStages) {
     entry.signedPayloads.push(stg);
   }
+  if (newStages.length) void settlementEngine.relayStages(entry, newStages);
   if (entry.usedUsd >= entry.creditUsd) entry.active = false;
   meterEvents.publish(entry, newStages.length ? "stage" : "usage", newStages.map((stage) => stage.payload.stage));
 

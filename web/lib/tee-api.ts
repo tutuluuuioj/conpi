@@ -49,12 +49,22 @@ export interface MeterResponse {
   active: boolean;
   creditUsd: number;
   priceUsd: number;
+  lastCheckpointAt?: string;
+  relayReceipts?: Array<{
+    kind: "stage" | "checkpoint" | "default";
+    nonce: string;
+    state: "queued" | "awaiting_credentials" | "submitted" | "applied" | "failed";
+    attempts: number;
+    transactionHash?: string;
+    error?: string;
+    updatedAt: string;
+  }>;
   timestamp: string;
 }
 
 export interface MeterStreamEvent extends MeterResponse {
   type: "meter.update";
-  reason: "snapshot" | "usage" | "stage" | "default";
+  reason: "snapshot" | "usage" | "stage" | "checkpoint" | "default";
   percent: number;
   stages: number[];
 }

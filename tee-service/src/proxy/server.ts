@@ -3,6 +3,7 @@ import { DefaultReason } from "../crypto/borsh.js";
 import { CONFIG } from "../config.js";
 import { keyVault, VaultEntry } from "../vault/preflight.js";
 import { meterEvents } from "./events.js";
+import { settlementEngine } from "../settlement/engine.js";
 import { meterEngine } from "./meter.js";
 import { calculateCost } from "./pricing.js";
 import { proxyRateLimiter } from "./rate-limit.js";
@@ -174,6 +175,11 @@ function recordUsage(entry: VaultEntry, model: string, inputTokens: number, outp
   entry.tokensTotal += usage.inputTokens + usage.outputTokens;
   const signedStages = meterEngine.checkAndEmitStages(entry, entry.termsHashHex);
   for (const stage of signedStages) entry.signedPayloads.push(stage);
+  if (signedStages.length > 0) {
+    void settlementEngine.relayStages(entry, signedStages).catch((error) => {
+      console.warn("[conpi:stage-relay]", { dealId: entry.dealId, error: error instanceof Error ? error.message : String(error) });
+    });
+  }
   if (entry.usedUsd >= entry.creditUsd) entry.active = false;
   const stages = signedStages.map((stage) => stage.payload.stage);
   meterEvents.publish(entry, stages.length ? "stage" : "usage", stages);
@@ -186,6 +192,9 @@ export function emitDefaultOnce(entry: VaultEntry, reason: DefaultReason) {
   entry.defaultPayload = signed;
   entry.signedPayloads.push(signed);
   meterEvents.publish(entry, "default");
+  void settlementEngine.relayDefault(entry, signed).catch((error) => {
+    console.warn("[conpi:default-relay]", { dealId: entry.dealId, error: error instanceof Error ? error.message : String(error) });
+  });
   return signed;
 }
 
