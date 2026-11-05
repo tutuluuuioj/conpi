@@ -118,11 +118,11 @@ export const teeApi = {
     return res.json();
   },
 
-  async initTicket(ticketId: string, dealId: number, buyer: string, seller: string): Promise<TicketResponse> {
+  async initTicket(ticketId: string, dealId: number, buyer: string, seller: string, onChainTermsHashHex?: string): Promise<TicketResponse> {
     const res = await fetch(`${TEE_BASE_URL}/v1/tickets/${ticketId}/init`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ dealId, buyer, seller }),
+      body: JSON.stringify({ dealId, buyer, seller, onChainTermsHashHex }),
     });
     if (!res.ok) throw new Error(`Failed to init ticket: ${res.statusText}`);
     return res.json();

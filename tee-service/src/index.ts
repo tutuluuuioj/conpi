@@ -68,11 +68,15 @@ export async function buildApp() {
   });
 
   // 2. Private Negotiation Ticket & Terms Matching
-  app.post("/v1/tickets/:id/init", async (req) => {
+  app.post("/v1/tickets/:id/init", async (req, reply) => {
     const { id } = req.params as { id: string };
-    const { dealId, buyer, seller } = req.body as { dealId: number; buyer: string; seller: string };
-    negotiationService.getOrCreateTicket(id, dealId, buyer, seller);
-    return negotiationService.getTicketView(id);
+    const { dealId, buyer, seller, onChainTermsHashHex } = req.body as { dealId: number; buyer: string; seller: string; onChainTermsHashHex?: string };
+    try {
+      negotiationService.getOrCreateTicket(id, dealId, buyer, seller, onChainTermsHashHex);
+      return negotiationService.getTicketView(id);
+    } catch (err: any) {
+      return reply.status(400).send({ error: err.message });
+    }
   });
 
   app.get("/v1/tickets/:id", async (req, reply) => {

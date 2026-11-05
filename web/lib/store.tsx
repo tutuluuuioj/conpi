@@ -149,6 +149,12 @@ async function saveDealListingMetadata(listing: Listing, dealId: string): Promis
   return boundListing;
 }
 
+function onChainTermsHashHex(deal: OnChainDeal | null | undefined): string | undefined {
+  const hash = deal?.terms_hash;
+  if (!Array.isArray(hash) || hash.length !== 32) return undefined;
+  return Buffer.from(hash).toString("hex");
+}
+
 function toYoctoNear(nearAmount: number): string {
   if (!nearAmount || isNaN(nearAmount) || nearAmount <= 0) return "0";
   // Safe 12-decimal string parsing into 24-decimal yocto to prevent IEEE 754 precision loss
@@ -816,6 +822,7 @@ export function Providers({ children }: { children: React.ReactNode }) {
         let outcome: any;
         let id: string;
         let txHash = "";
+        let createdTermsHashHex: string | undefined;
         try {
           const params = await dealParamsForListing(listing, buyer, seller);
           const beforeDeals = await fetchContractDeals(0, 100);
@@ -834,6 +841,8 @@ export function Providers({ children }: { children: React.ReactNode }) {
           }
           if (onChainId === null) throw new Error("The transaction succeeded, but its on-chain deal ID could not be resolved");
           id = String(onChainId);
+          createdTermsHashHex = onChainTermsHashHex(await fetchContractDeal(onChainId));
+          if (!createdTermsHashHex) throw new Error("The created deal is missing its canonical on-chain terms hash");
           const boundListing = await saveDealListingMetadata(listing, id);
           setState((s) => ({
             ...s,
@@ -861,7 +870,7 @@ export function Providers({ children }: { children: React.ReactNode }) {
           buyer,
           seller,
           deadline: agreed.deadline,
-          termsHash: null,
+          termsHash: `0x${createdTermsHashHex}`,
           buyerSubmitted: false,
           sellerSubmitted: false,
           buyerTerms: agreed,
@@ -894,7 +903,7 @@ export function Providers({ children }: { children: React.ReactNode }) {
         };
         setState((s) => ({ ...s, deals: [deal, ...s.deals] }));
         try {
-          const ticket = await teeApi.initTicket(id, Number(id), buyer, seller);
+          const ticket = await teeApi.initTicket(id, Number(id), buyer, seller, createdTermsHashHex);
           applyTicketState(id, ticket);
           replaceToast(pendingToast, {
             kind: "success",
@@ -975,7 +984,7 @@ export function Providers({ children }: { children: React.ReactNode }) {
           try {
             ticket = await teeApi.getTicket(dealId);
           } catch {
-            ticket = await teeApi.initTicket(dealId, Number(dealId), deal.buyer, deal.seller);
+            ticket = await teeApi.initTicket(dealId, Number(dealId), deal.buyer, deal.seller, deal.termsHash?.replace(/^0x/, ""));
           }
           applyTicketState(dealId, ticket);
         } catch {
@@ -1474,11 +1483,14 @@ export function Providers({ children }: { children: React.ReactNode }) {
 
             if (dealId) {
               const boundListing = await saveDealListingMetadata(listing, String(dealId));
+              const createdDeal = await fetchContractDeal(Number(dealId));
+              const createdTermsHashHex = onChainTermsHashHex(createdDeal);
+              if (!createdTermsHashHex) throw new Error("The created deal is missing its canonical on-chain terms hash");
               setState((s) => ({
                 ...s,
                 listings: [boundListing, ...s.listings.filter((item) => item.id !== listing.id)],
               }));
-              await teeApi.initTicket(String(dealId), Number(dealId), buyer, current.account).catch(() => undefined);
+              await teeApi.initTicket(String(dealId), Number(dealId), buyer, current.account, createdTermsHashHex);
             }
 
             setTimeout(loadOnChainData, 2000);

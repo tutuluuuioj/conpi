@@ -85,7 +85,8 @@ async function runTests() {
   // 4. Negotiation Matcher Test
   console.log("\n[Test 4] Testing Negotiation Ticket & Terms Matcher...");
   const ticketId = "ticket-test-01";
-  negotiationService.getOrCreateTicket(ticketId, 1, "buyer.near", "seller.near");
+  const canonicalOnChainTermsHash = "ab".repeat(32);
+  negotiationService.getOrCreateTicket(ticketId, 1, "buyer.near", "seller.near", canonicalOnChainTermsHash);
 
   const termA = {
     provider: "OpenAI" as const,
@@ -136,6 +137,9 @@ async function runTests() {
   console.log("  Matched signature:", ticketMatched.signatureHex?.slice(0, 32) + "...");
   if (!ticketMatched.matched || !ticketMatched.termsHashHex || !ticketMatched.signatureHex) {
     throw new Error("Terms matching failed");
+  }
+  if (ticketMatched.termsHashHex !== canonicalOnChainTermsHash) {
+    throw new Error("Negotiation signature did not preserve the canonical on-chain terms hash");
   }
   let substitutionRejected = false;
   try {

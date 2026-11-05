@@ -26,6 +26,7 @@ export interface TicketState {
   dealId: number;
   buyer: string;
   seller: string;
+  onChainTermsHashHex?: string;
   buyerTerms?: TermSheet;
   sellerTerms?: TermSheet;
   matched: boolean;
@@ -72,7 +73,17 @@ export function normalizeTerms(input: any): TermSheet {
 class NegotiationService {
   private tickets = new Map<string, TicketState>();
 
-  public getOrCreateTicket(ticketId: string, dealId: number, buyer: string, seller: string): TicketState {
+  public getOrCreateTicket(
+    ticketId: string,
+    dealId: number,
+    buyer: string,
+    seller: string,
+    onChainTermsHashHex?: string
+  ): TicketState {
+    const normalizedHash = onChainTermsHashHex?.replace(/^0x/, "").trim().toLowerCase();
+    if (normalizedHash && !/^[0-9a-f]{64}$/.test(normalizedHash)) {
+      throw new Error("On-chain terms hash must be exactly 32 bytes of hex");
+    }
     let ticket = this.tickets.get(ticketId);
     if (!ticket) {
       ticket = {
@@ -80,11 +91,20 @@ class NegotiationService {
         dealId,
         buyer,
         seller,
+        onChainTermsHashHex: normalizedHash,
         matched: false,
         messages: [],
         updatedAt: new Date().toISOString(),
       };
       this.tickets.set(ticketId, ticket);
+    } else {
+      if (ticket.dealId !== dealId || ticket.buyer !== buyer || ticket.seller !== seller) {
+        throw new Error(`Ticket ${ticketId} is already bound to different deal participants`);
+      }
+      if (ticket.onChainTermsHashHex && normalizedHash && ticket.onChainTermsHashHex !== normalizedHash) {
+        throw new Error(`Ticket ${ticketId} is already bound to a different on-chain terms hash`);
+      }
+      if (!ticket.onChainTermsHashHex && normalizedHash) ticket.onChainTermsHashHex = normalizedHash;
     }
     return ticket;
   }
@@ -232,9 +252,10 @@ class NegotiationService {
         };
 
         const termsHashBytes = computeTermsHash(params);
-        ticket.termsHashHex = Buffer.from(termsHashBytes).toString("hex");
+        ticket.termsHashHex = ticket.onChainTermsHashHex || Buffer.from(termsHashBytes).toString("hex");
 
-        const msgBytes = buildTermsMessage(CONFIG.networkId, CONFIG.contractId, ticket.dealId, termsHashBytes);
+        const signedTermsHashBytes = Buffer.from(ticket.termsHashHex, "hex");
+        const msgBytes = buildTermsMessage(CONFIG.networkId, CONFIG.contractId, ticket.dealId, signedTermsHashBytes);
         const sig = enclaveKeys.sign(msgBytes);
         ticket.signatureHex = Buffer.from(sig).toString("hex");
       } else {
