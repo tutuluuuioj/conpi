@@ -11,6 +11,8 @@ import type { Asset, Provider } from "@/lib/types";
 import { Button, Card, Field, Overline, fieldClass } from "./ui";
 
 const STEPS = ["Credit", "Price", "Review"];
+const MIN_CREDIT_USD = 0.05;
+const MIN_PRICE_USD = MIN_CREDIT_USD * 0.5;
 
 export function CreateView() {
   const app = useApp();
@@ -19,8 +21,8 @@ export function CreateView() {
   const [provider, setProvider] = useState<Provider>("OpenAI");
   const [models, setModels] = useState<string[]>(["gpt-4o"]);
   const [customModel, setCustomModel] = useState("");
-  const [credit, setCredit] = useState(0.1);
-  const [price, setPrice] = useState(0.08);
+  const [credit, setCredit] = useState(MIN_CREDIT_USD);
+  const [price, setPrice] = useState(0.04);
   const [collateral, setCollateral] = useState(20);
   const [token, setToken] = useState<Asset>("NEAR");
   const [buyerAccount, setBuyerAccount] = useState("");
@@ -59,8 +61,8 @@ export function CreateView() {
   };
 
   const next = () => {
-    if (step === 0 && (!models.length || credit < 0.1 || credit > 1000)) {
-      setError("Choose at least one model and a credit amount from $0.10 to $1,000.");
+    if (step === 0 && (!models.length || credit < MIN_CREDIT_USD || credit > 1000)) {
+      setError("Choose at least one model and a credit amount from $0.05 to $1,000.");
       return;
     }
     if (step === 1) {
@@ -180,8 +182,8 @@ export function CreateView() {
               label="Credit amount"
               hint={
                 token === "NEAR"
-                  ? `USD value of prepaid credit (min $0.10). ≈ ${(credit / nearPrice).toFixed(4)} NEAR @ $${nearPrice.toFixed(2)}/NEAR`
-                  : "USD value of prepaid credit (min $0.10)."
+                  ? `USD value of prepaid credit (min $0.05). ≈ ${(credit / nearPrice).toFixed(4)} NEAR @ $${nearPrice.toFixed(2)}/NEAR`
+                  : "USD value of prepaid credit (min $0.05)."
               }
             >
               <input
@@ -189,7 +191,7 @@ export function CreateView() {
                 type="number"
                 inputMode="decimal"
                 step="any"
-                min={0.1}
+                min={MIN_CREDIT_USD}
                 max={1000}
                 value={credit}
                 onChange={(event) => {
@@ -218,7 +220,7 @@ export function CreateView() {
                 type="number"
                 inputMode="decimal"
                 step="any"
-                min={0.05}
+                min={MIN_PRICE_USD}
                 value={price}
                 onChange={(event) => setPrice(Number(event.target.value))}
               />
