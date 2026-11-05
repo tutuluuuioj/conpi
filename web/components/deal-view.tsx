@@ -93,13 +93,17 @@ export function DealView({ id }: { id: string }) {
   }
 
   const escrow = escrowOf(deal);
-  const depositAmount = deal.role === "buyer" ? escrow.buyerDeposit : escrow.sellerDeposit;
+  const depositAmount = deal.role === "buyer"
+    ? (deal.buyerDepositRemaining ?? escrow.buyerDeposit)
+    : (deal.sellerDepositRemaining ?? escrow.sellerDeposit);
   const myDeposited = deal.role === "buyer" ? deal.buyerDeposited : deal.sellerDeposited;
 
   const isNear = deal.token === "NEAR";
   const creditUsd = deal.creditUsd ?? (isNear ? deal.credit * 4.02 : deal.credit);
   const priceUsd = deal.priceUsd ?? (isNear ? deal.price * 4.02 : deal.price);
-  const fmtDeposit = isNear ? `${depositAmount.toFixed(4)} NEAR` : usd(depositAmount);
+  const fmtDeposit = isNear
+    ? `${depositAmount > 0 && depositAmount < 0.0001 ? "<0.0001" : depositAmount.toFixed(4)} NEAR`
+    : usd(depositAmount);
   const pctUsed = creditUsd > 0 ? ((deal.usedUsd / creditUsd) * 100).toFixed(2) : "0.00";
   const tokensText = deal.tokens >= 1_000_000
     ? `${(deal.tokens / 1_000_000).toFixed(2)}M`
@@ -132,6 +136,18 @@ export function DealView({ id }: { id: string }) {
   };
 
   const cancel = () => {
+    const isDeadlineActive = deal.status === "Created" && deal.depositDeadline && new Date(deal.depositDeadline).getTime() > Date.now();
+    if (isDeadlineActive) {
+      const deadlineStr = new Date(deal.depositDeadline).toLocaleString();
+      app.ask({
+        title: "Deposit deadline still active",
+        body: `The smart contract enforces a deposit lock until ${deadlineStr}. Escrow funds can only be refunded via timeout_refund after this deadline expires. Submitting now will be rejected on-chain with "Deposit deadline has not passed yet".`,
+        confirm: "Attempt refund anyway",
+        danger: true,
+        run: () => app.cancelDeal(deal.id),
+      });
+      return;
+    }
     app.ask({
       title: "Cancel this deal",
       body: "Cancellation is only available before the proxy key goes live. Any deposit you made is refunded.",

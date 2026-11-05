@@ -47,6 +47,10 @@ export interface MeterResponse {
   usedUsd: number;
   tokensTotal: number;
   active: boolean;
+  provider: string;
+  model: string;
+  models: string[];
+  lockedPricing: Record<string, { inputPerMillion: number; outputPerMillion: number; cachedInputPerMillion?: number }>;
   creditUsd: number;
   priceUsd: number;
   lastCheckpointAt?: string;

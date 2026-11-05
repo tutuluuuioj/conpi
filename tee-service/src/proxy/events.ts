@@ -13,6 +13,10 @@ export interface MeterEvent {
   tokensTotal: number;
   percent: number;
   active: boolean;
+  provider: string;
+  model: string;
+  models: string[];
+  lockedPricing: VaultEntry["lockedPricing"];
   stages: number[];
   timestamp: string;
 }
@@ -31,6 +35,10 @@ class MeterEventHub {
       tokensTotal: entry.tokensTotal,
       percent: entry.creditUsd > 0 ? Math.min(100, (entry.usedUsd / entry.creditUsd) * 100) : 0,
       active: entry.active,
+      provider: entry.provider,
+      model: entry.model,
+      models: entry.models,
+      lockedPricing: entry.lockedPricing,
       stages,
       timestamp: new Date().toISOString(),
     };

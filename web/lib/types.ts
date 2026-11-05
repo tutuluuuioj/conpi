@@ -30,6 +30,7 @@ export type Outcome =
 
 export interface Listing {
   id: string;
+  dealId?: string;
   type: ListingType;
   provider: Provider;
   model: string;
@@ -131,6 +132,8 @@ export interface Deal {
   sellerTerms: Terms;
   buyerDeposited: boolean;
   sellerDeposited: boolean;
+  buyerDepositRemaining?: number;
+  sellerDepositRemaining?: number;
   depositDeadline: string;
   keyStatus: "idle" | "checking" | "verified";
   keyChecks: { label: string; ok: boolean }[];

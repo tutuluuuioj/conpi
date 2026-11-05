@@ -64,6 +64,7 @@ export function MarketView() {
 
   const filtered = useMemo(() => {
     const rows = app.listings.filter((listing) => {
+      if (listing.published === false || listing.dealId) return false;
       if (listing.type !== filters.side) return false;
       if (filters.providers.length && !filters.providers.includes(listing.provider)) return false;
       if (filters.model && !listing.models.some((model) => model.toLowerCase().includes(filters.model.toLowerCase())) && listing.model !== filters.model) return false;

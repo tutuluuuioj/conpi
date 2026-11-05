@@ -2,7 +2,7 @@
 
 import { createContext, useContext, useEffect, useMemo, useRef, useState } from "react";
 import { BASE_URL, CONFIG, CONTRACT_ID, MARKET_SNAPSHOT, TEE_SIGNER_PUBLIC_KEY, TX } from "./chain";
-import { KEY_CHECKS, MODELS, listingTerms } from "./data";
+import { KEY_CHECKS, listingTerms } from "./data";
 import { maskKey, round2, sameTerms, usd } from "./format";
 import { escrowOf, settleComplete, settleRevoke, stageFor } from "./money";
 import type { Asset, Claim, Deal, DealStatus, DealStep, Listing, Notice, Proposal, SignResult, Terms, ThemeMode, Toast, WalletName } from "./types";
@@ -123,6 +123,32 @@ interface Api {
 const Ctx = createContext<(State & Api) | null>(null);
 const PUBLISHED_LISTINGS_KEY = "conpi-published-listings-v1";
 
+function priceRowsFromLockedPricing(lockedPricing: any): Deal["prices"] {
+  if (!lockedPricing || typeof lockedPricing !== "object") return [];
+  return Object.entries(lockedPricing).map(([model, value]: [string, any]) => ({
+    model,
+    input: `$${Number(value?.inputPerMillion || 0).toFixed(4)} / 1M`,
+    output: `$${Number(value?.outputPerMillion || 0).toFixed(4)} / 1M`,
+  }));
+}
+
+async function saveDealListingMetadata(listing: Listing, dealId: string): Promise<Listing> {
+  const boundListing: Listing = { ...listing, dealId, published: false };
+  try {
+    const saved = JSON.parse(localStorage.getItem(PUBLISHED_LISTINGS_KEY) || "[]");
+    const current = Array.isArray(saved) ? saved.filter((item: Listing) => item.id !== listing.id) : [];
+    localStorage.setItem(PUBLISHED_LISTINGS_KEY, JSON.stringify([boundListing, ...current]));
+  } catch {
+    localStorage.setItem(PUBLISHED_LISTINGS_KEY, JSON.stringify([boundListing]));
+  }
+  await fetch("/api/listings", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(boundListing),
+  }).catch(() => undefined);
+  return boundListing;
+}
+
 function toYoctoNear(nearAmount: number): string {
   if (!nearAmount || isNaN(nearAmount) || nearAmount <= 0) return "0";
   // Safe 12-decimal string parsing into 24-decimal yocto to prevent IEEE 754 precision loss
@@ -242,17 +268,22 @@ export function useApp() {
 function mapOnChainDeal(d: OnChainDeal, currentAccount: string | null): Deal {
   const raw = d as any;
   const chainStatus = String(d.status);
-  const balanceIsPositive = (value: string | number | boolean | undefined): boolean => {
-    if (typeof value === "boolean") return value;
-    if (value === undefined || value === null || value === "") return false;
-    try { return BigInt(value) > BigInt(0); } catch { return Number(value) > 0; }
-  };
   const priceNear = Number(d.price) / 1e24;
   const creditNear = Number(d.credit_amount) / 1e24;
   const meteredNear = Number(d.metered_value ?? raw.last_signed?.metered_value ?? 0) / 1e24;
   const releasedNear = Number(d.released_amount ?? raw.released_to_seller ?? 0) / 1e24;
-  const buyerDeposited = balanceIsPositive(d.buyer_deposited);
-  const sellerDeposited = balanceIsPositive(d.seller_deposited);
+  const toBigInt = (value: string | number | boolean | undefined): bigint => {
+    if (typeof value === "boolean" || value === undefined || value === null || value === "") return BigInt(0);
+    try { return BigInt(value); } catch { return BigInt(0); }
+  };
+  const requiredBuyerDeposit = toBigInt(d.price) + toBigInt(d.buyer_collateral);
+  const requiredSellerDeposit = toBigInt(d.seller_collateral);
+  const currentBuyerDeposit = toBigInt(d.buyer_deposited);
+  const currentSellerDeposit = toBigInt(d.seller_deposited);
+  const buyerDeposited = requiredBuyerDeposit > BigInt(0) && currentBuyerDeposit >= requiredBuyerDeposit;
+  const sellerDeposited = requiredSellerDeposit > BigInt(0) && currentSellerDeposit >= requiredSellerDeposit;
+  const buyerDepositRemainingYocto = requiredBuyerDeposit > currentBuyerDeposit ? requiredBuyerDeposit - currentBuyerDeposit : BigInt(0);
+  const sellerDepositRemainingYocto = requiredSellerDeposit > currentSellerDeposit ? requiredSellerDeposit - currentSellerDeposit : BigInt(0);
   const buyerSubmitted = Boolean(d.terms_submitted_by_buyer ?? d.terms_hash?.length);
   const sellerSubmitted = Boolean(d.terms_submitted_by_seller ?? raw.counterparty_accepted);
   const currentStage = Number(d.current_stage ?? raw.stage_reached ?? raw.last_signed?.stage ?? 0);
@@ -318,7 +349,11 @@ function mapOnChainDeal(d: OnChainDeal, currentAccount: string | null): Deal {
     sellerTerms: defaultTerms,
     buyerDeposited,
     sellerDeposited,
-    depositDeadline: new Date(Date.now() + 86400000 * 2).toISOString(),
+    buyerDepositRemaining: Number(buyerDepositRemainingYocto) / 1e24,
+    sellerDepositRemaining: Number(sellerDepositRemainingYocto) / 1e24,
+    depositDeadline: d.deposit_deadline
+      ? new Date(Number(toBigInt(d.deposit_deadline) / BigInt(1_000_000))).toISOString()
+      : new Date(Date.now() + 86400000 * 2).toISOString(),
     keyStatus: ["Active", "Settled", "Completed"].includes(chainStatus) ? "verified" : "idle",
     keyChecks: KEY_CHECKS.map((label) => ({ label, ok: ["Active", "Settled", "Completed"].includes(chainStatus) })),
     proxyKey: "",
@@ -388,11 +423,16 @@ export function Providers({ children }: { children: React.ReactNode }) {
 
   // 2. Fetch live data from contract
   const loadOnChainData = async () => {
+    setState((s) => ({ ...s, isLoadingOnChain: true }));
     try {
-      const [onChainDeals, stagedProposals, liveNearPrice] = await Promise.all([
+      const [onChainDeals, stagedProposals, liveNearPrice, serverListings] = await Promise.all([
         fetchContractDeals(0, 100),
         fetchContractStagedProposals(),
         getLiveNearPrice().catch(() => 4.02),
+        fetch("/api/listings", { cache: "no-store" })
+          .then((res) => res.ok ? res.json() : null)
+          .then((data) => Array.isArray(data?.listings) ? data.listings as Listing[] : [])
+          .catch(() => [] as Listing[]),
       ]);
 
       // Proxy credentials remain in this browser only; never expose them from a shared server route.
@@ -403,6 +443,15 @@ export function Providers({ children }: { children: React.ReactNode }) {
           if (raw) Object.assign(storedKeys, JSON.parse(raw));
         } catch {}
       }
+      let localListings: Listing[] = [];
+      if (typeof window !== "undefined") {
+        try {
+          const saved = JSON.parse(localStorage.getItem(PUBLISHED_LISTINGS_KEY) || "[]");
+          if (Array.isArray(saved)) localListings = saved;
+        } catch {}
+      }
+      const metadataListings = [...serverListings, ...localListings, ...stateRef.current.listings]
+        .filter((listing, index, all) => all.findIndex((item) => item.id === listing.id) === index);
 
       // For any deal in Active status, fetch live TEE meter!
       const activeDeals = onChainDeals.filter((d) => String(d.status) === "Active");
@@ -428,6 +477,7 @@ export function Providers({ children }: { children: React.ReactNode }) {
       const mappedDeals = onChainDeals.map((d) => {
         const mapped = mapOnChainDeal(d, currentAccount);
         const existing = stateRef.current.deals.find((item) => item.id === String(d.id));
+        const listing = metadataListings.find((item) => String(item.dealId || "") === String(d.id));
         const resolvedProxyKey = existing?.proxyKey || storedKeys[String(d.id)] || "";
         const liveMeter = meterMap.get(Number(d.id));
 
@@ -440,8 +490,19 @@ export function Providers({ children }: { children: React.ReactNode }) {
           ? `TEE Enclave (${new Date(liveMeter.timestamp).toLocaleTimeString()})`
           : existing?.lastUpdate || mapped.lastUpdate;
 
+        const provider = liveMeter?.provider || listing?.provider || existing?.provider || mapped.provider;
+        const models = Array.isArray(liveMeter?.models) && liveMeter.models.length
+          ? liveMeter.models
+          : listing?.models?.length ? listing.models : existing?.models?.length ? existing.models : mapped.models;
+        const model = liveMeter?.model || listing?.model || existing?.model || models[0] || mapped.model;
+        const lockedPriceRows = priceRowsFromLockedPricing(liveMeter?.lockedPricing);
+
         return {
           ...mapped,
+          listingId: listing?.id || existing?.listingId || mapped.listingId,
+          provider,
+          model,
+          models,
           proxyKey: resolvedProxyKey,
           usedUsd,
           tokens,
@@ -449,6 +510,9 @@ export function Providers({ children }: { children: React.ReactNode }) {
           priceUsd,
           stage,
           lastUpdate,
+          prices: lockedPriceRows.length ? lockedPriceRows : existing?.prices || mapped.prices,
+          buyerTerms: existing?.buyerTerms || (listing ? { ...listingTerms(listing), creditUsd: listing.credit, priceUsd: listing.price } : mapped.buyerTerms),
+          sellerTerms: existing?.sellerTerms || (listing ? { ...listingTerms(listing), creditUsd: listing.credit, priceUsd: listing.price } : mapped.sellerTerms),
           heartbeat: liveMeter?.active ? "live" : mapped.heartbeat,
         };
       });
@@ -552,7 +616,7 @@ export function Providers({ children }: { children: React.ReactNode }) {
       });
 
       setState((s) => {
-        const publishedListings = s.listings.filter((listing) => listing.published);
+        const publishedListings = metadataListings.filter((listing) => listing.published && !listing.dealId);
         const publishedIds = new Set(publishedListings.map((listing) => listing.id));
         return {
           ...s,
@@ -586,7 +650,9 @@ export function Providers({ children }: { children: React.ReactNode }) {
           const res = await fetch("/api/listings");
           if (res.ok) {
             const data = await res.json();
-            if (data.ok && Array.isArray(data.listings)) serverPub = data.listings;
+            if (data.ok && Array.isArray(data.listings)) {
+              serverPub = data.listings.filter((listing: Listing) => listing.published && !listing.dealId);
+            }
           }
         } catch {}
 
@@ -768,6 +834,11 @@ export function Providers({ children }: { children: React.ReactNode }) {
           }
           if (onChainId === null) throw new Error("The transaction succeeded, but its on-chain deal ID could not be resolved");
           id = String(onChainId);
+          const boundListing = await saveDealListingMetadata(listing, id);
+          setState((s) => ({
+            ...s,
+            listings: s.listings.map((item) => item.id === listing.id ? boundListing : item),
+          }));
         } catch (err: any) {
           replaceToast(pendingToast, { kind: "error", title: "Deal creation failed", body: err.message });
           return null;
@@ -1024,20 +1095,29 @@ export function Providers({ children }: { children: React.ReactNode }) {
         pushToast({ kind: "pending", title: "Validating key in TEE Enclave..." });
 
         try {
-          let provider = (deal.provider || "OpenAI").toLowerCase();
-          let model = deal.model || "gpt-4o";
-          let models = deal.models || ["gpt-4o", "gpt-4o-mini"];
+          const provider = (deal.provider || "OpenAI").toLowerCase();
+          const model = deal.model?.trim();
+          const models = Array.from(new Set(
+            (deal.models?.length ? deal.models : [model])
+              .map((item) => item?.trim())
+              .filter((item): item is string => Boolean(item))
+          ));
+          if (!model || !models.length || !models.includes(model)) {
+            pushToast({ kind: "error", title: "Deal model terms are missing", body: "Reload the original listing metadata before activating this deal." });
+            return;
+          }
 
-          if (plainApiKey.startsWith("sk-or-v1-") || plainApiKey.startsWith("sk-or-")) {
-            provider = "openrouter";
-            model = "meta-llama/llama-3.2-1b-instruct";
-            models = ["meta-llama/llama-3.2-1b-instruct"];
-          } else if (plainApiKey.startsWith("sk-ant-")) {
-            provider = "anthropic";
-            model = "claude-sonnet-4-6";
-            models = ["claude-sonnet-4-6"];
-          } else if (plainApiKey.startsWith("sk-rp-")) {
-            provider = "redpill";
+          const detectedProvider = plainApiKey.startsWith("sk-or-v1-") || plainApiKey.startsWith("sk-or-")
+            ? "openrouter"
+            : plainApiKey.startsWith("sk-ant-") ? "anthropic"
+              : plainApiKey.startsWith("sk-rp-") ? "redpill" : null;
+          if (detectedProvider && detectedProvider !== provider) {
+            pushToast({
+              kind: "error",
+              title: "Provider key does not match this deal",
+              body: `This deal is locked to ${deal.provider}; the submitted key appears to be for ${detectedProvider}.`,
+            });
+            return;
           }
 
           // If counterparty hasn't accepted yet on-chain, accept first to transition deal to Funded
@@ -1256,13 +1336,18 @@ export function Providers({ children }: { children: React.ReactNode }) {
               const usedUsd = Number(data.usedUsd ?? item.usedUsd);
               const tokens = Number(data.tokensTotal ?? item.tokens);
               const stage = creditUsd > 0 ? Math.min(100, Math.floor((usedUsd / creditUsd) * 100)) : item.stage;
+              const lockedPriceRows = priceRowsFromLockedPricing(data.lockedPricing);
               return {
                 ...item,
+                provider: (data.provider || item.provider) as Deal["provider"],
+                model: data.model || item.model,
+                models: Array.isArray(data.models) && data.models.length ? data.models : item.models,
                 usedUsd,
                 tokens,
                 creditUsd,
                 priceUsd,
                 stage,
+                prices: lockedPriceRows.length ? lockedPriceRows : item.prices,
                 lastUpdate: `TEE Enclave (${new Date().toLocaleTimeString()})`,
                 heartbeat: data.active ? "live" : item.heartbeat,
               };
@@ -1305,13 +1390,18 @@ export function Providers({ children }: { children: React.ReactNode }) {
           const creditUsd = Number(event.creditUsd) || deal.creditUsd || (deal.token === "NEAR" ? deal.credit * 4.02 : deal.credit);
           const priceUsd = Number(event.priceUsd) || deal.priceUsd || (deal.token === "NEAR" ? deal.price * 4.02 : deal.price);
           const stage = creditUsd > 0 ? Math.max(deal.stage, ...event.stages, Math.min(100, Math.floor((event.usedUsd / creditUsd) * 100))) : deal.stage;
+          const lockedPriceRows = priceRowsFromLockedPricing(event.lockedPricing);
           return {
             ...deal,
+            provider: (event.provider || deal.provider) as Deal["provider"],
+            model: event.model || deal.model,
+            models: event.models?.length ? event.models : deal.models,
             usedUsd: event.usedUsd,
             tokens: event.tokensTotal,
             creditUsd,
             priceUsd,
             stage,
+            prices: lockedPriceRows.length ? lockedPriceRows : deal.prices,
             heartbeat: event.active ? "live" : deal.heartbeat,
             pulseStage: event.stages.length ? event.stages[event.stages.length - 1] : deal.pulseStage,
             lastUpdate: `TEE Enclave (${new Date(event.timestamp).toLocaleTimeString()})`,
@@ -1380,6 +1470,15 @@ export function Providers({ children }: { children: React.ReactNode }) {
               const deals = await fetchContractDeals(0, 100);
               const latest = deals.filter((d) => d.buyer === buyer && d.seller === current.account).sort((a, b) => Number(b.id) - Number(a.id))[0];
               if (latest) dealId = Number(latest.id);
+            }
+
+            if (dealId) {
+              const boundListing = await saveDealListingMetadata(listing, String(dealId));
+              setState((s) => ({
+                ...s,
+                listings: [boundListing, ...s.listings.filter((item) => item.id !== listing.id)],
+              }));
+              await teeApi.initTicket(String(dealId), Number(dealId), buyer, current.account).catch(() => undefined);
             }
 
             setTimeout(loadOnChainData, 2000);

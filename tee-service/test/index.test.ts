@@ -6,8 +6,10 @@ import { encryptToEnclave, decryptFromClient } from "../src/crypto/encryption.js
 import { negotiationService } from "../src/negotiation/matcher.js";
 import { keyVault, fetchLiveNearPriceUsd } from "../src/vault/preflight.js";
 import { calculateCost, meterEngine } from "../src/proxy/meter.js";
+import { openRouterPricingFromModels } from "../src/proxy/pricing.js";
 import { buildApp, INTERNAL_SERVER_TOKEN } from "../src/index.js";
 import { isProviderBan } from "../src/proxy/server.js";
+import { nearRelayer } from "../src/chain/relayer.js";
 
 async function runTests() {
   console.log("=== RUNNING CONPI TEE SERVICE UNIT TESTS ===");
@@ -135,6 +137,13 @@ async function runTests() {
   if (!ticketMatched.matched || !ticketMatched.termsHashHex || !ticketMatched.signatureHex) {
     throw new Error("Terms matching failed");
   }
+  let substitutionRejected = false;
+  try {
+    negotiationService.assertMatchedDealTerms(1, "OpenAI", ["gpt-4o-mini"], ticketMatched.termsHashHex);
+  } catch {
+    substitutionRejected = true;
+  }
+  if (!substitutionRejected) throw new Error("TEE accepted a model allowlist that differs from the matched terms");
   const ticketWithMessage = negotiationService.addEncryptedMessage(
     ticketId,
     "buyer.near",
@@ -147,11 +156,21 @@ async function runTests() {
 
   // 5. Key Injection & Pre-flight Test
   console.log("\n[Test 5] Testing Key Injection & Pre-flight Validation...");
+  (nearRelayer as any).getDeal = async () => ({
+    id: 1,
+    token: "usdc.testnet",
+    credit_amount: "80000000",
+    price: "60000000",
+    terms_hash: Array.from(Buffer.from(ticketMatched.termsHashHex!, "hex")),
+    last_nonce: 0,
+    stage_reached: 0,
+    status: "Funded",
+  });
   const keyResult = await keyVault.validateAndInjectKey(
     1,
     "OpenAI",
     "gpt-4o",
-    ["gpt-4o", "gpt-4o-mini"],
+    ["gpt-4o"],
     80,
     60,
     ticketMatched.termsHashHex,
@@ -174,6 +193,22 @@ async function runTests() {
   const cost1 = calculateCost("gpt-4o", 1000, 500); // 1000 in ($0.0025) + 500 out ($0.005) = $0.0075
   console.log("  Calculated cost for 1k in / 500 out:", cost1.costUsd);
   if (Math.abs(cost1.costUsd - 0.0075) > 0.0001) throw new Error("Cost calculation mismatch");
+
+  const openRouterSnapshot = openRouterPricingFromModels(
+    ["meta-llama/llama-3.2-1b-instruct", "anthropic/claude-sonnet-4.6"],
+    [
+      { id: "meta-llama/llama-3.2-1b-instruct", pricing: { prompt: "0.0000000275", completion: "0.00000004" } },
+      { id: "anthropic/claude-sonnet-4.6", pricing: { prompt: "0.000003", completion: "0.000015", input_cache_read: "0.0000003" } },
+    ]
+  );
+  const observedLlamaUsage = calculateCost("meta-llama/llama-3.2-1b-instruct", 2_741_058, 0, 0, openRouterSnapshot);
+  if (Math.abs(observedLlamaUsage.costUsd - 0.075379095) > 1e-12) {
+    throw new Error(`OpenRouter catalogue snapshot produced the wrong cost: ${observedLlamaUsage.costUsd}`);
+  }
+  const claudeUsage = calculateCost("anthropic/claude-sonnet-4.6", 1_000, 500, 0, openRouterSnapshot);
+  if (Math.abs(claudeUsage.costUsd - 0.0105) > 1e-12) {
+    throw new Error(`Per-model OpenRouter pricing was not applied: ${claudeUsage.costUsd}`);
+  }
 
   const entry = keyVault.getByDealId(1)!;
   // Isolate milestone emission from any historical stage already present on

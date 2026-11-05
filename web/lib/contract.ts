@@ -3,6 +3,14 @@ import { CONTRACT_ID } from "./chain";
 export const NEAR_RPC_URL = process.env.NEXT_PUBLIC_NEAR_RPC || "https://test.rpc.fastnear.com";
 const FALLBACK_RPC_URL = "https://rpc.testnet.near.org";
 
+function parseNearResult<T>(value: string): T {
+  // Contract view methods currently serialize u128 balances as JSON numbers.
+  // Quote integers beyond Number.MAX_SAFE_INTEGER before JSON.parse so wallet
+  // deposits retain their exact yoctoNEAR value.
+  const lossless = value.replace(/([:[,]\s*)(-?\d{16,})(?=\s*[,}\]])/g, '$1"$2"');
+  return JSON.parse(lossless) as T;
+}
+
 export interface OnChainDeal {
   id: number;
   buyer: string;
@@ -68,47 +76,56 @@ export interface OnChainTeeSigner {
 
 export async function callNearRpc<T>(methodName: string, args: Record<string, any> = {}): Promise<T> {
   const argsBase64 = Buffer.from(JSON.stringify(args)).toString("base64");
-  const urls = [NEAR_RPC_URL, FALLBACK_RPC_URL].filter(Boolean);
+  // Always retain two independent providers even when NEXT_PUBLIC_NEAR_RPC is
+  // set to the official endpoint. A transient failure must not make the UI
+  // replace real on-chain deals with an empty list.
+  const urls = Array.from(new Set([
+    NEAR_RPC_URL,
+    "https://test.rpc.fastnear.com",
+    FALLBACK_RPC_URL,
+  ].filter(Boolean)));
 
   let lastError: any = null;
-  for (const url of urls) {
-    try {
-      const response = await fetch(url, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          jsonrpc: "2.0",
-          id: `query_${methodName}_${Date.now()}`,
-          method: "query",
-          params: {
-            request_type: "call_function",
-            finality: "final",
-            account_id: CONTRACT_ID,
-            method_name: methodName,
-            args_base64: argsBase64,
-          },
-        }),
-      });
+  for (let attempt = 0; attempt < 2; attempt += 1) {
+    for (const url of urls) {
+      try {
+        const response = await fetch(url, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          cache: "no-store",
+          body: JSON.stringify({
+            jsonrpc: "2.0",
+            id: `query_${methodName}_${Date.now()}_${attempt}`,
+            method: "query",
+            params: {
+              request_type: "call_function",
+              finality: "final",
+              account_id: CONTRACT_ID,
+              method_name: methodName,
+              args_base64: argsBase64,
+            },
+          }),
+        });
 
-      if (!response.ok) {
-        throw new Error(`NEAR RPC error: ${response.statusText}`);
+        if (!response.ok) {
+          throw new Error(`NEAR RPC error: ${response.status} ${response.statusText}`);
+        }
+
+        const json = await response.json();
+        if (json.error) {
+          throw new Error(json.error.message || JSON.stringify(json.error));
+        }
+
+        const rawBytes = json.result?.result;
+        if (!rawBytes || !Array.isArray(rawBytes)) {
+          throw new Error(`Invalid response bytes for ${methodName}`);
+        }
+
+        const decodedStr = new TextDecoder().decode(new Uint8Array(rawBytes));
+        return parseNearResult<T>(decodedStr);
+      } catch (err) {
+        lastError = err;
       }
-
-      const json = await response.json();
-      if (json.error) {
-        throw new Error(json.error.message || JSON.stringify(json.error));
-      }
-
-      const rawBytes = json.result?.result;
-      if (!rawBytes || !Array.isArray(rawBytes)) {
-        throw new Error(`Invalid response bytes for ${methodName}`);
-      }
-
-      const decodedStr = new TextDecoder().decode(new Uint8Array(rawBytes));
-      return JSON.parse(decodedStr) as T;
-    } catch (err) {
-      lastError = err;
-      continue;
     }
   }
 
@@ -116,12 +133,7 @@ export async function callNearRpc<T>(methodName: string, args: Record<string, an
 }
 
 export async function fetchContractDeals(fromIndex = 0, limit = 100): Promise<OnChainDeal[]> {
-  try {
-    return await callNearRpc<OnChainDeal[]>("list_deals", { from_index: fromIndex, limit });
-  } catch (err) {
-    console.warn("fetchContractDeals fallback/error:", err);
-    return [];
-  }
+  return callNearRpc<OnChainDeal[]>("list_deals", { from_index: fromIndex, limit });
 }
 
 export async function fetchContractDeal(dealId: number): Promise<OnChainDeal | null> {

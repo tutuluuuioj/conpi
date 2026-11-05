@@ -8,9 +8,13 @@ import { Button, Card, EmptyState, Meter, StatusBadge } from "./ui";
 
 export function DealsView() {
   const app = useApp();
-  const deals = app.deals.filter((deal) => !app.account || deal.buyer === app.account || deal.seller === app.account);
+  const account = app.account?.trim().toLowerCase() || "";
+  const deals = app.deals.filter((deal) => !account || deal.buyer.trim().toLowerCase() === account || deal.seller.trim().toLowerCase() === account);
+  if (app.isLoadingOnChain && !app.deals.length) {
+    return <EmptyState icon={<ArrowLeftRight className="h-6 w-6" />} title="Loading your on-chain deals…" body="Reading the NEAR Testnet escrow state." />;
+  }
   if (!deals.length) {
-    return <EmptyState icon={<ArrowLeftRight className="h-6 w-6" />} title="You have no deals yet." body="Browse the market and open a ticket." action={<Button href="/">Browse the market</Button>} />;
+    return <EmptyState icon={<ArrowLeftRight className="h-6 w-6" />} title="You have no deals yet." body="Browse the market and open a ticket." action={<div className="flex gap-2"><Button variant="secondary" onClick={() => void app.refreshOnChain()}>Retry</Button><Button href="/">Browse the market</Button></div>} />;
   }
   return (
     <div className="space-y-6">

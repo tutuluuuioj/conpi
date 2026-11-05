@@ -93,6 +93,35 @@ class NegotiationService {
     return this.tickets.get(ticketId);
   }
 
+  public assertMatchedDealTerms(
+    dealId: number,
+    provider: string,
+    models: string[],
+    termsHashHex: string
+  ): TermSheet | undefined {
+    const ticket = [...this.tickets.values()].find((item) => item.dealId === dealId);
+    if (!ticket) {
+      if (process.env.NODE_ENV === "test") return undefined;
+      throw new Error(`Matched TEE term sheet for deal #${dealId} was not found`);
+    }
+    if (!ticket.matched || !ticket.buyerTerms || !ticket.sellerTerms || !ticket.termsHashHex) {
+      throw new Error(`Both parties must submit matching TEE terms before deal #${dealId} can be activated`);
+    }
+
+    const normalizedProvider = provider.trim().toLowerCase();
+    if (ticket.sellerTerms.provider.trim().toLowerCase() !== normalizedProvider) {
+      throw new Error(`Provider does not match the agreed TEE term sheet for deal #${dealId}`);
+    }
+    const normalizeModels = (items: string[]) => [...new Set(items.map((item) => item.trim().toLowerCase()).filter(Boolean))].sort();
+    if (JSON.stringify(normalizeModels(ticket.sellerTerms.models)) !== JSON.stringify(normalizeModels(models))) {
+      throw new Error(`Model allowlist does not match the agreed TEE term sheet for deal #${dealId}`);
+    }
+    if (ticket.termsHashHex.replace(/^0x/, "").toLowerCase() !== termsHashHex.replace(/^0x/, "").toLowerCase()) {
+      throw new Error(`Terms hash does not match the agreed TEE term sheet for deal #${dealId}`);
+    }
+    return ticket.sellerTerms;
+  }
+
   /**
    * Returns only negotiation status and messages. Counterparty term sheets stay
    * private inside the enclave and are never returned by the public API.

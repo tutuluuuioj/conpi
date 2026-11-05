@@ -2,7 +2,7 @@
 
 import { useEffect, useState } from "react";
 import { useRouter } from "next/navigation";
-import { MODELS } from "@/lib/data";
+import { modelsForProvider } from "@/lib/data";
 import { ratioOf, usd } from "@/lib/format";
 import { escrowOf } from "@/lib/money";
 import { useApp } from "@/lib/store";
@@ -18,6 +18,7 @@ export function CreateView() {
   const [step, setStep] = useState(0);
   const [provider, setProvider] = useState<Provider>("OpenAI");
   const [models, setModels] = useState<string[]>(["gpt-4o"]);
+  const [customModel, setCustomModel] = useState("");
   const [credit, setCredit] = useState(0.1);
   const [price, setPrice] = useState(0.08);
   const [collateral, setCollateral] = useState(20);
@@ -25,6 +26,7 @@ export function CreateView() {
   const [buyerAccount, setBuyerAccount] = useState("");
   const [error, setError] = useState("");
   const [nearPrice, setNearPrice] = useState(4.02);
+  const availableModels = modelsForProvider(provider);
 
   useEffect(() => {
     getLiveNearPrice().then(setNearPrice).catch(() => {});
@@ -39,6 +41,21 @@ export function CreateView() {
 
   const toggle = (model: string) => {
     setModels((current) => current.includes(model) ? current.filter((item) => item !== model) : [...current, model]);
+  };
+
+  const addCustomModel = () => {
+    const model = customModel.trim();
+    if (!model) return;
+    setModels((current) => current.includes(model) ? current : [...current, model]);
+    setCustomModel("");
+  };
+
+  const changeProvider = (nextProvider: Provider) => {
+    const nextModels = modelsForProvider(nextProvider);
+    setProvider(nextProvider);
+    setModels([nextModels[0]]);
+    setCustomModel("");
+    setError("");
   };
 
   const next = () => {
@@ -121,7 +138,7 @@ export function CreateView() {
         {step === 0 ? (
           <div className="space-y-4">
             <Field label="Provider">
-              <select className={fieldClass} value={provider} onChange={(event) => setProvider(event.target.value as Provider)}>
+              <select className={fieldClass} value={provider} onChange={(event) => changeProvider(event.target.value as Provider)}>
                 <option>OpenAI</option>
                 <option>Anthropic</option>
                 <option>OpenRouter</option>
@@ -130,10 +147,34 @@ export function CreateView() {
             <div>
               <div className="mb-2 text-[13px] font-medium">Models</div>
               <div className="flex flex-wrap gap-2">
-                {MODELS.map((model) => (
+                {availableModels.map((model) => (
                   <button key={model} type="button" className={`rounded-sm border px-2 py-1 text-xs font-semibold ${models.includes(model) ? "border-brand bg-brand/10 text-brand" : "border-line text-muted"}`} onClick={() => toggle(model)}>{model}</button>
                 ))}
               </div>
+              <div className="mt-3 flex gap-2">
+                <input
+                  className={`${fieldClass} font-mono`}
+                  value={customModel}
+                  list={`models-${provider.toLowerCase()}`}
+                  onChange={(event) => setCustomModel(event.target.value)}
+                  onKeyDown={(event) => {
+                    if (event.key === "Enter") {
+                      event.preventDefault();
+                      addCustomModel();
+                    }
+                  }}
+                  placeholder={provider === "OpenRouter" ? "Exact ID, e.g. google/gemini-2.5-pro" : "Exact provider model ID"}
+                />
+                <button type="button" className="rounded-sm border border-line px-3 text-sm font-semibold text-ink" onClick={addCustomModel}>Add</button>
+                <datalist id={`models-${provider.toLowerCase()}`}>
+                  {availableModels.map((model) => <option key={model} value={model} />)}
+                </datalist>
+              </div>
+              <p className="mt-2 text-xs text-muted">
+                {provider === "OpenRouter"
+                  ? "Any exact OpenRouter model ID can be added. Its live catalogue price is verified and frozen when the deal activates."
+                  : `Add an exact ${provider} model ID. The enclave verifies both account access and supported locked pricing before activation.`}
+              </p>
             </div>
             <Field
               label="Credit amount"

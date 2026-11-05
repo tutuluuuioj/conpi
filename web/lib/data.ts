@@ -1,14 +1,23 @@
 import { BASE_URL, CONFIG, TERMS_HASH, TX } from "./chain";
-import type { Claim, Deal, Listing, Notice, Proposal, Terms } from "./types";
+import type { Claim, Deal, Listing, Notice, Proposal, Provider, Terms } from "./types";
 
-export const MODELS = [
-  "gpt-4o",
-  "gpt-4o-mini",
-  "text-embedding-3-small",
-  "text-embedding-3-large",
-  "claude-sonnet-4-6",
-  "meta-llama/llama-3-70b",
-];
+export const PROVIDER_MODELS: Record<Provider, readonly string[]> = {
+  OpenAI: ["gpt-4o", "gpt-4o-mini", "text-embedding-3-small", "text-embedding-3-large"],
+  Anthropic: ["claude-sonnet-4-6", "claude-3-5-sonnet", "claude-3-5-haiku"],
+  OpenRouter: [
+    "anthropic/claude-sonnet-4.6",
+    "openai/gpt-4o",
+    "openai/gpt-4o-mini",
+    "meta-llama/llama-3.2-1b-instruct",
+    "meta-llama/llama-3-70b",
+  ],
+};
+
+export const MODELS = Array.from(new Set(Object.values(PROVIDER_MODELS).flat()));
+
+export function modelsForProvider(provider: Provider): readonly string[] {
+  return PROVIDER_MODELS[provider];
+}
 
 const prices = {
   openai: [

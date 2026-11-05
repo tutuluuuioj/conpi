@@ -143,30 +143,57 @@ export async function GET(req: NextRequest) {
       errors.push("Event log empty; cannot replay RTMR3");
     }
 
-    // 8. Compare with on-chain get_tee_signer
+    // 8. Compare with on-chain get_tee_signer. Public testnet RPCs can
+    // transiently rate-limit or return gateway errors, so do not turn one
+    // failed response into a misleading "signer not registered" result.
     if (signerPublicKeyNear) {
       try {
-        const nearRpcUrl = "https://rpc.testnet.near.org";
-        const rpcRes = await fetch(nearRpcUrl, {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({
-            jsonrpc: "2.0",
-            id: "tee-check",
-            method: "query",
-            params: {
-              request_type: "call_function",
-              finality: "final",
-              account_id: CONTRACT_ID,
-              method_name: "get_tee_signer",
-              args_base64: Buffer.from(JSON.stringify({ public_key: signerPublicKeyNear })).toString("base64"),
-            },
-          }),
-        });
-        const rpcJson = await rpcRes.json();
-        if (rpcJson.result && rpcJson.result.result) {
-          const signerStr = Buffer.from(rpcJson.result.result).toString("utf8");
-          const signerData = JSON.parse(signerStr);
+        const nearRpcUrls = Array.from(new Set([
+          process.env.NEXT_PUBLIC_NEAR_RPC,
+          "https://test.rpc.fastnear.com",
+          "https://rpc.testnet.near.org",
+        ].filter((url): url is string => Boolean(url))));
+        const argsBase64 = Buffer.from(JSON.stringify({ public_key: signerPublicKeyNear })).toString("base64");
+        let signerData: any = null;
+        let lastRpcError = "No NEAR RPC endpoint returned a valid response";
+
+        for (const nearRpcUrl of nearRpcUrls) {
+          try {
+            const rpcRes = await fetch(nearRpcUrl, {
+              method: "POST",
+              headers: { "Content-Type": "application/json" },
+              cache: "no-store",
+              signal: AbortSignal.timeout(10_000),
+              body: JSON.stringify({
+                jsonrpc: "2.0",
+                id: "tee-check",
+                method: "query",
+                params: {
+                  request_type: "call_function",
+                  finality: "final",
+                  account_id: CONTRACT_ID,
+                  method_name: "get_tee_signer",
+                  args_base64: argsBase64,
+                },
+              }),
+            });
+            if (!rpcRes.ok) throw new Error(`${rpcRes.status} ${rpcRes.statusText}`);
+
+            const rpcJson = await rpcRes.json();
+            if (rpcJson.error) throw new Error(rpcJson.error.message || JSON.stringify(rpcJson.error));
+            const resultBytes = rpcJson.result?.result;
+            if (!Array.isArray(resultBytes)) throw new Error("RPC response did not contain result bytes");
+
+            const parsed = JSON.parse(Buffer.from(resultBytes).toString("utf8"));
+            if (!parsed) throw new Error(`Signer not found at finalized block ${rpcJson.result?.block_height || "unknown"}`);
+            signerData = parsed;
+            break;
+          } catch (rpcError: any) {
+            lastRpcError = `${nearRpcUrl}: ${rpcError.message}`;
+          }
+        }
+
+        if (signerData) {
 
           checks.onChainSignerRegistered = true;
           if (signerData.active) {
@@ -184,7 +211,7 @@ export async function GET(req: NextRequest) {
             errors.push(`On-chain measurement mismatch with quote: expected mrtd:${quoteMrtd} and compose:${composeHash}, got: ${meas}`);
           }
         } else {
-          errors.push(`Signer ${signerPublicKeyNear} not registered on contract ${CONTRACT_ID}`);
+          errors.push(`Unable to verify signer ${signerPublicKeyNear} on contract ${CONTRACT_ID}: ${lastRpcError}`);
         }
       } catch (chainErr: any) {
         errors.push(`On-chain TEE query failed: ${chainErr.message}`);

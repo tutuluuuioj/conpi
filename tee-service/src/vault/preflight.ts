@@ -3,8 +3,10 @@ import { decryptFromClient, EncryptedEnvelope } from "../crypto/encryption.js";
 import { serializeSignedPayload, PayloadKind, SignedPayloadDto } from "../crypto/borsh.js";
 import { enclaveKeys } from "../crypto/keys.js";
 import { CONFIG } from "../config.js";
-import { lockPricingTable, LockedPricingTable } from "../proxy/pricing.js";
+import { lockPricingTable, LockedPricingTable, openRouterPricingFromModels } from "../proxy/pricing.js";
 import { meterEngine } from "../proxy/meter.js";
+import { negotiationService } from "../negotiation/matcher.js";
+import type { TermSheet } from "../negotiation/matcher.js";
 
 export function parseBalance(val: any): bigint {
   if (typeof val === "bigint") return val;
@@ -155,12 +157,13 @@ class KeyVault {
     creditAmountYocto?: string
   ): Promise<KeyCheckResult> {
     let lockedPricing: LockedPricingTable;
+    let normalizedModels: string[];
     try {
-      const normalizedModels = [...new Set([model, ...models].map((item) => item?.trim()).filter(Boolean))];
+      model = model?.trim();
+      normalizedModels = [...new Set([model, ...models].map((item) => item?.trim()).filter(Boolean))];
       if (!normalizedModels.includes(model.trim())) {
         return { ok: false, modelAvailable: false, balanceCoversCredit: false, error: "Primary model must be included in the allowlist" };
       }
-      lockedPricing = lockPricingTable(normalizedModels);
       models = normalizedModels;
     } catch (err: any) {
       return { ok: false, modelAvailable: false, balanceCoversCredit: false, error: err.message };
@@ -187,8 +190,15 @@ class KeyVault {
       return { ok: false, modelAvailable: false, balanceCoversCredit: false, error: "API key too short" };
     }
 
+    let agreedTerms: TermSheet | undefined;
+    try {
+      agreedTerms = negotiationService.assertMatchedDealTerms(dealId, provider, models, termsHashHex || "");
+    } catch (err: any) {
+      return { ok: false, modelAvailable: false, balanceCoversCredit: false, error: err.message };
+    }
+
     // Pre-flight check against provider API
-    const preflight = await this.executePreflight(provider, apiKey, model);
+    const preflight = await this.executePreflight(provider, apiKey, model, models);
     if (!preflight.ok) {
       return {
         ok: false,
@@ -196,6 +206,11 @@ class KeyVault {
         balanceCoversCredit: preflight.balanceCoversCredit,
         error: preflight.error,
       };
+    }
+    try {
+      lockedPricing = lockPricingTable(models, preflight.providerPricing);
+    } catch (err: any) {
+      return { ok: false, modelAvailable: true, balanceCoversCredit: true, error: err.message };
     }
 
     // Generate buyer bearer proxy key
@@ -251,6 +266,16 @@ class KeyVault {
       } else {
         return { ok: false, modelAvailable: false, balanceCoversCredit: false, error: `Failed to query on-chain deal #${dealId}: ${err.message}` };
       }
+    }
+
+    try {
+      agreedTerms = negotiationService.assertMatchedDealTerms(dealId, provider, models, resolvedTermsHashHex) || agreedTerms;
+    } catch (err: any) {
+      return { ok: false, modelAvailable: true, balanceCoversCredit: true, error: err.message };
+    }
+    if (agreedTerms) {
+      resolvedCreditUsd = agreedTerms.creditAmountUsd;
+      resolvedPriceUsd = agreedTerms.priceUsd;
     }
 
     const entry: VaultEntry = {
@@ -337,8 +362,9 @@ class KeyVault {
   private async executePreflight(
     provider: string,
     apiKey: string,
-    model: string
-  ): Promise<{ ok: boolean; modelAvailable: boolean; balanceCoversCredit: boolean; error?: string }> {
+    model: string,
+    models: string[]
+  ): Promise<{ ok: boolean; modelAvailable: boolean; balanceCoversCredit: boolean; error?: string; providerPricing?: LockedPricingTable }> {
     // Mock and test shortcuts are strictly disabled outside test mode
     if (apiKey.startsWith("mock_") || apiKey.startsWith("test_") || apiKey.startsWith("sk-test")) {
       if (process.env.NODE_ENV !== "test") {
@@ -395,13 +421,15 @@ class KeyVault {
 
       // Verify requested model is present in account via strict exact match
       const data: any = await res.json().catch(() => null);
+      let providerPricing: LockedPricingTable | undefined;
       if (data && Array.isArray(data.data)) {
         const modelsList: string[] = data.data.map((m: any) => (typeof m === "string" ? m : m.id || ""));
-        const targetModel = model.trim().toLowerCase();
-        const found = modelsList.some((m: string) => typeof m === "string" && m.trim().toLowerCase() === targetModel);
-        if (!found) {
-          return { ok: false, modelAvailable: false, balanceCoversCredit: false, error: `Model "${model}" not available for this API key (exact match required)` };
+        const available = new Set(modelsList.map((item) => item.trim().toLowerCase()).filter(Boolean));
+        const missing = models.filter((item) => !available.has(item.trim().toLowerCase()));
+        if (missing.length) {
+          return { ok: false, modelAvailable: false, balanceCoversCredit: false, error: `Model "${missing[0]}" not available for this API key (exact match required)` };
         }
+        if (isOpenRouter) providerPricing = openRouterPricingFromModels(models, data.data);
       }
 
       // 2. Real balance & quota preflight check via minimal completion probe
@@ -445,7 +473,7 @@ class KeyVault {
         }
       }
 
-      return { ok: true, modelAvailable: true, balanceCoversCredit: true };
+      return { ok: true, modelAvailable: true, balanceCoversCredit: true, providerPricing };
     } catch (err: any) {
       console.error(`[Preflight] Network check failed:`, err.message);
       return { ok: false, modelAvailable: false, balanceCoversCredit: false, error: `Preflight network error: ${err.message}` };
