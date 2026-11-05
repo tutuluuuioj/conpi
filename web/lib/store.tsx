@@ -68,7 +68,7 @@ const seed: State = {
   notices: [],
   proposals: [],
   paused: false,
-  defaultToken: "USDC",
+  defaultToken: "NEAR",
   currency: "USD",
   toasts: [],
   signing: null,
@@ -1085,6 +1085,34 @@ export function Providers({ children }: { children: React.ReactNode }) {
           return { ok: false, title: "Listing owner mismatch", body: "The connected seller wallet must own the listing." };
         }
 
+        const buyer = (listing as any).buyer?.trim();
+        if (buyer && buyer.toLowerCase() !== current.account.toLowerCase()) {
+          pushToast({ kind: "pending", title: "Awaiting wallet approval to create deal..." });
+          try {
+            const params = dealParamsForListing(listing, buyer, current.account);
+            const outcome: any = await txCreateDeal(params);
+            const txHash = outcome?.transaction?.hash || outcome?.transaction_outcome?.id;
+            let dealId = createdDealIdFromOutcome(outcome);
+            if (!dealId) {
+              await new Promise((r) => setTimeout(r, 1500));
+              const deals = await fetchContractDeals(0, 100);
+              const latest = deals.filter((d) => d.buyer === buyer && d.seller === current.account).sort((a, b) => Number(b.id) - Number(a.id))[0];
+              if (latest) dealId = Number(latest.id);
+            }
+
+            setTimeout(loadOnChainData, 2000);
+            return {
+              ok: true,
+              title: "Deal created on NEAR!",
+              body: dealId ? `Deal #${dealId} created on-chain.` : "Deal registered on escrow contract.",
+              href: txHash ? `https://testnet.nearblocks.io/txns/${txHash}` : undefined,
+              dealId: dealId ? String(dealId) : undefined,
+            } as any;
+          } catch (err: any) {
+            return { ok: false, title: "Create deal transaction rejected or failed", body: err.message };
+          }
+        }
+
         const publishedListing: Listing = { ...listing, seller: current.account, published: true };
         setState((s) => ({ ...s, listings: [publishedListing, ...s.listings.filter((item) => item.id !== listing.id)] }));
         try {
@@ -1097,7 +1125,7 @@ export function Providers({ children }: { children: React.ReactNode }) {
         return {
           ok: true,
           title: "Seller listing published",
-          body: "No on-chain deal exists yet. A different wallet will create it when Buy is confirmed.",
+          body: "Listing published. Buyers can now fund and activate this deal.",
         };
       },
       cancelMyListings: () => {

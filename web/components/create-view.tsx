@@ -20,7 +20,8 @@ export function CreateView() {
   const [credit, setCredit] = useState(0.1);
   const [price, setPrice] = useState(0.08);
   const [collateral, setCollateral] = useState(20);
-  const [token, setToken] = useState<Asset>(app.defaultToken);
+  const [token, setToken] = useState<Asset>("NEAR");
+  const [buyerAccount, setBuyerAccount] = useState("");
   const [error, setError] = useState("");
 
   const ratio = credit ? price / credit : 0;
@@ -56,6 +57,7 @@ export function CreateView() {
       collateralPct: collateral,
       buyerCollateralPct: 10,
       seller: app.account,
+      buyer: buyerAccount.trim() || undefined,
       reputation: 0,
       tee: true,
       token,
@@ -68,8 +70,11 @@ export function CreateView() {
       body: `Publish ${usd(credit)} of ${provider} credit at ${usd(price)} (${ratioOf(price, credit)}). You will deposit ${usd(escrow.sellerCollateral)} ${token} only after a buyer funds the deal. The provider key is not part of this signature.`,
       confirm: "Sign",
       run: async () => {
-        const result = await app.createListing(listing);
-        if (result.ok) router.push("/");
+        const result: any = await app.createListing(listing);
+        if (result.ok) {
+          if (result.dealId) router.push(`/deals/${result.dealId}`);
+          else router.push("/");
+        }
         return result;
       },
     });
@@ -127,6 +132,14 @@ export function CreateView() {
         ) : null}
         {step === 1 ? (
           <div className="space-y-4">
+            <Field label="Buyer testnet account" hint="Target buyer testnet account (e.g. anastasia-buyer.testnet). Leave blank for public listing.">
+              <input
+                className={fieldClass}
+                placeholder="e.g. anastasia-buyer.testnet"
+                value={buyerAccount}
+                onChange={(event) => setBuyerAccount(event.target.value)}
+              />
+            </Field>
             <Field label="Price" hint={`Ratio ${ratioOf(price, credit)}.`}>
               <input
                 className={`${fieldClass} tabular text-right`}
@@ -143,9 +156,9 @@ export function CreateView() {
             </Field>
             <Field label="Accepted token">
               <select className={fieldClass} value={token} onChange={(event) => setToken(event.target.value as Asset)}>
+                <option>NEAR</option>
                 <option>USDC</option>
                 <option>USDT</option>
-                <option>NEAR</option>
               </select>
             </Field>
             <ul className="rounded-md border border-line bg-surface-2 p-3 text-sm">
@@ -161,6 +174,9 @@ export function CreateView() {
             <div className="flex justify-between gap-4"><dt className="text-muted">Price</dt><dd className="tabular">{usd(price)} · {ratioOf(price, credit)}</dd></div>
             <div className="flex justify-between gap-4"><dt className="text-muted">Collateral</dt><dd className="tabular">{collateral}% · {usd(escrow.sellerDeposit)} {token}</dd></div>
             <div className="flex justify-between gap-4"><dt className="text-muted">Seller</dt><dd className="font-mono">{app.account}</dd></div>
+            {buyerAccount ? (
+              <div className="flex justify-between gap-4"><dt className="text-muted">Buyer</dt><dd className="font-mono">{buyerAccount}</dd></div>
+            ) : null}
           </dl>
         ) : null}
         {error ? <p className="mt-3 text-xs font-medium text-danger">{error}</p> : null}
