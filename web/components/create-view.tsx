@@ -36,9 +36,19 @@ export function CreateView() {
       setError("Choose at least one model and a credit amount from $0.10 to $1,000.");
       return;
     }
-    if (step === 1 && (ratio < 0.5 || ratio > 1 || collateral < 10 || collateral > 50)) {
-      setError("Price ratio must sit between 0.50× and 1.00×. Collateral is 10% to 50%.");
-      return;
+    if (step === 1) {
+      if (!buyerAccount.trim()) {
+        setError("Please enter your second testnet wallet for the Buyer (e.g. your-buyer.testnet).");
+        return;
+      }
+      if (app.account && buyerAccount.trim().toLowerCase() === app.account.toLowerCase()) {
+        setError(`Buyer wallet must be different from your connected seller wallet (${app.account}).`);
+        return;
+      }
+      if (ratio < 0.5 || ratio > 1 || collateral < 10 || collateral > 50) {
+        setError("Price ratio must sit between 0.50× and 1.00×. Collateral is 10% to 50%.");
+        return;
+      }
     }
     setError("");
     setStep((value) => Math.min(2, value + 1));
@@ -46,6 +56,11 @@ export function CreateView() {
 
   const sign = () => {
     if (!app.account) return;
+    if (!buyerAccount.trim()) {
+      setError("Please enter your second testnet wallet for the Buyer.");
+      setStep(1);
+      return;
+    }
     const listing = {
       id: `lst-${crypto.randomUUID().slice(0, 6)}`,
       type: "sell" as const,
@@ -57,7 +72,7 @@ export function CreateView() {
       collateralPct: collateral,
       buyerCollateralPct: 10,
       seller: app.account,
-      buyer: buyerAccount.trim() || undefined,
+      buyer: buyerAccount.trim(),
       reputation: 0,
       tee: true,
       token,
@@ -66,14 +81,14 @@ export function CreateView() {
       createdAt: new Date().toISOString(),
     };
     app.ask({
-      title: "Sign listing",
-      body: `Publish ${usd(credit)} of ${provider} credit at ${usd(price)} (${ratioOf(price, credit)}). You will deposit ${usd(escrow.sellerCollateral)} ${token} only after a buyer funds the deal. The provider key is not part of this signature.`,
-      confirm: "Sign",
+      title: "Create Deal on NEAR",
+      body: `Create on-chain deal on NEAR: ${usd(credit)} of ${provider} credit at ${usd(price)} (${ratioOf(price, credit)}) with buyer ${buyerAccount.trim()}. A 0.05 NEAR storage deposit will be attached (excess refunded). Your wallet will now open for approval.`,
+      confirm: "Approve in Wallet",
       run: async () => {
         const result: any = await app.createListing(listing);
         if (result.ok) {
           if (result.dealId) router.push(`/deals/${result.dealId}`);
-          else router.push("/");
+          else router.push("/deals");
         }
         return result;
       },

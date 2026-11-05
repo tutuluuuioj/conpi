@@ -1086,47 +1086,45 @@ export function Providers({ children }: { children: React.ReactNode }) {
         }
 
         const buyer = (listing as any).buyer?.trim();
-        if (buyer && buyer.toLowerCase() !== current.account.toLowerCase()) {
-          pushToast({ kind: "pending", title: "Awaiting wallet approval to create deal..." });
-          try {
-            const params = dealParamsForListing(listing, buyer, current.account);
-            const outcome: any = await txCreateDeal(params);
-            const txHash = outcome?.transaction?.hash || outcome?.transaction_outcome?.id;
-            let dealId = createdDealIdFromOutcome(outcome);
-            if (!dealId) {
-              await new Promise((r) => setTimeout(r, 1500));
-              const deals = await fetchContractDeals(0, 100);
-              const latest = deals.filter((d) => d.buyer === buyer && d.seller === current.account).sort((a, b) => Number(b.id) - Number(a.id))[0];
-              if (latest) dealId = Number(latest.id);
-            }
-
-            setTimeout(loadOnChainData, 2000);
-            return {
-              ok: true,
-              title: "Deal created on NEAR!",
-              body: dealId ? `Deal #${dealId} created on-chain.` : "Deal registered on escrow contract.",
-              href: txHash ? `https://testnet.nearblocks.io/txns/${txHash}` : undefined,
-              dealId: dealId ? String(dealId) : undefined,
-            } as any;
-          } catch (err: any) {
-            return { ok: false, title: "Create deal transaction rejected or failed", body: err.message };
-          }
+        if (!buyer) {
+          return {
+            ok: false,
+            title: "Buyer wallet required",
+            body: "Please enter your buyer testnet wallet (e.g. anastasia-buyer.testnet) in Step 2.",
+          };
+        }
+        if (buyer.toLowerCase() === current.account.toLowerCase()) {
+          return {
+            ok: false,
+            title: "Buyer and seller must differ",
+            body: "You cannot create a deal with yourself. Please enter your second testnet wallet for the Buyer.",
+          };
         }
 
-        const publishedListing: Listing = { ...listing, seller: current.account, published: true };
-        setState((s) => ({ ...s, listings: [publishedListing, ...s.listings.filter((item) => item.id !== listing.id)] }));
+        pushToast({ kind: "pending", title: "Awaiting wallet approval to create deal..." });
         try {
-          const saved = JSON.parse(localStorage.getItem(PUBLISHED_LISTINGS_KEY) || "[]");
-          const existing = Array.isArray(saved) ? saved.filter((item: Listing) => item.id !== listing.id) : [];
-          localStorage.setItem(PUBLISHED_LISTINGS_KEY, JSON.stringify([publishedListing, ...existing]));
-        } catch {
-          localStorage.setItem(PUBLISHED_LISTINGS_KEY, JSON.stringify([publishedListing]));
+          const params = dealParamsForListing(listing, buyer, current.account);
+          const outcome: any = await txCreateDeal(params);
+          const txHash = outcome?.transaction?.hash || outcome?.transaction_outcome?.id;
+          let dealId = createdDealIdFromOutcome(outcome);
+          if (!dealId) {
+            await new Promise((r) => setTimeout(r, 1500));
+            const deals = await fetchContractDeals(0, 100);
+            const latest = deals.filter((d) => d.buyer === buyer && d.seller === current.account).sort((a, b) => Number(b.id) - Number(a.id))[0];
+            if (latest) dealId = Number(latest.id);
+          }
+
+          setTimeout(loadOnChainData, 2000);
+          return {
+            ok: true,
+            title: "Deal created on NEAR!",
+            body: dealId ? `Deal #${dealId} created on-chain.` : "Deal registered on escrow contract.",
+            href: txHash ? `https://testnet.nearblocks.io/txns/${txHash}` : undefined,
+            dealId: dealId ? String(dealId) : undefined,
+          } as any;
+        } catch (err: any) {
+          return { ok: false, title: "Create deal transaction rejected or failed", body: err.message };
         }
-        return {
-          ok: true,
-          title: "Seller listing published",
-          body: "Listing published. Buyers can now fund and activate this deal.",
-        };
       },
       cancelMyListings: () => {
         const account = stateRef.current.account;
