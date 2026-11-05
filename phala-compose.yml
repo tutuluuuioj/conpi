@@ -1,6 +1,6 @@
 services:
   conpi-tee:
-    image: ghcr.io/tutuluuuioj/conpi-tee@sha256:e66e099f85221e047280ea1fd922281c1cf933e1b028d04e8cebf3ed4fc03ca1
+    image: ghcr.io/tutuluuuioj/conpi-tee@sha256:e3a14782d831ea0f32b67401d01fedcaf521a7afe1b66fac8fb5032db5c7161c
     container_name: conpi-tee
     restart: unless-stopped
     ports:
