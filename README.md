@@ -172,5 +172,5 @@ and supplies an explicit confirmation:
 
 ```bash
 cd tee-service
-CONPI_LIVE_PROOF_CONFIRMATION=I_APPROVE_ENCRYPTED_OPENROUTER_KEY_UPLOAD npm run test:phase4:live
+CONPI_LIVE_PROOF_CONFIRMATION=I_APPROVE_ENCRYPTED_OPENROUTER_KEY_UPLOAD ./node_modules/.bin/tsx scripts/phase4-live-proof.ts
 ```
