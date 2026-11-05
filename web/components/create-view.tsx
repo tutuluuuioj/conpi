@@ -17,8 +17,8 @@ export function CreateView() {
   const [step, setStep] = useState(0);
   const [provider, setProvider] = useState<Provider>("OpenAI");
   const [models, setModels] = useState<string[]>(["gpt-4o"]);
-  const [credit, setCredit] = useState(80);
-  const [price, setPrice] = useState(60);
+  const [credit, setCredit] = useState(0.1);
+  const [price, setPrice] = useState(0.08);
   const [collateral, setCollateral] = useState(20);
   const [token, setToken] = useState<Asset>(app.defaultToken);
   const [error, setError] = useState("");
@@ -31,8 +31,8 @@ export function CreateView() {
   };
 
   const next = () => {
-    if (step === 0 && (!models.length || credit < 10 || credit > 1000)) {
-      setError("Choose at least one model and a credit amount from $10 to $1,000.");
+    if (step === 0 && (!models.length || credit < 0.1 || credit > 1000)) {
+      setError("Choose at least one model and a credit amount from $0.10 to $1,000.");
       return;
     }
     if (step === 1 && (ratio < 0.5 || ratio > 1 || collateral < 10 || collateral > 50)) {
@@ -105,15 +105,38 @@ export function CreateView() {
                 ))}
               </div>
             </div>
-            <Field label="Credit amount" hint="USD value of prepaid credit.">
-              <input className={`${fieldClass} tabular text-right`} type="number" inputMode="decimal" min={10} max={1000} value={credit} onChange={(event) => setCredit(Number(event.target.value))} />
+            <Field label="Credit amount" hint="USD value of prepaid credit (min $0.10).">
+              <input
+                className={`${fieldClass} tabular text-right`}
+                type="number"
+                inputMode="decimal"
+                step="any"
+                min={0.1}
+                max={1000}
+                value={credit}
+                onChange={(event) => {
+                  const val = Number(event.target.value);
+                  setCredit(val);
+                  if (price > val || price < val * 0.5) {
+                    setPrice(Math.round(val * 0.8 * 100) / 100);
+                  }
+                }}
+              />
             </Field>
           </div>
         ) : null}
         {step === 1 ? (
           <div className="space-y-4">
             <Field label="Price" hint={`Ratio ${ratioOf(price, credit)}.`}>
-              <input className={`${fieldClass} tabular text-right`} type="number" inputMode="decimal" value={price} onChange={(event) => setPrice(Number(event.target.value))} />
+              <input
+                className={`${fieldClass} tabular text-right`}
+                type="number"
+                inputMode="decimal"
+                step="any"
+                min={0.05}
+                value={price}
+                onChange={(event) => setPrice(Number(event.target.value))}
+              />
             </Field>
             <Field label="Seller collateral %" hint="Locked until the deal settles. Returned in full if the credit is delivered.">
               <input className={`${fieldClass} tabular text-right`} type="number" min={10} max={50} value={collateral} onChange={(event) => setCollateral(Number(event.target.value))} />
