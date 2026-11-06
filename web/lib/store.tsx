@@ -125,6 +125,14 @@ const PUBLISHED_LISTINGS_KEY = "conpi-published-listings-v1";
 const DEAL_DEPOSIT_DURATION_SEC = 3_600;
 const DEAL_KEY_DURATION_SEC = 3_600;
 
+function withExplicitListingUsd(listing: Listing): Listing {
+  return {
+    ...listing,
+    creditUsd: listing.creditUsd ?? listing.credit,
+    priceUsd: listing.priceUsd ?? listing.price,
+  };
+}
+
 function priceRowsFromLockedPricing(lockedPricing: any): Deal["prices"] {
   if (!lockedPricing || typeof lockedPricing !== "object") return [];
   return Object.entries(lockedPricing).map(([model, value]: [string, any]) => ({
@@ -135,7 +143,7 @@ function priceRowsFromLockedPricing(lockedPricing: any): Deal["prices"] {
 }
 
 async function saveDealListingMetadata(listing: Listing, dealId: string): Promise<Listing> {
-  const boundListing: Listing = { ...listing, dealId, published: false };
+  const boundListing: Listing = withExplicitListingUsd({ ...listing, dealId, published: false });
   try {
     const saved = JSON.parse(localStorage.getItem(PUBLISHED_LISTINGS_KEY) || "[]");
     const current = Array.isArray(saved) ? saved.filter((item: Listing) => item.id !== listing.id) : [];
@@ -170,11 +178,16 @@ async function waitForOnChainTermsHash(dealId: number, attempts = 8): Promise<st
 
 function teeTermSheetForDeal(deal: Deal, party: "buyer" | "seller") {
   const terms = party === "buyer" ? deal.buyerTerms : deal.sellerTerms;
+  const creditAmountUsd = terms.creditUsd ?? deal.creditUsd ?? (terms.token === "NEAR" ? undefined : terms.credit);
+  const priceUsd = terms.priceUsd ?? deal.priceUsd ?? (terms.token === "NEAR" ? undefined : terms.price);
+  if (!Number.isFinite(creditAmountUsd) || Number(creditAmountUsd) <= 0 || !Number.isFinite(priceUsd) || Number(priceUsd) <= 0) {
+    throw new Error("Original USD listing amounts are missing. Reload the deal metadata before submitting TEE terms.");
+  }
   return {
     provider: deal.provider,
     models: terms.models,
-    creditAmountUsd: terms.creditUsd ?? deal.creditUsd ?? terms.credit,
-    priceUsd: terms.priceUsd ?? deal.priceUsd ?? terms.price,
+    creditAmountUsd: Number(creditAmountUsd),
+    priceUsd: Number(priceUsd),
     buyerCollateralPct: terms.buyerCollateralPct,
     sellerCollateralPct: terms.sellerCollateralPct,
     token: terms.token === "NEAR" ? null : terms.token,
@@ -490,6 +503,7 @@ export function Providers({ children }: { children: React.ReactNode }) {
         } catch {}
       }
       const metadataListings = [...serverListings, ...localListings, ...stateRef.current.listings]
+        .map(withExplicitListingUsd)
         .filter((listing, index, all) => all.findIndex((item) => item.id === listing.id) === index);
 
       // For any deal in Active status, fetch live TEE meter!
@@ -797,12 +811,12 @@ export function Providers({ children }: { children: React.ReactNode }) {
           deal.termsHash?.replace(/^0x/, "")
         );
       }
-      const alreadySubmitted = party === "buyer" ? ticket.buyerSubmitted : ticket.sellerSubmitted;
-      if (!alreadySubmitted) {
-        const enclaveKey = await getVerifiedEncryptionKey();
-        const encryptedEnvelope = encryptPayloadToEnclave(JSON.stringify(teeTermSheetForDeal(deal, party)), enclaveKey);
-        ticket = await teeApi.submitTerms(deal.id, party, encryptedEnvelope);
-      }
+      // Always refresh the connected party's encrypted term sheet. A previous
+      // browser session may have submitted legacy NEAR-denominated values, and
+      // treating "submitted" as immutable would permanently strand the deal.
+      const enclaveKey = await getVerifiedEncryptionKey();
+      const encryptedEnvelope = encryptPayloadToEnclave(JSON.stringify(teeTermSheetForDeal(deal, party)), enclaveKey);
+      ticket = await teeApi.submitTerms(deal.id, party, encryptedEnvelope);
       applyTicketState(deal.id, ticket);
       return ticket;
     };
@@ -920,7 +934,9 @@ export function Providers({ children }: { children: React.ReactNode }) {
           model: listing.model,
           models: listing.models,
           credit: listing.credit,
+          creditUsd: listing.creditUsd ?? listing.credit,
           price: listing.price,
+          priceUsd: listing.priceUsd ?? listing.price,
           buyerCollateralPct: listing.buyerCollateralPct,
           sellerCollateralPct: listing.collateralPct,
           token: listing.token,
@@ -1558,7 +1574,7 @@ export function Providers({ children }: { children: React.ReactNode }) {
         }
 
         // Public marketplace listing - NO specific buyer needed!
-        const publishedListing: Listing = { ...listing, seller: current.account, published: true };
+        const publishedListing: Listing = withExplicitListingUsd({ ...listing, seller: current.account, published: true });
         setState((s) => ({ ...s, listings: [publishedListing, ...s.listings.filter((item) => item.id !== listing.id)] }));
         try {
           const saved = JSON.parse(localStorage.getItem(PUBLISHED_LISTINGS_KEY) || "[]");

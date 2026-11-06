@@ -247,6 +247,9 @@ export function DealView({ id }: { id: string }) {
           {view === "key" ? (
             <Card>
               <h2 className="text-lg font-semibold">Key check</h2>
+              <p className="mt-2 text-xs text-muted">
+                If the enclave reports a USD terms mismatch, each party must <Link className="font-semibold text-brand" href={`/deals/${deal.id}/ticket`}>refresh their own encrypted terms</Link> before activation.
+              </p>
               {deal.keyStatus !== "verified" ? (
                 <form id="seller-key" className="mt-4 space-y-3" onSubmit={submitKey}>
                   <label className="block text-[13px] font-medium text-ink">Provider key
