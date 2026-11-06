@@ -220,7 +220,9 @@ export const KEY_CHECKS = [
 export function listingTerms(listing: Listing): Terms {
   return {
     credit: listing.credit,
+    creditUsd: listing.creditUsd ?? listing.credit,
     price: listing.price,
+    priceUsd: listing.priceUsd ?? listing.price,
     buyerCollateralPct: listing.buyerCollateralPct,
     sellerCollateralPct: listing.collateralPct,
     token: listing.token,

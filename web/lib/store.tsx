@@ -122,6 +122,8 @@ interface Api {
 
 const Ctx = createContext<(State & Api) | null>(null);
 const PUBLISHED_LISTINGS_KEY = "conpi-published-listings-v1";
+const DEAL_DEPOSIT_DURATION_SEC = 3_600;
+const DEAL_KEY_DURATION_SEC = 3_600;
 
 function priceRowsFromLockedPricing(lockedPricing: any): Deal["prices"] {
   if (!lockedPricing || typeof lockedPricing !== "object") return [];
@@ -153,6 +155,37 @@ function onChainTermsHashHex(deal: OnChainDeal | null | undefined): string | und
   const hash = deal?.terms_hash;
   if (!Array.isArray(hash) || hash.length !== 32) return undefined;
   return Buffer.from(hash).toString("hex");
+}
+
+async function waitForOnChainTermsHash(dealId: number, attempts = 8): Promise<string> {
+  for (let attempt = 0; attempt < attempts; attempt += 1) {
+    const termsHash = onChainTermsHashHex(await fetchContractDeal(dealId));
+    if (termsHash) return termsHash;
+    if (attempt < attempts - 1) {
+      await new Promise((resolve) => setTimeout(resolve, 750));
+    }
+  }
+  throw new Error(`Deal #${dealId} was created, but its on-chain terms are not visible yet. Refresh the Deals page; do not submit Quick Buy again.`);
+}
+
+function teeTermSheetForDeal(deal: Deal, party: "buyer" | "seller") {
+  const terms = party === "buyer" ? deal.buyerTerms : deal.sellerTerms;
+  return {
+    provider: deal.provider,
+    models: terms.models,
+    creditAmountUsd: terms.creditUsd ?? deal.creditUsd ?? terms.credit,
+    priceUsd: terms.priceUsd ?? deal.priceUsd ?? terms.price,
+    buyerCollateralPct: terms.buyerCollateralPct,
+    sellerCollateralPct: terms.sellerCollateralPct,
+    token: terms.token === "NEAR" ? null : terms.token,
+    depositDurationSec: DEAL_DEPOSIT_DURATION_SEC,
+    keyDurationSec: DEAL_KEY_DURATION_SEC,
+    teeLivenessTimeoutSec: CONFIG.teeLivenessSec,
+    slashBpsProviderBan: CONFIG.slashProviderBanBps,
+    slashBpsRevoke: CONFIG.slashRevokeBps,
+    slashBpsBuyerBreach: CONFIG.slashBuyerBreachBps,
+    deadline: terms.deadline,
+  };
 }
 
 function toYoctoNear(nearAmount: number): string {
@@ -216,8 +249,8 @@ async function dealParamsForListing(listing: Listing, buyer: string, seller: str
     buyer_collateral: buyerCollateralUnits,
     seller_collateral: sellerCollateralUnits,
     tee_pubkey: TEE_SIGNER_PUBLIC_KEY,
-    deposit_duration_sec: 172800,
-    key_duration_sec: 172800,
+    deposit_duration_sec: DEAL_DEPOSIT_DURATION_SEC,
+    key_duration_sec: DEAL_KEY_DURATION_SEC,
     tee_liveness_timeout_sec: CONFIG.teeLivenessSec,
     slash_bps_provider_ban: CONFIG.slashProviderBanBps,
     slash_bps_revoke: CONFIG.slashRevokeBps,
@@ -517,8 +550,12 @@ export function Providers({ children }: { children: React.ReactNode }) {
           stage,
           lastUpdate,
           prices: lockedPriceRows.length ? lockedPriceRows : existing?.prices || mapped.prices,
-          buyerTerms: existing?.buyerTerms || (listing ? { ...listingTerms(listing), creditUsd: listing.credit, priceUsd: listing.price } : mapped.buyerTerms),
-          sellerTerms: existing?.sellerTerms || (listing ? { ...listingTerms(listing), creditUsd: listing.credit, priceUsd: listing.price } : mapped.sellerTerms),
+          buyerTerms: listing
+            ? { ...(existing?.buyerTerms || listingTerms(listing)), creditUsd: listing.creditUsd ?? listing.credit, priceUsd: listing.priceUsd ?? listing.price }
+            : existing?.buyerTerms || mapped.buyerTerms,
+          sellerTerms: listing
+            ? { ...(existing?.sellerTerms || listingTerms(listing)), creditUsd: listing.creditUsd ?? listing.credit, priceUsd: listing.priceUsd ?? listing.price }
+            : existing?.sellerTerms || mapped.sellerTerms,
           heartbeat: liveMeter?.active ? "live" : mapped.heartbeat,
         };
       });
@@ -749,6 +786,27 @@ export function Providers({ children }: { children: React.ReactNode }) {
       }));
     };
 
+    const submitPartyTermsToTee = async (deal: Deal, party: "buyer" | "seller") => {
+      let ticket = await teeApi.getTicket(deal.id).catch(() => null);
+      if (!ticket) {
+        ticket = await teeApi.initTicket(
+          deal.id,
+          Number(deal.id),
+          deal.buyer,
+          deal.seller,
+          deal.termsHash?.replace(/^0x/, "")
+        );
+      }
+      const alreadySubmitted = party === "buyer" ? ticket.buyerSubmitted : ticket.sellerSubmitted;
+      if (!alreadySubmitted) {
+        const enclaveKey = await getVerifiedEncryptionKey();
+        const encryptedEnvelope = encryptPayloadToEnclave(JSON.stringify(teeTermSheetForDeal(deal, party)), enclaveKey);
+        ticket = await teeApi.submitTerms(deal.id, party, encryptedEnvelope);
+      }
+      applyTicketState(deal.id, ticket);
+      return ticket;
+    };
+
     return {
       setTheme: (theme) => setState((s) => ({ ...s, theme })),
       setDefaultToken: (defaultToken) => setState((s) => ({ ...s, defaultToken })),
@@ -841,8 +899,7 @@ export function Providers({ children }: { children: React.ReactNode }) {
           }
           if (onChainId === null) throw new Error("The transaction succeeded, but its on-chain deal ID could not be resolved");
           id = String(onChainId);
-          createdTermsHashHex = onChainTermsHashHex(await fetchContractDeal(onChainId));
-          if (!createdTermsHashHex) throw new Error("The created deal is missing its canonical on-chain terms hash");
+          createdTermsHashHex = await waitForOnChainTermsHash(onChainId);
           const boundListing = await saveDealListingMetadata(listing, id);
           setState((s) => ({
             ...s,
@@ -946,27 +1003,7 @@ export function Providers({ children }: { children: React.ReactNode }) {
         if (!deal) return;
         try {
           const party = deal.role;
-          const terms = party === "buyer" ? deal.buyerTerms : deal.sellerTerms;
-          const termSheet = {
-            provider: deal.provider,
-            models: terms.models,
-            creditAmountUsd: terms.credit,
-            priceUsd: terms.price,
-            buyerCollateralPct: terms.buyerCollateralPct,
-            sellerCollateralPct: terms.sellerCollateralPct,
-            token: terms.token === "NEAR" ? null : terms.token,
-            depositDurationSec: 172800,
-            keyDurationSec: 86400,
-            teeLivenessTimeoutSec: 3600,
-            slashBpsProviderBan: 5000,
-            slashBpsRevoke: 8000,
-            slashBpsBuyerBreach: 5000,
-            deadline: terms.deadline,
-          };
-          const enclaveKey = await getVerifiedEncryptionKey();
-          const encryptedEnvelope = encryptPayloadToEnclave(JSON.stringify(termSheet), enclaveKey);
-          const ticket = await teeApi.submitTerms(dealId, party, encryptedEnvelope);
-          applyTicketState(dealId, ticket);
+          const ticket = await submitPartyTermsToTee(deal, party);
           pushToast({
             kind: ticket.matched ? "success" : "info",
             title: ticket.matched ? "Terms matched inside TEE" : "Encrypted terms submitted",
@@ -1022,6 +1059,7 @@ export function Providers({ children }: { children: React.ReactNode }) {
         const amount = isBuyer ? escrow.buyerDeposit : escrow.sellerDeposit;
 
         try {
+          await submitPartyTermsToTee(deal, deal.role);
           if (deal.token === "NEAR") {
             let yocto: string;
             const onChain = await fetchContractDeal(Number(dealId));
@@ -1104,6 +1142,11 @@ export function Providers({ children }: { children: React.ReactNode }) {
         pushToast({ kind: "pending", title: "Validating key in TEE Enclave..." });
 
         try {
+          const connectedAccount = stateRef.current.account?.trim().toLowerCase();
+          if (!connectedAccount || connectedAccount !== deal.seller.trim().toLowerCase()) {
+            pushToast({ kind: "error", title: "Seller wallet required", body: `Connect ${deal.seller} before submitting the provider key.` });
+            return;
+          }
           const provider = (deal.provider || "OpenAI").toLowerCase();
           const model = deal.model?.trim();
           const models = Array.from(new Set(
@@ -1143,14 +1186,24 @@ export function Providers({ children }: { children: React.ReactNode }) {
             }
           }
 
+          const ticket = await submitPartyTermsToTee(deal, "seller");
+          if (!ticket.matched) {
+            pushToast({
+              kind: "error",
+              title: "Buyer TEE confirmation required",
+              body: `Connect ${deal.buyer} and submit the encrypted terms before retrying the provider key.`,
+            });
+            return;
+          }
+
           const enclaveKey = await getVerifiedEncryptionKey();
           const encryptedEnvelope = encryptApiKeyToEnclave(plainApiKey, enclaveKey);
           const res = await teeApi.submitKey(Number(dealId), {
             provider,
             model,
             models,
-            creditUsd: deal.credit,
-            priceUsd: deal.price,
+            creditUsd: deal.sellerTerms.creditUsd ?? deal.buyerTerms.creditUsd ?? deal.creditUsd ?? deal.credit,
+            priceUsd: deal.sellerTerms.priceUsd ?? deal.buyerTerms.priceUsd ?? deal.priceUsd ?? deal.price,
             termsHashHex: deal.termsHash ? deal.termsHash.replace(/^0x/, "") : "00".repeat(32),
             encryptedEnvelope,
           });
@@ -1482,10 +1535,8 @@ export function Providers({ children }: { children: React.ReactNode }) {
             }
 
             if (dealId) {
+              const createdTermsHashHex = await waitForOnChainTermsHash(Number(dealId));
               const boundListing = await saveDealListingMetadata(listing, String(dealId));
-              const createdDeal = await fetchContractDeal(Number(dealId));
-              const createdTermsHashHex = onChainTermsHashHex(createdDeal);
-              if (!createdTermsHashHex) throw new Error("The created deal is missing its canonical on-chain terms hash");
               setState((s) => ({
                 ...s,
                 listings: [boundListing, ...s.listings.filter((item) => item.id !== listing.id)],

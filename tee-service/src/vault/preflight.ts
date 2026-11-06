@@ -25,6 +25,13 @@ export function parseBalance(val: any): bigint {
   return BigInt(str);
 }
 
+export function usdBudgetMatchesOnChain(agreedUsd: number, derivedUsd: number, isNear: boolean): boolean {
+  if (!Number.isFinite(agreedUsd) || !Number.isFinite(derivedUsd) || agreedUsd <= 0 || derivedUsd <= 0) return false;
+  const absoluteTolerance = isNear ? 0.005 : 0.0001;
+  const relativeTolerance = derivedUsd * (isNear ? 0.15 : 0.01);
+  return Math.abs(agreedUsd - derivedUsd) <= Math.max(absoluteTolerance, relativeTolerance);
+}
+
 export interface KeyCheckResult {
   ok: boolean;
   modelAvailable: boolean;
@@ -223,6 +230,9 @@ class KeyVault {
     let resolvedLastNonce = 0;
     let resolvedStage = 0;
     let resolvedStatus = "Funded";
+    let derivedCreditUsd = 0;
+    let derivedPriceUsd = 0;
+    let onChainTokenIsNear = false;
 
     // Strictly resolve creditUsd, priceUsd and creditAmountYocto from on-chain deal state
     try {
@@ -236,14 +246,17 @@ class KeyVault {
         resolvedCreditYocto = creditBigInt.toString();
         const priceBigInt = parseBalance(deal.price);
         const isNear = (deal.token === null || deal.token === "NEAR");
+        onChainTokenIsNear = isNear;
         if (isNear) {
           const nearPrice = await fetchLiveNearPriceUsd();
-          resolvedCreditUsd = (Number(creditBigInt) / 1e24) * nearPrice;
-          resolvedPriceUsd = (Number(priceBigInt) / 1e24) * nearPrice;
+          derivedCreditUsd = (Number(creditBigInt) / 1e24) * nearPrice;
+          derivedPriceUsd = (Number(priceBigInt) / 1e24) * nearPrice;
         } else {
-          resolvedCreditUsd = Number(creditBigInt) / 1e6;
-          resolvedPriceUsd = Number(priceBigInt) / 1e6;
+          derivedCreditUsd = Number(creditBigInt) / 1e6;
+          derivedPriceUsd = Number(priceBigInt) / 1e6;
         }
+        resolvedCreditUsd = derivedCreditUsd;
+        resolvedPriceUsd = derivedPriceUsd;
         if (Array.isArray(deal.terms_hash)) {
           resolvedTermsHashHex = Buffer.from(deal.terms_hash).toString("hex");
         }
@@ -255,6 +268,8 @@ class KeyVault {
         resolvedCreditYocto = creditAmountYocto || "2000000000000000000000000";
         resolvedCreditUsd = (typeof creditUsd === "number" && creditUsd > 0) ? creditUsd : 2;
         resolvedPriceUsd = (typeof priceUsd === "number" && priceUsd > 0) ? priceUsd : 2;
+        derivedCreditUsd = resolvedCreditUsd;
+        derivedPriceUsd = resolvedPriceUsd;
       } else {
         return { ok: false, modelAvailable: false, balanceCoversCredit: false, error: `Deal #${dealId} does not exist on-chain` };
       }
@@ -263,6 +278,8 @@ class KeyVault {
         resolvedCreditYocto = creditAmountYocto || "2000000000000000000000000";
         resolvedCreditUsd = (typeof creditUsd === "number" && creditUsd > 0) ? creditUsd : 2;
         resolvedPriceUsd = (typeof priceUsd === "number" && priceUsd > 0) ? priceUsd : 2;
+        derivedCreditUsd = resolvedCreditUsd;
+        derivedPriceUsd = resolvedPriceUsd;
       } else {
         return { ok: false, modelAvailable: false, balanceCoversCredit: false, error: `Failed to query on-chain deal #${dealId}: ${err.message}` };
       }
@@ -274,6 +291,22 @@ class KeyVault {
       return { ok: false, modelAvailable: true, balanceCoversCredit: true, error: err.message };
     }
     if (agreedTerms) {
+      if (!usdBudgetMatchesOnChain(agreedTerms.creditAmountUsd, derivedCreditUsd, onChainTokenIsNear)) {
+        return {
+          ok: false,
+          modelAvailable: true,
+          balanceCoversCredit: false,
+          error: `Agreed USD credit $${agreedTerms.creditAmountUsd.toFixed(6)} does not match the on-chain ${onChainTokenIsNear ? "NEAR" : "token"} value ($${derivedCreditUsd.toFixed(6)})`,
+        };
+      }
+      if (!usdBudgetMatchesOnChain(agreedTerms.priceUsd, derivedPriceUsd, onChainTokenIsNear)) {
+        return {
+          ok: false,
+          modelAvailable: true,
+          balanceCoversCredit: false,
+          error: `Agreed USD price $${agreedTerms.priceUsd.toFixed(6)} does not match the on-chain ${onChainTokenIsNear ? "NEAR" : "token"} value ($${derivedPriceUsd.toFixed(6)})`,
+        };
+      }
       resolvedCreditUsd = agreedTerms.creditAmountUsd;
       resolvedPriceUsd = agreedTerms.priceUsd;
     }
@@ -430,6 +463,25 @@ class KeyVault {
           return { ok: false, modelAvailable: false, balanceCoversCredit: false, error: `Model "${missing[0]}" not available for this API key (exact match required)` };
         }
         if (isOpenRouter) providerPricing = openRouterPricingFromModels(models, data.data);
+      }
+
+      // OpenRouter exposes a free key-inspection endpoint. Use it instead of a
+      // billable one-token completion probe so validation never appears as
+      // unmetered usage in the seller's OpenRouter dashboard.
+      if (isOpenRouter) {
+        const keyRes = await fetch(`${baseUrl}/key`, { headers, method: "GET" });
+        if (keyRes.status === 401 || keyRes.status === 403) {
+          return { ok: false, modelAvailable: true, balanceCoversCredit: false, error: "Invalid OpenRouter API key" };
+        }
+        if (!keyRes.ok) {
+          return { ok: false, modelAvailable: true, balanceCoversCredit: false, error: `OpenRouter key check failed (HTTP ${keyRes.status})` };
+        }
+        const keyData: any = await keyRes.json().catch(() => null);
+        const remaining = Number(keyData?.data?.limit_remaining);
+        if (Number.isFinite(remaining) && remaining <= 0) {
+          return { ok: false, modelAvailable: true, balanceCoversCredit: false, error: "OpenRouter API key limit is exhausted" };
+        }
+        return { ok: true, modelAvailable: true, balanceCoversCredit: true, providerPricing };
       }
 
       // 2. Real balance & quota preflight check via minimal completion probe

@@ -4,7 +4,7 @@ import { computeTermsHash, buildTermsMessage } from "../src/crypto/terms.js";
 import { serializeSignedPayload, PayloadKind } from "../src/crypto/borsh.js";
 import { encryptToEnclave, decryptFromClient } from "../src/crypto/encryption.js";
 import { negotiationService } from "../src/negotiation/matcher.js";
-import { keyVault, fetchLiveNearPriceUsd } from "../src/vault/preflight.js";
+import { keyVault, fetchLiveNearPriceUsd, usdBudgetMatchesOnChain } from "../src/vault/preflight.js";
 import { calculateCost, meterEngine } from "../src/proxy/meter.js";
 import { openRouterPricingFromModels } from "../src/proxy/pricing.js";
 import { buildApp, INTERNAL_SERVER_TOKEN } from "../src/index.js";
@@ -158,6 +158,17 @@ async function runTests() {
   }
   console.log("PASS: Negotiation terms matching and diffing verified.");
 
+  if (!usdBudgetMatchesOnChain(0.05, 0.0504, true)) {
+    throw new Error("Valid USD-to-NEAR oracle drift was rejected");
+  }
+  if (usdBudgetMatchesOnChain(0.0135, 0.05, true)) {
+    throw new Error("NEAR token quantity was incorrectly accepted as the USD credit budget");
+  }
+  if (!usdBudgetMatchesOnChain(80, 80, false) || usdBudgetMatchesOnChain(0.08, 80, false)) {
+    throw new Error("Stable-token USD budget validation failed");
+  }
+  console.log("PASS: USD budgets are bound to their on-chain token value without mixing NEAR and USD units.");
+
   // 5. Key Injection & Pre-flight Test
   console.log("\n[Test 5] Testing Key Injection & Pre-flight Validation...");
   (nearRelayer as any).getDeal = async () => ({
@@ -191,6 +202,63 @@ async function runTests() {
     throw new Error("Key injection failed");
   }
   console.log("PASS: In-enclave key vault & preflight validation verified.");
+
+  const openRouterTicketHash = "cd".repeat(32);
+  const openRouterTerms = {
+    ...termA,
+    provider: "OpenRouter" as const,
+    models: ["deepseek/deepseek-v4.1-flash-1017"],
+    creditAmountUsd: 0.05,
+    priceUsd: 0.04,
+    token: "usdc.testnet",
+  };
+  negotiationService.getOrCreateTicket("ticket-openrouter-free-preflight", 2, "buyer.near", "seller.near", openRouterTicketHash);
+  negotiationService.submitTerms("ticket-openrouter-free-preflight", "buyer", openRouterTerms);
+  negotiationService.submitTerms("ticket-openrouter-free-preflight", "seller", openRouterTerms);
+  const savedGetDeal = (nearRelayer as any).getDeal;
+  const savedFetch = globalThis.fetch;
+  const preflightUrls: string[] = [];
+  (nearRelayer as any).getDeal = async (dealId: number) => dealId === 2 ? ({
+    id: 2,
+    token: "usdc.testnet",
+    credit_amount: "50000",
+    price: "40000",
+    terms_hash: Array.from(Buffer.from(openRouterTicketHash, "hex")),
+    last_nonce: 0,
+    stage_reached: 0,
+    status: "Funded",
+  }) : savedGetDeal(dealId);
+  globalThis.fetch = (async (url: string | URL | Request) => {
+    const value = String(url);
+    preflightUrls.push(value);
+    if (value.endsWith("/models")) {
+      return new Response(JSON.stringify({ data: [{
+        id: "deepseek/deepseek-v4.1-flash-1017",
+        pricing: { prompt: "0.0000001", completion: "0.0000002" },
+      }] }), { status: 200, headers: { "content-type": "application/json" } });
+    }
+    if (value.endsWith("/key")) {
+      return new Response(JSON.stringify({ data: { limit_remaining: 1 } }), { status: 200, headers: { "content-type": "application/json" } });
+    }
+    throw new Error(`Unexpected billable OpenRouter preflight request: ${value}`);
+  }) as typeof fetch;
+  const freePreflight = await keyVault.validateAndInjectKey(
+    2,
+    "OpenRouter",
+    "deepseek/deepseek-v4.1-flash-1017",
+    ["deepseek/deepseek-v4.1-flash-1017"],
+    0.05,
+    0.04,
+    openRouterTicketHash,
+    encryptToEnclave("sk-or-v1-real-shaped-test-key", enclaveKeys.getEncryptionPublicKeyHex()),
+    undefined
+  );
+  globalThis.fetch = savedFetch;
+  (nearRelayer as any).getDeal = savedGetDeal;
+  if (!freePreflight.ok || preflightUrls.length !== 2 || !preflightUrls[0].endsWith("/models") || !preflightUrls[1].endsWith("/key")) {
+    throw new Error(`OpenRouter preflight was not free and deterministic: ${freePreflight.error || preflightUrls.join(", ")}`);
+  }
+  console.log("PASS: OpenRouter preflight validates model, price, and key without a billable completion.");
 
   // 6. Token Metering & Milestone Stage Releases
   console.log("\n[Test 6] Testing Token Metering & 25/50/75/100% Stage Releases...");

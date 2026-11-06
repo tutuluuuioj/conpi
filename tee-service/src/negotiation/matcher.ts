@@ -270,8 +270,8 @@ class NegotiationService {
   private compareTerms(a: TermSheet, b: TermSheet): string[] {
     const diffs: string[] = [];
     if (a.provider !== b.provider) diffs.push("provider");
-    if (Math.abs(a.creditAmountUsd - b.creditAmountUsd) > 0.01) diffs.push("creditAmount");
-    if (Math.abs(a.priceUsd - b.priceUsd) > 0.01) diffs.push("price");
+    if (Math.abs(a.creditAmountUsd - b.creditAmountUsd) > 0.000001) diffs.push("creditAmount");
+    if (Math.abs(a.priceUsd - b.priceUsd) > 0.000001) diffs.push("price");
     if (a.buyerCollateralPct !== b.buyerCollateralPct) diffs.push("buyerCollateralPct");
     if (a.sellerCollateralPct !== b.sellerCollateralPct) diffs.push("sellerCollateralPct");
     if (a.token !== b.token) diffs.push("token");
