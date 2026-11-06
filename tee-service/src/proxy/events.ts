@@ -17,6 +17,9 @@ export interface MeterEvent {
   model: string;
   models: string[];
   lockedPricing: VaultEntry["lockedPricing"];
+  pricingSnapshotHash: string;
+  usageReceiptCount: number;
+  lastUsageReceipt: VaultEntry["usageReceipts"][number] | null;
   stages: number[];
   timestamp: string;
 }
@@ -39,6 +42,9 @@ class MeterEventHub {
       model: entry.model,
       models: entry.models,
       lockedPricing: entry.lockedPricing,
+      pricingSnapshotHash: entry.pricingSnapshotHash || "",
+      usageReceiptCount: entry.usageReceipts?.length || 0,
+      lastUsageReceipt: entry.usageReceipts?.at(-1) || null,
       stages,
       timestamp: new Date().toISOString(),
     };

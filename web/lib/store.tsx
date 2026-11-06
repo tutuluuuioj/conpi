@@ -564,6 +564,9 @@ export function Providers({ children }: { children: React.ReactNode }) {
           stage,
           lastUpdate,
           prices: lockedPriceRows.length ? lockedPriceRows : existing?.prices || mapped.prices,
+          pricingSnapshotHash: liveMeter?.pricingSnapshotHash || existing?.pricingSnapshotHash,
+          usageReceiptCount: Number(liveMeter?.usageReceiptCount ?? existing?.usageReceiptCount ?? 0),
+          lastUsageReceipt: liveMeter?.lastUsageReceipt ?? existing?.lastUsageReceipt ?? null,
           buyerTerms: listing
             ? { ...(existing?.buyerTerms || listingTerms(listing)), creditUsd: listing.creditUsd ?? listing.credit, priceUsd: listing.priceUsd ?? listing.price }
             : existing?.buyerTerms || mapped.buyerTerms,
@@ -1426,6 +1429,9 @@ export function Providers({ children }: { children: React.ReactNode }) {
                 priceUsd,
                 stage,
                 prices: lockedPriceRows.length ? lockedPriceRows : item.prices,
+                pricingSnapshotHash: data.pricingSnapshotHash || item.pricingSnapshotHash,
+                usageReceiptCount: Number(data.usageReceiptCount ?? item.usageReceiptCount ?? 0),
+                lastUsageReceipt: data.lastUsageReceipt ?? item.lastUsageReceipt ?? null,
                 lastUpdate: `TEE Enclave (${new Date().toLocaleTimeString()})`,
                 heartbeat: data.active ? "live" : item.heartbeat,
               };
@@ -1480,6 +1486,9 @@ export function Providers({ children }: { children: React.ReactNode }) {
             priceUsd,
             stage,
             prices: lockedPriceRows.length ? lockedPriceRows : deal.prices,
+            pricingSnapshotHash: event.pricingSnapshotHash || deal.pricingSnapshotHash,
+            usageReceiptCount: Number(event.usageReceiptCount ?? deal.usageReceiptCount ?? 0),
+            lastUsageReceipt: event.lastUsageReceipt ?? deal.lastUsageReceipt ?? null,
             heartbeat: event.active ? "live" : deal.heartbeat,
             pulseStage: event.stages.length ? event.stages[event.stages.length - 1] : deal.pulseStage,
             lastUpdate: `TEE Enclave (${new Date(event.timestamp).toLocaleTimeString()})`,

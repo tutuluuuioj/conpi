@@ -1,11 +1,13 @@
 import { FastifyReply, FastifyRequest } from "fastify";
+import crypto from "crypto";
 import { DefaultReason } from "../crypto/borsh.js";
+import { enclaveKeys } from "../crypto/keys.js";
 import { CONFIG } from "../config.js";
 import { keyVault, VaultEntry } from "../vault/preflight.js";
 import { meterEvents } from "./events.js";
 import { settlementEngine } from "../settlement/engine.js";
 import { meterEngine } from "./meter.js";
-import { calculateCost } from "./pricing.js";
+import { calculateCost, PricingRate } from "./pricing.js";
 import { proxyRateLimiter } from "./rate-limit.js";
 import { countChatInputTokens, countEmbeddingInputTokens, countTextTokens, extractText } from "./tokenizer.js";
 
@@ -20,13 +22,33 @@ interface UsageResult {
   stages: number[];
 }
 
-export function requestWithProviderUsage(body: any, kind: ProviderKind): any {
+function finitePriceCeiling(value: unknown): number | undefined {
+  const parsed = typeof value === "number" ? value : Number.parseFloat(String(value ?? ""));
+  return Number.isFinite(parsed) && parsed >= 0 ? parsed : undefined;
+}
+
+export function requestWithProviderUsage(body: any, kind: ProviderKind, lockedRate?: PricingRate): any {
   if (kind !== "openrouter") {
     return body.stream ? { ...body, stream_options: { ...(body.stream_options || {}), include_usage: true } } : body;
   }
+  const requestedMaxPrice = body.provider?.max_price || {};
+  const lockedPrompt = lockedRate?.inputPerMillion;
+  const lockedCompletion = lockedRate?.outputPerMillion;
+  const requestedPrompt = finitePriceCeiling(requestedMaxPrice.prompt);
+  const requestedCompletion = finitePriceCeiling(requestedMaxPrice.completion);
+  const maxPrice = lockedRate
+    ? {
+        prompt: requestedPrompt === undefined ? lockedPrompt : Math.min(requestedPrompt, lockedPrompt!),
+        completion: requestedCompletion === undefined ? lockedCompletion : Math.min(requestedCompletion, lockedCompletion!),
+      }
+    : requestedMaxPrice;
   return {
     ...body,
     usage: { ...(body.usage && typeof body.usage === "object" ? body.usage : {}), include: true },
+    provider: {
+      ...(body.provider && typeof body.provider === "object" ? body.provider : {}),
+      ...(Object.keys(maxPrice).length ? { max_price: maxPrice } : {}),
+    },
     ...(body.stream
       ? { stream_options: { ...(body.stream_options || {}), include_usage: true } }
       : {}),
@@ -35,10 +57,65 @@ export function requestWithProviderUsage(body: any, kind: ProviderKind): any {
 
 export function resolveMeteredCostUsd(provider: string, calculatedCostUsd: number, providerCost: unknown): number {
   const observed = typeof providerCost === "number" ? providerCost : Number.parseFloat(String(providerCost ?? ""));
-  if (provider.trim().toLowerCase() === "openrouter" && Number.isFinite(observed) && observed >= 0) {
-    return observed;
+  if (provider.trim().toLowerCase() === "openrouter") {
+    if (Number.isFinite(observed) && observed >= 0) return observed;
+    throw new Error("OpenRouter response is missing an authoritative cost; estimated billing is disabled");
   }
   return calculatedCostUsd;
+}
+
+export interface OpenRouterCostResolution {
+  costUsd: number;
+  source: "openrouter_usage" | "openrouter_generation";
+}
+
+export async function resolveOpenRouterCost(
+  apiKey: string,
+  providerCost: unknown,
+  generationId: unknown,
+  options: { fetchImpl?: typeof fetch; retryDelaysMs?: number[] } = {}
+): Promise<OpenRouterCostResolution> {
+  const direct = typeof providerCost === "number" ? providerCost : Number.parseFloat(String(providerCost ?? ""));
+  if (Number.isFinite(direct) && direct >= 0) return { costUsd: direct, source: "openrouter_usage" };
+
+  const normalizedId = typeof generationId === "string" ? generationId.trim() : "";
+  if (!normalizedId) {
+    throw new Error("OpenRouter omitted both usage.cost and the generation ID; metering was stopped without releasing funds");
+  }
+
+  const fetchImpl = options.fetchImpl || fetch;
+  const retryDelaysMs = options.retryDelaysMs || [250, 500, 1_000, 2_000];
+  for (let attempt = 0; attempt <= retryDelaysMs.length; attempt += 1) {
+    const response = await fetchImpl(`https://openrouter.ai/api/v1/generation?id=${encodeURIComponent(normalizedId)}`, {
+      method: "GET",
+      headers: { Authorization: `Bearer ${apiKey}` },
+      signal: AbortSignal.timeout(5_000),
+    });
+    if (response.ok) {
+      const data: any = await response.json().catch(() => null);
+      const observed = Number(data?.data?.total_cost ?? data?.data?.usage);
+      if (Number.isFinite(observed) && observed >= 0) {
+        return { costUsd: observed, source: "openrouter_generation" };
+      }
+      throw new Error("OpenRouter generation record did not contain an authoritative total cost");
+    }
+    const retryable = response.status === 404 || response.status === 429 || response.status >= 500;
+    if (!retryable || attempt === retryDelaysMs.length) {
+      throw new Error(`OpenRouter cost reconciliation failed (HTTP ${response.status}); metering was stopped without releasing funds`);
+    }
+    await new Promise((resolve) => setTimeout(resolve, retryDelaysMs[attempt]));
+  }
+  throw new Error("OpenRouter cost reconciliation failed; metering was stopped without releasing funds");
+}
+
+export function validatePricedOpenRouterRequest(body: any): string | null {
+  if (Array.isArray(body?.models) && (body.models.length !== 1 || body.models[0] !== body.model)) return "model_fallbacks";
+  if (body?.route !== undefined) return "alternate_route";
+  if (Array.isArray(body?.plugins) && body.plugins.length > 0) return "plugins";
+  if (body?.web_search_options !== undefined) return "web_search";
+  if (body?.image_config !== undefined || body?.audio !== undefined) return "unpriced_media";
+  if (Array.isArray(body?.modalities) && body.modalities.some((item: unknown) => item !== "text")) return "unpriced_modality";
+  return null;
 }
 
 function getProxyKey(req: FastifyRequest): string | null {
@@ -55,6 +132,17 @@ function providerKind(entry: VaultEntry): ProviderKind {
   if (provider === "openrouter") return "openrouter";
   if (provider === "redpill" || provider === "phala" || entry.apiKey.startsWith("sk-rp-")) return "redpill";
   return "openai";
+}
+
+async function authoritativeCostForEntry(
+  entry: VaultEntry,
+  providerCost: unknown,
+  generationId: unknown
+): Promise<{ providerCost?: number; generationId?: string; source?: OpenRouterCostResolution["source"] }> {
+  if (providerKind(entry) !== "openrouter") return {};
+  const normalizedId = typeof generationId === "string" && generationId.trim() ? generationId.trim() : undefined;
+  const resolved = await resolveOpenRouterCost(entry.apiKey, providerCost, normalizedId);
+  return { providerCost: resolved.costUsd, generationId: normalizedId, source: resolved.source };
 }
 
 function openAiBaseUrl(kind: ProviderKind): string {
@@ -196,7 +284,9 @@ function recordUsage(
   inputTokens: number,
   outputTokens: number,
   cachedTokens = 0,
-  providerCost?: unknown
+  providerCost?: unknown,
+  generationId?: string,
+  costSource?: OpenRouterCostResolution["source"]
 ): UsageResult {
   const calculated = calculateCost(model, inputTokens, outputTokens, cachedTokens, entry.lockedPricing);
   const usage = {
@@ -205,6 +295,26 @@ function recordUsage(
   };
   entry.usedUsd = Math.min(entry.creditUsd, entry.usedUsd + usage.costUsd);
   entry.tokensTotal += usage.inputTokens + usage.outputTokens;
+  const previousHash = entry.usageReceipts.at(-1)?.hash || null;
+  const receiptBody = {
+    sequence: entry.usageReceipts.length + 1,
+    generationId: generationId || null,
+    model,
+    inputTokens: usage.inputTokens,
+    outputTokens: usage.outputTokens,
+    cachedTokens: usage.cachedTokens,
+    costUsd: usage.costUsd,
+    cumulativeUsedUsd: entry.usedUsd,
+    source: costSource || "locked_pricing" as const,
+    createdAt: new Date().toISOString(),
+    previousHash,
+  };
+  const hash = crypto.createHash("sha256").update(JSON.stringify(receiptBody)).digest("hex");
+  entry.usageReceipts.push({
+    ...receiptBody,
+    hash,
+    signatureHex: Buffer.from(enclaveKeys.sign(Buffer.from(hash, "hex"))).toString("hex"),
+  });
   const signedStages = meterEngine.checkAndEmitStages(entry, entry.termsHashHex);
   for (const stage of signedStages) entry.signedPayloads.push(stage);
   if (signedStages.length > 0) {
@@ -349,6 +459,7 @@ async function streamOpenAiResponse(response: Response, reply: FastifyReply, ent
   let cachedTokens = 0;
   let providerCost: unknown;
   let providerUsageSeen = false;
+  let generationId: string | undefined;
 
   if (transformToAnthropic) {
     reply.raw.write(`event: message_start\ndata: ${JSON.stringify({ type: "message_start", message: { id: `msg_${Date.now()}`, type: "message", role: "assistant", model, content: [], stop_reason: null, usage: { input_tokens: fallbackInputTokens, output_tokens: 0 } } })}\n\n`);
@@ -370,6 +481,7 @@ async function streamOpenAiResponse(response: Response, reply: FastifyReply, ent
       if (!raw || raw === "[DONE]") continue;
       let data: any;
       try { data = JSON.parse(raw); } catch { continue; }
+      if (!generationId && typeof data.id === "string") generationId = data.id;
       const text = data.choices?.[0]?.delta?.content;
       if (typeof text === "string") {
         outputText += text;
@@ -390,13 +502,32 @@ async function streamOpenAiResponse(response: Response, reply: FastifyReply, ent
 
   inputTokens ||= fallbackInputTokens;
   outputTokens ||= countTextTokens(entry.provider, model, outputText);
-  const usage = recordUsage(entry, model, inputTokens, outputTokens, cachedTokens, providerCost);
+  let authoritative: Awaited<ReturnType<typeof authoritativeCostForEntry>>;
+  try {
+    authoritative = await authoritativeCostForEntry(entry, providerCost, generationId);
+  } catch (error: any) {
+    const payload = { error: { message: error.message, code: "cost_reconciliation_failed" } };
+    if (transformToAnthropic) reply.raw.write(`event: error\ndata: ${JSON.stringify(payload)}\n\n`);
+    else reply.raw.write(`data: ${JSON.stringify(payload)}\n\ndata: [DONE]\n\n`);
+    return reply.raw.end();
+  }
+  const usage = recordUsage(
+    entry,
+    model,
+    inputTokens,
+    outputTokens,
+    cachedTokens,
+    authoritative.providerCost,
+    authoritative.generationId,
+    authoritative.source
+  );
+  const usageSource = authoritative.source || (providerUsageSeen ? "provider" : "tokenizer");
   if (transformToAnthropic) {
     reply.raw.write(`event: content_block_stop\ndata: ${JSON.stringify({ type: "content_block_stop", index: 0 })}\n\n`);
     reply.raw.write(`event: message_delta\ndata: ${JSON.stringify({ type: "message_delta", delta: { stop_reason: "end_turn", stop_sequence: null }, usage: { output_tokens: outputTokens } })}\n\n`);
-    reply.raw.write(`event: message_stop\ndata: ${JSON.stringify({ type: "message_stop", conpi_cost_usd: usage.costUsd, conpi_usage_source: providerUsageSeen ? "provider" : "tokenizer" })}\n\n`);
+    reply.raw.write(`event: message_stop\ndata: ${JSON.stringify({ type: "message_stop", conpi_cost_usd: usage.costUsd, conpi_usage_source: usageSource })}\n\n`);
   } else {
-    reply.raw.write(`data: ${JSON.stringify({ object: "conpi.meter", usage: { prompt_tokens: inputTokens, completion_tokens: outputTokens, total_tokens: inputTokens + outputTokens, conpi_cost_usd: usage.costUsd, conpi_usage_source: providerUsageSeen ? "provider" : "tokenizer" }, stages: usage.stages })}\n\n`);
+    reply.raw.write(`data: ${JSON.stringify({ object: "conpi.meter", usage: { prompt_tokens: inputTokens, completion_tokens: outputTokens, total_tokens: inputTokens + outputTokens, conpi_cost_usd: usage.costUsd, conpi_usage_source: usageSource }, stages: usage.stages })}\n\n`);
     reply.raw.write("data: [DONE]\n\n");
   }
   return reply.raw.end();
@@ -456,6 +587,14 @@ export async function handleChatCompletions(req: FastifyRequest, reply: FastifyR
   const body = (req.body || {}) as any;
   const model = String(body.model || "");
   if (!model) return reply.status(400).send({ error: { message: "model is required", code: "invalid_request" } });
+  if (providerKind(entry) === "openrouter") {
+    const unpricedFeature = validatePricedOpenRouterRequest(body);
+    if (unpricedFeature) {
+      return reply.status(400).send({
+        error: { message: `OpenRouter request feature '${unpricedFeature}' is not covered by the deal's locked pricing`, code: "unpriced_feature" },
+      });
+    }
+  }
   const inputTokens = countChatInputTokens(entry.provider, model, body.messages);
   const maxOutputTokens = Math.max(1, Number(body.max_tokens ?? body.max_completion_tokens ?? 1_000));
   if (!enforceModelAndBudget(entry, model, inputTokens, maxOutputTokens, reply)) return;
@@ -490,7 +629,7 @@ export async function handleChatCompletions(req: FastifyRequest, reply: FastifyR
 
     const response = await fetchWithTransientBackoff(`${openAiBaseUrl(kind)}/chat/completions`, {
       method: "POST", headers: providerHeaders(entry, kind),
-      body: JSON.stringify(requestWithProviderUsage(body, kind)),
+      body: JSON.stringify(requestWithProviderUsage(body, kind, entry.lockedPricing[model])),
     });
     if (!response.ok) return handleProviderFailure(response, entry, reply);
     if (body.stream) return streamOpenAiResponse(response, reply, entry, model, inputTokens);
@@ -500,8 +639,9 @@ export async function handleChatCompletions(req: FastifyRequest, reply: FastifyR
     const finalInput = Number(data.usage?.prompt_tokens || inputTokens);
     const finalOutput = Number(data.usage?.completion_tokens || countTextTokens(entry.provider, model, outputText));
     const cachedTokens = Number(data.usage?.prompt_tokens_details?.cached_tokens || 0);
-    const usage = recordUsage(entry, model, finalInput, finalOutput, cachedTokens, data.usage?.cost);
-    data.usage = { ...(data.usage || {}), prompt_tokens: finalInput, completion_tokens: finalOutput, total_tokens: finalInput + finalOutput, conpi_cost_usd: usage.costUsd, conpi_usage_source: providerUsageSeen ? "provider" : "tokenizer" };
+    const authoritative = await authoritativeCostForEntry(entry, data.usage?.cost, data.id);
+    const usage = recordUsage(entry, model, finalInput, finalOutput, cachedTokens, authoritative.providerCost, authoritative.generationId, authoritative.source);
+    data.usage = { ...(data.usage || {}), prompt_tokens: finalInput, completion_tokens: finalOutput, total_tokens: finalInput + finalOutput, conpi_cost_usd: usage.costUsd, conpi_usage_source: authoritative.source || (providerUsageSeen ? "provider" : "tokenizer") };
     return reply.status(response.status).send(data);
   } catch (err: any) {
     return reply.status(502).send({ error: { message: err.message, code: "proxy_error" } });
@@ -514,6 +654,14 @@ export async function handleAnthropicMessages(req: FastifyRequest, reply: Fastif
   const body = (req.body || {}) as any;
   const model = String(body.model || "");
   if (!model) return reply.status(400).send({ error: { type: "invalid_request_error", message: "model is required" } });
+  if (providerKind(entry) === "openrouter") {
+    const unpricedFeature = validatePricedOpenRouterRequest(body);
+    if (unpricedFeature) {
+      return reply.status(400).send({
+        error: { type: "invalid_request_error", message: `OpenRouter request feature '${unpricedFeature}' is not covered by the deal's locked pricing`, code: "unpriced_feature" },
+      });
+    }
+  }
   const inputTokens = countChatInputTokens(entry.provider, model, body.messages, body.system);
   const maxOutputTokens = Math.max(1, Number(body.max_tokens ?? 1_000));
   if (!enforceModelAndBudget(entry, model, inputTokens, maxOutputTokens, reply)) return;
@@ -544,7 +692,7 @@ export async function handleAnthropicMessages(req: FastifyRequest, reply: Fastif
     }
 
     const response = await fetchWithTransientBackoff(`${openAiBaseUrl(kind)}/chat/completions`, {
-      method: "POST", headers: providerHeaders(entry, kind), body: JSON.stringify(requestWithProviderUsage(anthropicMessagesToOpenAi(body), kind)),
+      method: "POST", headers: providerHeaders(entry, kind), body: JSON.stringify(requestWithProviderUsage(anthropicMessagesToOpenAi(body), kind, entry.lockedPricing[model])),
     });
     if (!response.ok) return handleProviderFailure(response, entry, reply, true);
     if (body.stream) return streamOpenAiResponse(response, reply, entry, model, inputTokens, true);
@@ -554,12 +702,13 @@ export async function handleAnthropicMessages(req: FastifyRequest, reply: Fastif
     const finalInput = Number(data.usage?.prompt_tokens || inputTokens);
     const finalOutput = Number(data.usage?.completion_tokens || countTextTokens(entry.provider, model, outputText));
     const cachedTokens = Number(data.usage?.prompt_tokens_details?.cached_tokens || 0);
-    const usage = recordUsage(entry, model, finalInput, finalOutput, cachedTokens, data.usage?.cost);
+    const authoritative = await authoritativeCostForEntry(entry, data.usage?.cost, data.id);
+    const usage = recordUsage(entry, model, finalInput, finalOutput, cachedTokens, authoritative.providerCost, authoritative.generationId, authoritative.source);
     return reply.send({
       id: `msg_${data.id || Date.now()}`, type: "message", role: "assistant", model,
       content: [{ type: "text", text: outputText }],
       stop_reason: data.choices?.[0]?.finish_reason === "length" ? "max_tokens" : "end_turn", stop_sequence: null,
-      usage: { input_tokens: finalInput, output_tokens: finalOutput, conpi_cost_usd: usage.costUsd, conpi_usage_source: providerUsageSeen ? "provider" : "tokenizer" },
+      usage: { input_tokens: finalInput, output_tokens: finalOutput, conpi_cost_usd: usage.costUsd, conpi_usage_source: authoritative.source || (providerUsageSeen ? "provider" : "tokenizer") },
     });
   } catch (err: any) {
     return reply.status(502).send({ error: { type: "api_error", message: err.message } });
@@ -572,6 +721,14 @@ export async function handleEmbeddings(req: FastifyRequest, reply: FastifyReply)
   const body = (req.body || {}) as any;
   const model = String(body.model || "");
   if (!model) return reply.status(400).send({ error: { message: "model is required", code: "invalid_request" } });
+  if (providerKind(entry) === "openrouter") {
+    const unpricedFeature = validatePricedOpenRouterRequest(body);
+    if (unpricedFeature) {
+      return reply.status(400).send({
+        error: { message: `OpenRouter request feature '${unpricedFeature}' is not covered by the deal's locked pricing`, code: "unpriced_feature" },
+      });
+    }
+  }
   const inputTokens = countEmbeddingInputTokens(entry.provider, model, body.input);
   if (!enforceModelAndBudget(entry, model, inputTokens, 0, reply)) return;
   const kind = providerKind(entry);
@@ -588,15 +745,16 @@ export async function handleEmbeddings(req: FastifyRequest, reply: FastifyReply)
   }
   try {
     const response = await fetchWithTransientBackoff(`${openAiBaseUrl(kind)}/embeddings`, {
-      method: "POST", headers: providerHeaders(entry, kind), body: JSON.stringify(body),
+      method: "POST", headers: providerHeaders(entry, kind), body: JSON.stringify(requestWithProviderUsage(body, kind, entry.lockedPricing[model])),
     });
     if (!response.ok) return handleProviderFailure(response, entry, reply);
     const data: any = await response.json();
     const providerUsageSeen = data.usage?.prompt_tokens !== undefined || data.usage?.total_tokens !== undefined;
     const finalInput = Number(data.usage?.prompt_tokens || data.usage?.total_tokens || inputTokens);
     const cachedTokens = Number(data.usage?.prompt_tokens_details?.cached_tokens || 0);
-    const usage = recordUsage(entry, model, finalInput, 0, cachedTokens, data.usage?.cost);
-    data.usage = { ...(data.usage || {}), prompt_tokens: finalInput, total_tokens: finalInput, conpi_cost_usd: usage.costUsd, conpi_usage_source: providerUsageSeen ? "provider" : "tokenizer" };
+    const authoritative = await authoritativeCostForEntry(entry, data.usage?.cost, data.id);
+    const usage = recordUsage(entry, model, finalInput, 0, cachedTokens, authoritative.providerCost, authoritative.generationId, authoritative.source);
+    data.usage = { ...(data.usage || {}), prompt_tokens: finalInput, total_tokens: finalInput, conpi_cost_usd: usage.costUsd, conpi_usage_source: authoritative.source || (providerUsageSeen ? "provider" : "tokenizer") };
     return reply.status(response.status).send(data);
   } catch (err: any) {
     return reply.status(502).send({ error: { message: err.message, code: "proxy_error" } });
@@ -608,6 +766,7 @@ export async function handleModels(req: FastifyRequest, reply: FastifyReply) {
   if (!entry || !enforceRateLimit(entry, reply)) return;
   return reply.send({
     object: "list",
+    conpi_pricing_snapshot_hash: entry.pricingSnapshotHash,
     data: entry.models.map((model) => ({
       id: model, object: "model", created: Math.floor(new Date(entry.registeredAt).getTime() / 1_000),
       owned_by: entry.provider.toLowerCase(), conpi_locked_pricing: entry.lockedPricing[model],

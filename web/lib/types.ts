@@ -104,6 +104,15 @@ export interface PriceRow {
   output: string;
 }
 
+export interface UsageReceiptSummary {
+  sequence: number;
+  generationId: string | null;
+  costUsd: number;
+  source: "openrouter_usage" | "openrouter_generation" | "locked_pricing";
+  hash: string;
+  signatureHex: string;
+}
+
 export interface Deal {
   id: string;
   listingId: string;
@@ -152,6 +161,9 @@ export interface Deal {
   messages: ChatMessage[];
   activity: Activity[];
   prices: PriceRow[];
+  pricingSnapshotHash?: string;
+  usageReceiptCount?: number;
+  lastUsageReceipt?: UsageReceiptSummary | null;
   steps: Partial<Record<DealStep, StepMark>>;
   createdAt: string;
   pulseStage: number | null;

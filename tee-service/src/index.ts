@@ -215,12 +215,28 @@ export async function buildApp() {
       model: entry.model,
       models: entry.models,
       lockedPricing: entry.lockedPricing,
+      pricingSnapshotHash: entry.pricingSnapshotHash,
       creditUsd: entry.creditUsd,
       priceUsd: entry.priceUsd,
+      usageReceiptCount: entry.usageReceipts.length,
+      lastUsageReceipt: entry.usageReceipts.at(-1) || null,
       registeredAt: entry.registeredAt,
       lastCheckpointAt: new Date(entry.lastCheckpointAt).toISOString(),
       relayReceipts: entry.relayReceipts,
       timestamp: new Date().toISOString(),
+    };
+  });
+
+  app.get("/v1/deals/:id/usage-receipts", async (req, reply) => {
+    const { id } = req.params as { id: string };
+    const dealId = parseInt(id, 10);
+    const entry = authenticateDealRequest(req, reply, dealId);
+    if (!entry) return;
+    return {
+      dealId,
+      signerPublicKeyNear: enclaveKeys.getSignerPublicKeyNear(),
+      pricingSnapshotHash: entry.pricingSnapshotHash,
+      receipts: entry.usageReceipts,
     };
   });
 

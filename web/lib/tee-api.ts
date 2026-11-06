@@ -51,6 +51,23 @@ export interface MeterResponse {
   model: string;
   models: string[];
   lockedPricing: Record<string, { inputPerMillion: number; outputPerMillion: number; cachedInputPerMillion?: number }>;
+  pricingSnapshotHash: string;
+  usageReceiptCount: number;
+  lastUsageReceipt: {
+    sequence: number;
+    generationId: string | null;
+    model: string;
+    inputTokens: number;
+    outputTokens: number;
+    cachedTokens: number;
+    costUsd: number;
+    cumulativeUsedUsd: number;
+    source: "openrouter_usage" | "openrouter_generation" | "locked_pricing";
+    createdAt: string;
+    previousHash: string | null;
+    hash: string;
+    signatureHex: string;
+  } | null;
   creditUsd: number;
   priceUsd: number;
   lastCheckpointAt?: string;

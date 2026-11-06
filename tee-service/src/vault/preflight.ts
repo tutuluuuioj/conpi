@@ -111,6 +111,8 @@ export interface VaultEntry {
   usedUsd: number;
   tokensTotal: number;
   lockedPricing: LockedPricingTable;
+  pricingSnapshotHash: string;
+  usageReceipts: UsageReceipt[];
   rateLimitPerMinute: number;
   creditAmountYocto?: string;
   active: boolean;
@@ -120,6 +122,29 @@ export interface VaultEntry {
   lastCheckpointAt: number;
   relayReceipts: RelayReceipt[];
   onChainStatus?: string;
+}
+
+export interface UsageReceipt {
+  sequence: number;
+  generationId: string | null;
+  model: string;
+  inputTokens: number;
+  outputTokens: number;
+  cachedTokens: number;
+  costUsd: number;
+  cumulativeUsedUsd: number;
+  source: "openrouter_usage" | "openrouter_generation" | "locked_pricing";
+  createdAt: string;
+  previousHash: string | null;
+  hash: string;
+  signatureHex: string;
+}
+
+export function hashLockedPricing(pricing: LockedPricingTable): string {
+  const canonical = Object.keys(pricing)
+    .sort()
+    .map((model) => ({ model, ...pricing[model] }));
+  return crypto.createHash("sha256").update(JSON.stringify(canonical)).digest("hex");
 }
 
 export interface RelayReceipt {
@@ -324,6 +349,8 @@ class KeyVault {
       usedUsd: 0,
       tokensTotal: 0,
       lockedPricing,
+      pricingSnapshotHash: hashLockedPricing(lockedPricing),
+      usageReceipts: [],
       rateLimitPerMinute: CONFIG.rateLimitPerMinute,
       creditAmountYocto: resolvedCreditYocto,
       active: true,
