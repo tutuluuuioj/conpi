@@ -20,6 +20,27 @@ interface UsageResult {
   stages: number[];
 }
 
+export function requestWithProviderUsage(body: any, kind: ProviderKind): any {
+  if (kind !== "openrouter") {
+    return body.stream ? { ...body, stream_options: { ...(body.stream_options || {}), include_usage: true } } : body;
+  }
+  return {
+    ...body,
+    usage: { ...(body.usage && typeof body.usage === "object" ? body.usage : {}), include: true },
+    ...(body.stream
+      ? { stream_options: { ...(body.stream_options || {}), include_usage: true } }
+      : {}),
+  };
+}
+
+export function resolveMeteredCostUsd(provider: string, calculatedCostUsd: number, providerCost: unknown): number {
+  const observed = typeof providerCost === "number" ? providerCost : Number.parseFloat(String(providerCost ?? ""));
+  if (provider.trim().toLowerCase() === "openrouter" && Number.isFinite(observed) && observed >= 0) {
+    return observed;
+  }
+  return calculatedCostUsd;
+}
+
 function getProxyKey(req: FastifyRequest): string | null {
   const xApiKey = req.headers["x-api-key"];
   if (typeof xApiKey === "string" && xApiKey.trim()) return xApiKey.trim();
@@ -169,8 +190,19 @@ function enforceModelAndBudget(entry: VaultEntry, model: string, inputTokens: nu
   return true;
 }
 
-function recordUsage(entry: VaultEntry, model: string, inputTokens: number, outputTokens: number, cachedTokens = 0): UsageResult {
-  const usage = calculateCost(model, inputTokens, outputTokens, cachedTokens, entry.lockedPricing);
+function recordUsage(
+  entry: VaultEntry,
+  model: string,
+  inputTokens: number,
+  outputTokens: number,
+  cachedTokens = 0,
+  providerCost?: unknown
+): UsageResult {
+  const calculated = calculateCost(model, inputTokens, outputTokens, cachedTokens, entry.lockedPricing);
+  const usage = {
+    ...calculated,
+    costUsd: resolveMeteredCostUsd(entry.provider, calculated.costUsd, providerCost),
+  };
   entry.usedUsd = Math.min(entry.creditUsd, entry.usedUsd + usage.costUsd);
   entry.tokensTotal += usage.inputTokens + usage.outputTokens;
   const signedStages = meterEngine.checkAndEmitStages(entry, entry.termsHashHex);
@@ -315,6 +347,7 @@ async function streamOpenAiResponse(response: Response, reply: FastifyReply, ent
   let inputTokens = 0;
   let outputTokens = 0;
   let cachedTokens = 0;
+  let providerCost: unknown;
   let providerUsageSeen = false;
 
   if (transformToAnthropic) {
@@ -350,13 +383,14 @@ async function streamOpenAiResponse(response: Response, reply: FastifyReply, ent
         inputTokens = Number(data.usage.prompt_tokens || inputTokens);
         outputTokens = Number(data.usage.completion_tokens || outputTokens);
         cachedTokens = Number(data.usage.prompt_tokens_details?.cached_tokens || cachedTokens);
+        if (data.usage.cost !== undefined) providerCost = data.usage.cost;
       }
     }
   }
 
   inputTokens ||= fallbackInputTokens;
   outputTokens ||= countTextTokens(entry.provider, model, outputText);
-  const usage = recordUsage(entry, model, inputTokens, outputTokens, cachedTokens);
+  const usage = recordUsage(entry, model, inputTokens, outputTokens, cachedTokens, providerCost);
   if (transformToAnthropic) {
     reply.raw.write(`event: content_block_stop\ndata: ${JSON.stringify({ type: "content_block_stop", index: 0 })}\n\n`);
     reply.raw.write(`event: message_delta\ndata: ${JSON.stringify({ type: "message_delta", delta: { stop_reason: "end_turn", stop_sequence: null }, usage: { output_tokens: outputTokens } })}\n\n`);
@@ -456,7 +490,7 @@ export async function handleChatCompletions(req: FastifyRequest, reply: FastifyR
 
     const response = await fetchWithTransientBackoff(`${openAiBaseUrl(kind)}/chat/completions`, {
       method: "POST", headers: providerHeaders(entry, kind),
-      body: JSON.stringify(body.stream ? { ...body, stream_options: { include_usage: true } } : body),
+      body: JSON.stringify(requestWithProviderUsage(body, kind)),
     });
     if (!response.ok) return handleProviderFailure(response, entry, reply);
     if (body.stream) return streamOpenAiResponse(response, reply, entry, model, inputTokens);
@@ -466,7 +500,7 @@ export async function handleChatCompletions(req: FastifyRequest, reply: FastifyR
     const finalInput = Number(data.usage?.prompt_tokens || inputTokens);
     const finalOutput = Number(data.usage?.completion_tokens || countTextTokens(entry.provider, model, outputText));
     const cachedTokens = Number(data.usage?.prompt_tokens_details?.cached_tokens || 0);
-    const usage = recordUsage(entry, model, finalInput, finalOutput, cachedTokens);
+    const usage = recordUsage(entry, model, finalInput, finalOutput, cachedTokens, data.usage?.cost);
     data.usage = { ...(data.usage || {}), prompt_tokens: finalInput, completion_tokens: finalOutput, total_tokens: finalInput + finalOutput, conpi_cost_usd: usage.costUsd, conpi_usage_source: providerUsageSeen ? "provider" : "tokenizer" };
     return reply.status(response.status).send(data);
   } catch (err: any) {
@@ -510,7 +544,7 @@ export async function handleAnthropicMessages(req: FastifyRequest, reply: Fastif
     }
 
     const response = await fetchWithTransientBackoff(`${openAiBaseUrl(kind)}/chat/completions`, {
-      method: "POST", headers: providerHeaders(entry, kind), body: JSON.stringify(anthropicMessagesToOpenAi(body)),
+      method: "POST", headers: providerHeaders(entry, kind), body: JSON.stringify(requestWithProviderUsage(anthropicMessagesToOpenAi(body), kind)),
     });
     if (!response.ok) return handleProviderFailure(response, entry, reply, true);
     if (body.stream) return streamOpenAiResponse(response, reply, entry, model, inputTokens, true);
@@ -519,7 +553,8 @@ export async function handleAnthropicMessages(req: FastifyRequest, reply: Fastif
     const providerUsageSeen = data.usage?.prompt_tokens !== undefined && data.usage?.completion_tokens !== undefined;
     const finalInput = Number(data.usage?.prompt_tokens || inputTokens);
     const finalOutput = Number(data.usage?.completion_tokens || countTextTokens(entry.provider, model, outputText));
-    const usage = recordUsage(entry, model, finalInput, finalOutput);
+    const cachedTokens = Number(data.usage?.prompt_tokens_details?.cached_tokens || 0);
+    const usage = recordUsage(entry, model, finalInput, finalOutput, cachedTokens, data.usage?.cost);
     return reply.send({
       id: `msg_${data.id || Date.now()}`, type: "message", role: "assistant", model,
       content: [{ type: "text", text: outputText }],
@@ -559,7 +594,8 @@ export async function handleEmbeddings(req: FastifyRequest, reply: FastifyReply)
     const data: any = await response.json();
     const providerUsageSeen = data.usage?.prompt_tokens !== undefined || data.usage?.total_tokens !== undefined;
     const finalInput = Number(data.usage?.prompt_tokens || data.usage?.total_tokens || inputTokens);
-    const usage = recordUsage(entry, model, finalInput, 0);
+    const cachedTokens = Number(data.usage?.prompt_tokens_details?.cached_tokens || 0);
+    const usage = recordUsage(entry, model, finalInput, 0, cachedTokens, data.usage?.cost);
     data.usage = { ...(data.usage || {}), prompt_tokens: finalInput, total_tokens: finalInput, conpi_cost_usd: usage.costUsd, conpi_usage_source: providerUsageSeen ? "provider" : "tokenizer" };
     return reply.status(response.status).send(data);
   } catch (err: any) {

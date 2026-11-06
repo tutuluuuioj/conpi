@@ -7,7 +7,7 @@ import { keyVault } from "../src/vault/preflight.js";
 import { meterEvents } from "../src/proxy/events.js";
 import { calculateCost } from "../src/proxy/pricing.js";
 import { proxyRateLimiter } from "../src/proxy/rate-limit.js";
-import { classifyProviderError, extractProviderErrorCode } from "../src/proxy/server.js";
+import { classifyProviderError, extractProviderErrorCode, requestWithProviderUsage, resolveMeteredCostUsd } from "../src/proxy/server.js";
 import { countChatInputTokens, countEmbeddingInputTokens } from "../src/proxy/tokenizer.js";
 
 function assert(condition: unknown, message: string): asserts condition {
@@ -47,6 +47,17 @@ async function runPhase3Tests() {
   assert(Object.isFrozen(entry.lockedPricing["gpt-4o"]), "Locked model rate must be immutable");
   const priced = calculateCost("gpt-4o", 1_000, 500, 0, entry.lockedPricing);
   assert(Math.abs(priced.costUsd - 0.0075) < 1e-12, "Locked price calculation is incorrect");
+  assert(
+    Math.abs(resolveMeteredCostUsd("OpenRouter", 0.05, 0.0251) - 0.0251) < 1e-12,
+    "OpenRouter authoritative usage.cost was not used"
+  );
+  assert(
+    Math.abs(resolveMeteredCostUsd("OpenAI", 0.05, 0.0251) - 0.05) < 1e-12,
+    "A non-OpenRouter provider was allowed to override locked-price accounting"
+  );
+  const openRouterBody = requestWithProviderUsage({ model: "z-ai/glm-5.3-flash", stream: true }, "openrouter");
+  assert(openRouterBody.usage?.include === true, "OpenRouter requests must require authoritative cost metadata");
+  assert(openRouterBody.stream_options?.include_usage === true, "OpenRouter streams must include their final usage chunk");
 
   console.log("[P3-2] Production tokenizer fallbacks...");
   const chatTokens = countChatInputTokens("OpenAI", "gpt-4o", [{ role: "user", content: "Tokenize this exact request." }]);
