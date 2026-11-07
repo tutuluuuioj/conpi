@@ -17,6 +17,7 @@ export const CONFIG = {
   checkpointIntervalMs: Math.max(10_000, parseInt(process.env.CHECKPOINT_INTERVAL_MS || "300_000", 10)),
   relayerMaxAttempts: Math.max(1, parseInt(process.env.RELAYER_MAX_ATTEMPTS || "5", 10)),
   relayerRetryBaseMs: Math.max(25, parseInt(process.env.RELAYER_RETRY_BASE_MS || "500", 10)),
+  meteringStateDir: process.env.METERING_STATE_DIR || (process.env.NODE_ENV === "test" ? `/tmp/conpi-metering-${process.pid}` : "/var/lib/conpi"),
   // Real measured MRTD from Phala Intel TDX CVM
   mrtd: process.env.TEE_MRTD || "7fe60787222bd394cb516abca2435f22f035ab2cc9c0a4b4b3b148e46297f3d931a237b72f359052c6e657d8c1409173",
 };

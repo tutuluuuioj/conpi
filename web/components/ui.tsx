@@ -366,20 +366,25 @@ export function StageTicks({
 export function EscrowTable({ deal }: { deal: Deal }) {
   const escrow = escrowOf(deal);
   const live = deal.status === "Active" || deal.step === "live";
-  const settled = deal.step === "settled" && deal.split;
+  const settled = deal.status === "Completed" || deal.step === "settled" || !!deal.split;
   const isNear = deal.token === "NEAR";
   const fmtAsset = (amount: number) =>
     isNear ? `${amount.toFixed(4)} NEAR` : usd(amount);
 
+  const priceState = settled ? "Released to seller" : "Locked";
+  const buyerColState = settled ? "Refunded to buyer" : "Locked, refunded on completion";
+  const sellerColState = settled ? "Returned to seller" : "Locked, returned on completion";
+  const escrowState = settled ? "Settled (0.0000 in escrow)" : "NEAR contract";
+
   const rows = [
-    ["Buyer price", fmtAsset(deal.price), "Locked"],
-    [`Buyer collateral (${deal.buyerCollateralPct}%)`, fmtAsset(escrow.buyerCollateral), settled ? "Settled" : "Locked, refunded on completion"],
-    [`Seller collateral (${deal.sellerCollateralPct}%)`, fmtAsset(escrow.sellerCollateral), settled ? "Settled" : "Locked, returned on completion"],
-    ["Total in escrow", fmtAsset(escrow.total), "NEAR contract"],
+    ["Buyer price", fmtAsset(deal.price), priceState],
+    [`Buyer collateral (${deal.buyerCollateralPct}%)`, fmtAsset(escrow.buyerCollateral), buyerColState],
+    [`Seller collateral (${deal.sellerCollateralPct}%)`, fmtAsset(escrow.sellerCollateral), sellerColState],
+    ["Total in escrow", settled ? fmtAsset(0) : fmtAsset(escrow.total), escrowState],
   ];
   if (live || settled) {
-    rows.push(["Released", fmtAsset(deal.releasedUsd), "Paid to the seller"]);
-    rows.push(["Remaining", fmtAsset(Math.max(0, escrow.total - (deal.split ? deal.split.seller + (deal.outcome === "completed" ? 0 : deal.split.buyer) : deal.releasedUsd))), "Still in the contract"]);
+    rows.push(["Released", fmtAsset(settled ? deal.price : deal.releasedUsd), "Paid to the seller"]);
+    rows.push(["Remaining", fmtAsset(settled ? 0 : Math.max(0, escrow.total - (deal.split ? deal.split.seller + (deal.outcome === "completed" ? 0 : deal.split.buyer) : deal.releasedUsd))), settled ? "All funds settled" : "Still in the contract"]);
   }
   return (
     <div>

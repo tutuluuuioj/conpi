@@ -1,0 +1,1033 @@
+<!DOCTYPE html>
+<html lang="en" class="dark">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>AI Chatbot — Proxy Client</title>
+  <!-- Tailwind CSS -->
+  <script src="https://cdn.tailwindcss.com"></script>
+  <script>
+    tailwind.config = {
+      darkMode: 'class',
+      theme: {
+        extend: {
+          colors: {
+            brand: {
+              50: '#f5f3ff',
+              100: '#ede9fe',
+              500: '#8b5cf6',
+              600: '#7c3aed',
+              700: '#6d28d9',
+            },
+            surface: {
+              DEFAULT: '#0f172a',
+              card: '#1e293b',
+              sidebar: '#0b1120',
+              border: '#334155',
+              hover: '#273549'
+            }
+          }
+        }
+      }
+    }
+  </script>
+  <!-- Marked for Markdown -->
+  <script src="https://cdn.jsdelivr.net/npm/marked/marked.min.js"></script>
+  <!-- Highlight.js for code blocks -->
+  <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/styles/github-dark-dimmed.min.css">
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/highlight.min.js"></script>
+  <!-- Lucide Icons -->
+  <script src="https://unpkg.com/lucide@latest"></script>
+  <style>
+    @import url('https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&family=JetBrains+Mono:wght@400;500&display=swap');
+    body {
+      font-family: 'Inter', sans-serif;
+    }
+    pre code {
+      font-family: 'JetBrains Mono', monospace;
+    }
+    .chat-scroll::-webkit-scrollbar {
+      width: 6px;
+    }
+    .chat-scroll::-webkit-scrollbar-track {
+      background: transparent;
+    }
+    .chat-scroll::-webkit-scrollbar-thumb {
+      background: #334155;
+      border-radius: 9999px;
+    }
+    .chat-scroll::-webkit-scrollbar-thumb:hover {
+      background: #475569;
+    }
+    /* Markdown Styles */
+    .prose p { margin-bottom: 0.75rem; }
+    .prose p:last-child { margin-bottom: 0; }
+    .prose ul { list-style-type: disc; margin-left: 1.25rem; margin-bottom: 0.75rem; }
+    .prose ol { list-style-type: decimal; margin-left: 1.25rem; margin-bottom: 0.75rem; }
+    .prose pre { margin-top: 0.5rem; margin-bottom: 0.75rem; border-radius: 0.5rem; overflow-x: auto; }
+    .prose code:not(pre code) {
+      background-color: rgba(51, 65, 85, 0.7);
+      padding: 0.15rem 0.35rem;
+      border-radius: 0.25rem;
+      font-size: 0.875em;
+      font-family: 'JetBrains Mono', monospace;
+    }
+    .prose h1, .prose h2, .prose h3 { font-weight: 600; margin-top: 1rem; margin-bottom: 0.5rem; }
+    .prose h1 { font-size: 1.4rem; }
+    .prose h2 { font-size: 1.2rem; }
+    .prose h3 { font-size: 1.05rem; }
+    .prose table { width: 100%; border-collapse: collapse; margin-bottom: 0.75rem; }
+    .prose th, .prose td { border: 1px solid #334155; padding: 0.5rem 0.75rem; text-align: left; }
+    .prose th { background: #1e293b; }
+    .prose blockquote { border-left: 3px solid #7c3aed; padding-left: 0.75rem; color: #94a3b8; font-style: italic; }
+  </style>
+</head>
+<body class="bg-surface text-slate-100 flex h-screen overflow-hidden antialiased">
+
+  <!-- Mobile Sidebar Overlay -->
+  <div id="mobileOverlay" class="fixed inset-0 bg-black/60 z-40 hidden md:hidden" onclick="toggleSidebar()"></div>
+
+  <!-- Sidebar -->
+  <aside id="sidebar" class="fixed md:static inset-y-0 left-0 w-72 bg-surface-sidebar border-r border-surface-border flex flex-col z-50 transform -translate-x-full md:translate-x-0 transition-transform duration-200 ease-in-out">
+    <!-- Sidebar Header -->
+    <div class="p-4 border-b border-surface-border flex items-center justify-between">
+      <div class="flex items-center gap-2.5">
+        <div class="h-8 w-8 rounded-lg bg-gradient-to-tr from-purple-600 to-indigo-500 flex items-center justify-center shadow-lg shadow-purple-500/20">
+          <i data-lucide="bot" class="w-5 h-5 text-white"></i>
+        </div>
+        <div>
+          <h1 class="font-bold text-sm tracking-tight">AI Chatbot</h1>
+          <p class="text-[11px] text-slate-400">Proxy Playground</p>
+        </div>
+      </div>
+      <button onclick="toggleSidebar()" class="md:hidden text-slate-400 hover:text-white p-1 rounded">
+        <i data-lucide="x" class="w-5 h-5"></i>
+      </button>
+    </div>
+
+    <!-- New Chat Button -->
+    <div class="p-3">
+      <button onclick="createNewChat()" class="w-full flex items-center justify-center gap-2 bg-purple-600 hover:bg-purple-700 text-white font-medium py-2 px-3 rounded-lg text-sm shadow-md transition-colors">
+        <i data-lucide="plus" class="w-4 h-4"></i>
+        <span>New Chat</span>
+      </button>
+    </div>
+
+    <!-- Chat History List -->
+    <div class="flex-1 overflow-y-auto chat-scroll px-3 py-2 space-y-1" id="chatList">
+      <!-- Chat items rendered here -->
+    </div>
+
+    <!-- Sidebar Footer / Settings Toggle -->
+    <div class="p-3 border-t border-surface-border bg-surface-sidebar/50 space-y-1.5">
+      <div id="apiStatusBadge" class="flex items-center justify-between px-2.5 py-1.5 rounded-lg bg-surface-card border border-surface-border text-xs">
+        <div class="flex items-center gap-2">
+          <span id="apiIndicator" class="h-2 w-2 rounded-full bg-amber-400"></span>
+          <span id="apiStatusText" class="text-slate-300 font-mono text-[11px] truncate max-w-[130px]">No API key</span>
+        </div>
+        <span id="modelPill" class="text-[10px] bg-slate-700 text-slate-300 px-1.5 py-0.5 rounded truncate max-w-[80px]">Model</span>
+      </div>
+
+      <button onclick="openSettingsModal()" class="w-full flex items-center justify-between text-slate-300 hover:text-white hover:bg-surface-card px-2.5 py-2 rounded-lg text-xs transition-colors">
+        <div class="flex items-center gap-2">
+          <i data-lucide="settings" class="w-4 h-4 text-purple-400"></i>
+          <span>API & Model Settings</span>
+        </div>
+        <i data-lucide="chevron-right" class="w-3.5 h-3.5 text-slate-500"></i>
+      </button>
+    </div>
+  </aside>
+
+  <!-- Main Chat Area -->
+  <main class="flex-1 flex flex-col h-full bg-surface relative overflow-hidden">
+    <!-- Header -->
+    <header class="h-14 border-b border-surface-border flex items-center justify-between px-4 bg-surface/80 backdrop-blur shrink-0 z-10">
+      <div class="flex items-center gap-3">
+        <button onclick="toggleSidebar()" class="md:hidden text-slate-400 hover:text-white p-1 rounded">
+          <i data-lucide="menu" class="w-5 h-5"></i>
+        </button>
+        <div>
+          <h2 id="currentChatTitle" class="text-sm font-semibold truncate max-w-[200px] sm:max-w-xs md:max-w-md">New Conversation</h2>
+          <div class="flex items-center gap-2 text-[11px] text-slate-400">
+            <span id="activeModelLabel" class="text-purple-400 font-mono">deepseek/deepseek-v4-flash-0731</span>
+            <span>•</span>
+            <span id="sessionTokensLabel">0 tokens</span>
+          </div>
+        </div>
+      </div>
+
+      <div class="flex items-center gap-2">
+        <button onclick="exportCurrentChat()" title="Export chat as Markdown" class="p-2 text-slate-400 hover:text-slate-200 hover:bg-surface-card rounded-lg transition-colors">
+          <i data-lucide="download" class="w-4 h-4"></i>
+        </button>
+        <button onclick="clearCurrentChat()" title="Clear messages" class="p-2 text-slate-400 hover:text-rose-400 hover:bg-surface-card rounded-lg transition-colors">
+          <i data-lucide="trash-2" class="w-4 h-4"></i>
+        </button>
+        <button onclick="openSettingsModal()" class="flex items-center gap-1.5 text-xs bg-surface-card hover:bg-surface-hover border border-surface-border px-2.5 py-1.5 rounded-lg text-slate-300 transition-colors">
+          <i data-lucide="sliders" class="w-3.5 h-3.5 text-purple-400"></i>
+          <span class="hidden sm:inline">Settings</span>
+        </button>
+      </div>
+    </header>
+
+    <!-- Message Scroll View -->
+    <div id="messagesContainer" class="flex-1 overflow-y-auto chat-scroll p-4 sm:p-6 space-y-5">
+      <!-- Welcome Empty State -->
+      <div id="emptyState" class="h-full flex flex-col items-center justify-center text-center max-w-lg mx-auto py-12 px-4">
+        <div class="h-16 w-16 rounded-2xl bg-gradient-to-tr from-purple-600 to-indigo-500 flex items-center justify-center shadow-xl shadow-purple-500/20 mb-4">
+          <i data-lucide="sparkles" class="w-8 h-8 text-white"></i>
+        </div>
+        <h3 class="text-xl font-bold mb-2">Welcome to AI Chatbot</h3>
+        <p class="text-sm text-slate-400 mb-6">
+          Connect your API key to chat with DeepSeek, Claude, Llama, or OpenAI models through your proxy endpoint.
+        </p>
+
+        <!-- Quick API Key Setup Pill if missing -->
+        <div id="emptyKeyWarning" class="w-full bg-purple-950/40 border border-purple-800/60 rounded-xl p-3.5 mb-6 text-left flex items-start gap-3">
+          <i data-lucide="key" class="w-5 h-5 text-purple-400 shrink-0 mt-0.5"></i>
+          <div class="flex-1 text-xs">
+            <p class="font-semibold text-purple-300">Set your API Key to begin</p>
+            <p class="text-slate-400 mt-0.5">Click Settings or the button below to paste your proxy key.</p>
+            <button onclick="openSettingsModal()" class="mt-2.5 inline-flex items-center gap-1.5 bg-purple-600 hover:bg-purple-700 text-white font-medium px-3 py-1.5 rounded-lg text-xs transition-colors">
+              <span>Configure API Key</span>
+              <i data-lucide="arrow-right" class="w-3.5 h-3.5"></i>
+            </button>
+          </div>
+        </div>
+
+        <!-- Sample Starter Prompts -->
+        <div class="w-full space-y-2 text-left">
+          <p class="text-xs font-semibold uppercase tracking-wider text-slate-500 mb-2">Try a prompt:</p>
+          <button onclick="useSamplePrompt('Write a Zero-Knowledge circuit in Circom that proves knowledge of a preimage for a Poseidon hash without revealing it.')" class="w-full p-3 rounded-xl border border-surface-border bg-surface-card hover:bg-surface-hover text-xs text-slate-300 transition-colors flex items-center justify-between group">
+            <span>Write a Zero-Knowledge circuit in Circom for Poseidon hash</span>
+            <i data-lucide="arrow-up-right" class="w-4 h-4 text-slate-500 group-hover:text-purple-400 transition-colors"></i>
+          </button>
+          <button onclick="useSamplePrompt('Explain the differences between optimistic rollups and ZK-rollups in simple terms.')" class="w-full p-3 rounded-xl border border-surface-border bg-surface-card hover:bg-surface-hover text-xs text-slate-300 transition-colors flex items-center justify-between group">
+            <span>Explain Optimistic vs ZK Rollups</span>
+            <i data-lucide="arrow-up-right" class="w-4 h-4 text-slate-500 group-hover:text-purple-400 transition-colors"></i>
+          </button>
+          <button onclick="useSamplePrompt('Write a Python function with asyncio that makes concurrent HTTP requests with rate limiting and exponential backoff.')" class="w-full p-3 rounded-xl border border-surface-border bg-surface-card hover:bg-surface-hover text-xs text-slate-300 transition-colors flex items-center justify-between group">
+            <span>Python asyncio rate-limited concurrent requester</span>
+            <i data-lucide="arrow-up-right" class="w-4 h-4 text-slate-500 group-hover:text-purple-400 transition-colors"></i>
+          </button>
+        </div>
+      </div>
+
+      <!-- Messages will be rendered here dynamically -->
+      <div id="messagesList" class="space-y-6 max-w-3xl mx-auto"></div>
+    </div>
+
+    <!-- Input Box Area -->
+    <div class="border-t border-surface-border bg-surface/90 backdrop-blur p-4 shrink-0">
+      <div class="max-w-3xl mx-auto space-y-2">
+        <!-- Input Form -->
+        <form id="chatForm" onsubmit="handleSubmit(event)" class="relative flex items-end gap-2 bg-surface-card border border-surface-border focus-within:border-purple-500 rounded-2xl p-2 transition-colors shadow-lg">
+          <textarea
+            id="promptInput"
+            rows="1"
+            placeholder="Type your prompt here... (Shift+Enter for newline, Enter to send)"
+            class="flex-1 bg-transparent text-sm text-slate-100 placeholder-slate-400 resize-none focus:outline-none p-2 max-h-48 chat-scroll"
+            onkeydown="handleKeyDown(event)"
+            oninput="autoResizeTextarea(this)"
+          ></textarea>
+
+          <div class="flex items-center gap-1 shrink-0 pb-1 pr-1">
+            <button
+              id="stopBtn"
+              type="button"
+              onclick="stopGeneration()"
+              class="hidden h-9 w-9 rounded-xl bg-rose-600 hover:bg-rose-700 text-white flex items-center justify-center transition-colors"
+              title="Stop generating"
+            >
+              <i data-lucide="square" class="w-4 h-4 fill-current"></i>
+            </button>
+            <button
+              id="sendBtn"
+              type="submit"
+              class="h-9 w-9 rounded-xl bg-purple-600 hover:bg-purple-700 disabled:opacity-50 disabled:cursor-not-allowed text-white flex items-center justify-center transition-colors shadow-md"
+              title="Send message"
+            >
+              <i data-lucide="arrow-up" class="w-5 h-5"></i>
+            </button>
+          </div>
+        </form>
+
+        <!-- Input Footer Metadata -->
+        <div class="flex items-center justify-between text-[11px] text-slate-500 px-2">
+          <div class="flex items-center gap-2">
+            <span id="streamIndicator" class="inline-flex items-center gap-1">
+              <span class="h-1.5 w-1.5 rounded-full bg-emerald-400"></span>
+              <span>Streaming ON</span>
+            </span>
+            <span>•</span>
+            <span id="lastLatencyLabel">Ready</span>
+          </div>
+          <div>
+            <span>Press <kbd class="px-1 py-0.5 rounded bg-surface-card border border-surface-border text-slate-400 text-[10px]">Enter</kbd> to send</span>
+          </div>
+        </div>
+      </div>
+    </div>
+  </main>
+
+  <!-- Settings Modal -->
+  <div id="settingsModal" class="fixed inset-0 bg-black/70 backdrop-blur-sm z-50 flex items-center justify-center p-4 hidden">
+    <div class="bg-surface-card border border-surface-border rounded-2xl max-w-md w-full shadow-2xl overflow-hidden flex flex-col max-h-[90vh]">
+      <!-- Modal Header -->
+      <div class="px-5 py-4 border-b border-surface-border flex items-center justify-between">
+        <div class="flex items-center gap-2">
+          <i data-lucide="sliders" class="w-5 h-5 text-purple-400"></i>
+          <h3 class="font-bold text-sm text-slate-100">Client Settings</h3>
+        </div>
+        <button onclick="closeSettingsModal()" class="text-slate-400 hover:text-white p-1 rounded-lg">
+          <i data-lucide="x" class="w-5 h-5"></i>
+        </button>
+      </div>
+
+      <!-- Modal Body -->
+      <div class="p-5 overflow-y-auto space-y-4 text-xs">
+        <!-- API Key Input -->
+        <div class="space-y-1.5">
+          <label class="font-semibold text-slate-200 flex items-center justify-between">
+            <span>Proxy API Key</span>
+            <span class="text-[10px] text-slate-400 font-normal">e.g. cpk_live_...</span>
+          </label>
+          <div class="relative">
+            <input
+              id="settingApiKey"
+              type="password"
+              placeholder="cpk_live_xxxxxxxxxxxxxxxxxxxxxxxx"
+              class="w-full bg-surface border border-surface-border rounded-lg px-3 py-2 pr-10 text-xs text-slate-100 focus:outline-none focus:border-purple-500 font-mono"
+            >
+            <button type="button" onclick="togglePasswordVisibility('settingApiKey', this)" class="absolute right-2.5 top-2.5 text-slate-400 hover:text-white">
+              <i data-lucide="eye" class="w-4 h-4"></i>
+            </button>
+          </div>
+          <p class="text-[11px] text-slate-400">Stored only in your browser's local storage.</p>
+        </div>
+
+        <!-- Base URL -->
+        <div class="space-y-1.5">
+          <label class="font-semibold text-slate-200 flex items-center justify-between">
+            <span>API Base URL</span>
+            <button type="button" onclick="resetDefaultBaseUrl()" class="text-[10px] text-purple-400 hover:underline">Reset default</button>
+          </label>
+          <input
+            id="settingBaseUrl"
+            type="text"
+            placeholder="https://.../v1"
+            class="w-full bg-surface border border-surface-border rounded-lg px-3 py-2 text-xs text-slate-100 focus:outline-none focus:border-purple-500 font-mono"
+          >
+        </div>
+
+        <!-- Model Selection -->
+        <div class="space-y-1.5">
+          <label class="font-semibold text-slate-200">Model Name</label>
+          <input
+            id="settingModel"
+            type="text"
+            placeholder="deepseek/deepseek-v4-flash-0731"
+            class="w-full bg-surface border border-surface-border rounded-lg px-3 py-2 text-xs text-slate-100 focus:outline-none focus:border-purple-500 font-mono mb-2"
+          >
+          <!-- Quick Presets -->
+          <div class="flex flex-wrap gap-1.5">
+            <button type="button" onclick="selectModelPreset('deepseek/deepseek-v4-flash-0731')" class="px-2 py-1 rounded bg-surface hover:bg-surface-hover border border-surface-border text-[11px] text-slate-300">
+              DeepSeek Flash
+            </button>
+            <button type="button" onclick="selectModelPreset('gpt-4o')" class="px-2 py-1 rounded bg-surface hover:bg-surface-hover border border-surface-border text-[11px] text-slate-300">
+              GPT-4o
+            </button>
+            <button type="button" onclick="selectModelPreset('gpt-4o-mini')" class="px-2 py-1 rounded bg-surface hover:bg-surface-hover border border-surface-border text-[11px] text-slate-300">
+              GPT-4o Mini
+            </button>
+            <button type="button" onclick="selectModelPreset('anthropic/claude-sonnet-4.6')" class="px-2 py-1 rounded bg-surface hover:bg-surface-hover border border-surface-border text-[11px] text-slate-300">
+              Claude Sonnet
+            </button>
+            <button type="button" onclick="selectModelPreset('z-ai/glm-5.3-flash')" class="px-2 py-1 rounded bg-surface hover:bg-surface-hover border border-surface-border text-[11px] text-slate-300">
+              GLM Flash
+            </button>
+            <button type="button" onclick="selectModelPreset('z-ai/glm-5.3-flashx-legal')" class="px-2 py-1 rounded bg-purple-900/40 hover:bg-purple-900/60 border border-purple-500/50 text-[11px] text-purple-200">
+              GLM FlashX Legal
+            </button>
+          </div>
+        </div>
+
+        <!-- System Prompt -->
+        <div class="space-y-1.5">
+          <label class="font-semibold text-slate-200">System Prompt</label>
+          <textarea
+            id="settingSystemPrompt"
+            rows="2"
+            placeholder="You are a helpful and concise AI assistant."
+            class="w-full bg-surface border border-surface-border rounded-lg px-3 py-2 text-xs text-slate-100 focus:outline-none focus:border-purple-500"
+          ></textarea>
+        </div>
+
+        <!-- Advanced Options: Temperature, Max Tokens & Streaming -->
+        <div class="space-y-3 pt-2 border-t border-surface-border">
+          <div class="grid grid-cols-2 gap-3">
+            <div class="space-y-1.5">
+              <label class="font-semibold text-slate-200 flex justify-between">
+                <span>Temperature</span>
+                <span id="tempValue" class="font-mono text-purple-400">0.7</span>
+              </label>
+              <input
+                id="settingTemperature"
+                type="range"
+                min="0"
+                max="2"
+                step="0.1"
+                value="0.7"
+                class="w-full accent-purple-500"
+                oninput="document.getElementById('tempValue').innerText = this.value"
+              >
+            </div>
+
+            <div class="space-y-1.5">
+              <label class="font-semibold text-slate-200 flex justify-between">
+                <span>Max Output Tokens</span>
+              </label>
+              <input
+                id="settingMaxTokens"
+                type="number"
+                min="1"
+                max="65536"
+                placeholder="2048"
+                class="w-full bg-surface border border-surface-border rounded-lg px-3 py-1.5 text-xs text-slate-100 focus:outline-none focus:border-purple-500 font-mono"
+              >
+            </div>
+          </div>
+
+          <div class="space-y-1.5">
+            <label class="flex items-center gap-2 cursor-pointer select-none">
+              <input id="settingStream" type="checkbox" checked class="rounded border-surface-border accent-purple-600 h-4 w-4">
+              <span class="font-semibold text-slate-200">Stream response</span>
+            </label>
+            <p class="text-[10px] text-slate-400">Stream tokens in real-time as they are generated</p>
+          </div>
+        </div>
+      </div>
+
+      <!-- Modal Footer -->
+      <div class="p-4 border-t border-surface-border bg-surface-sidebar/40 flex justify-end gap-2">
+        <button onclick="closeSettingsModal()" class="px-3 py-1.5 rounded-lg border border-surface-border text-slate-300 hover:text-white text-xs">
+          Cancel
+        </button>
+        <button onclick="saveSettings()" class="px-4 py-1.5 rounded-lg bg-purple-600 hover:bg-purple-700 text-white font-medium text-xs shadow-md transition-colors">
+          Save Settings
+        </button>
+      </div>
+    </div>
+  </div>
+
+  <script>
+    // --- Default Configuration ---
+    const DEFAULT_BASE_URL = "https://b1b35377079ac7b7937afc607481587bc6d22665-3000.dstack-pha-prod9.phala.network/v1";
+    const DEFAULT_MODEL = "deepseek/deepseek-v4-flash-0731";
+    const DEFAULT_SYSTEM_PROMPT = "You are a helpful, expert AI assistant.";
+
+    // --- State ---
+    let appConfig = {
+      apiKey: localStorage.getItem("cb_api_key") || "",
+      baseUrl: localStorage.getItem("cb_base_url") || DEFAULT_BASE_URL,
+      model: localStorage.getItem("cb_model") || DEFAULT_MODEL,
+      systemPrompt: localStorage.getItem("cb_system_prompt") || DEFAULT_SYSTEM_PROMPT,
+      temperature: parseFloat(localStorage.getItem("cb_temperature") || "0.7"),
+      maxTokens: parseInt(localStorage.getItem("cb_max_tokens") || "2048", 10),
+      stream: localStorage.getItem("cb_stream") !== "false"
+    };
+
+    let chats = JSON.parse(localStorage.getItem("cb_chats") || "[]");
+    let activeChatId = localStorage.getItem("cb_active_chat_id") || null;
+    let currentAbortController = null;
+    let sessionTokens = 0;
+
+    // --- Initialization ---
+    window.addEventListener("DOMContentLoaded", () => {
+      lucide.createIcons();
+      updateStatusBadge();
+
+      if (chats.length === 0) {
+        createNewChat(false);
+      } else {
+        if (!activeChatId || !chats.find(c => c.id === activeChatId)) {
+          activeChatId = chats[0].id;
+        }
+        renderChatList();
+        renderActiveChatMessages();
+      }
+    });
+
+    // --- Chat Session Management ---
+    function createNewChat(shouldRender = true) {
+      const newChat = {
+        id: "chat_" + Date.now(),
+        title: "New Conversation",
+        createdAt: new Date().toISOString(),
+        messages: []
+      };
+      chats.unshift(newChat);
+      activeChatId = newChat.id;
+      saveChats();
+
+      if (shouldRender) {
+        renderChatList();
+        renderActiveChatMessages();
+        closeMobileSidebar();
+      }
+    }
+
+    function selectChat(id) {
+      activeChatId = id;
+      localStorage.setItem("cb_active_chat_id", id);
+      renderChatList();
+      renderActiveChatMessages();
+      closeMobileSidebar();
+    }
+
+    function deleteChat(id, event) {
+      if (event) event.stopPropagation();
+      chats = chats.filter(c => c.id !== id);
+      if (activeChatId === id) {
+        activeChatId = chats.length > 0 ? chats[0].id : null;
+      }
+      if (chats.length === 0) {
+        createNewChat(false);
+      }
+      saveChats();
+      renderChatList();
+      renderActiveChatMessages();
+    }
+
+    function clearCurrentChat() {
+      const chat = getActiveChat();
+      if (!chat) return;
+      if (confirm("Clear all messages in this conversation?")) {
+        chat.messages = [];
+        chat.title = "New Conversation";
+        saveChats();
+        renderChatList();
+        renderActiveChatMessages();
+      }
+    }
+
+    function getActiveChat() {
+      return chats.find(c => c.id === activeChatId) || null;
+    }
+
+    function saveChats() {
+      localStorage.setItem("cb_chats", JSON.stringify(chats));
+      localStorage.setItem("cb_active_chat_id", activeChatId);
+    }
+
+    function renderChatList() {
+      const listEl = document.getElementById("chatList");
+      listEl.innerHTML = "";
+
+      chats.forEach(chat => {
+        const isActive = chat.id === activeChatId;
+        const item = document.createElement("div");
+        item.className = `group flex items-center justify-between px-3 py-2.5 rounded-lg text-xs cursor-pointer transition-colors ${
+          isActive ? "bg-surface-card border border-surface-border text-white font-medium" : "text-slate-400 hover:bg-surface-card/60 hover:text-slate-200"
+        }`;
+        item.onclick = () => selectChat(chat.id);
+
+        item.innerHTML = `
+          <div class="flex items-center gap-2.5 truncate flex-1 mr-2">
+            <i data-lucide="message-square" class="w-3.5 h-3.5 shrink-0 ${isActive ? "text-purple-400" : "text-slate-500"}"></i>
+            <span class="truncate">${escapeHtml(chat.title)}</span>
+          </div>
+          <button onclick="deleteChat('${chat.id}', event)" class="opacity-0 group-hover:opacity-100 text-slate-500 hover:text-rose-400 p-1 rounded transition-opacity">
+            <i data-lucide="trash-2" class="w-3.5 h-3.5"></i>
+          </button>
+        `;
+        listEl.appendChild(item);
+      });
+      lucide.createIcons();
+    }
+
+    // --- Message Rendering ---
+    function renderActiveChatMessages() {
+      const chat = getActiveChat();
+      const emptyState = document.getElementById("emptyState");
+      const messagesList = document.getElementById("messagesList");
+      const titleEl = document.getElementById("currentChatTitle");
+
+      if (!chat || chat.messages.length === 0) {
+        emptyState.classList.remove("hidden");
+        messagesList.innerHTML = "";
+        titleEl.innerText = chat ? chat.title : "New Conversation";
+        return;
+      }
+
+      emptyState.classList.add("hidden");
+      titleEl.innerText = chat.title;
+      messagesList.innerHTML = "";
+
+      chat.messages.forEach((msg, index) => {
+        const isUser = msg.role === "user";
+        const msgDiv = document.createElement("div");
+        msgDiv.className = `flex gap-3 sm:gap-4 ${isUser ? "justify-end" : "justify-start"}`;
+
+        if (!isUser) {
+          const reasoningHtml = msg.reasoning ? `
+            <details class="mb-3 rounded-lg bg-surface/60 border border-surface-border p-2.5 text-xs text-slate-400">
+              <summary class="cursor-pointer font-medium text-purple-400 select-none flex items-center gap-1.5">
+                <i data-lucide="brain" class="w-3.5 h-3.5"></i>
+                <span>Thought process</span>
+              </summary>
+              <div class="mt-2 text-slate-400 whitespace-pre-wrap leading-relaxed font-mono text-[11px]">${escapeHtml(msg.reasoning)}</div>
+            </details>
+          ` : "";
+
+          msgDiv.innerHTML = `
+            <div class="h-8 w-8 rounded-lg bg-gradient-to-tr from-purple-600 to-indigo-500 flex items-center justify-center shrink-0 shadow-md">
+              <i data-lucide="bot" class="w-4 h-4 text-white"></i>
+            </div>
+            <div class="flex-1 max-w-[85%] sm:max-w-[90%] space-y-1">
+              <div class="flex items-center gap-2 text-[11px] text-slate-400">
+                <span class="font-semibold text-purple-300">Assistant</span>
+                <span>${msg.time || ""}</span>
+                ${msg.model ? `<span class="bg-surface-card border border-surface-border px-1.5 py-0.2 rounded font-mono text-[10px] text-slate-400">${msg.model}</span>` : ""}
+              </div>
+              <div class="bg-surface-card border border-surface-border text-slate-100 p-3.5 sm:p-4 rounded-2xl rounded-tl-sm text-sm prose max-w-none shadow-sm leading-relaxed overflow-x-auto">
+                ${reasoningHtml}
+                ${marked.parse(msg.content || (msg.reasoning ? "*(Thinking...)*" : ""))}
+              </div>
+            </div>
+          `;
+        } else {
+          msgDiv.innerHTML = `
+            <div class="flex flex-col items-end max-w-[85%] sm:max-w-[80%] space-y-1">
+              <div class="text-[11px] text-slate-400">
+                <span>You</span> • <span>${msg.time || ""}</span>
+              </div>
+              <div class="bg-purple-600 text-white px-4 py-2.5 rounded-2xl rounded-tr-sm text-sm whitespace-pre-wrap shadow-md">
+                ${escapeHtml(msg.content)}
+              </div>
+            </div>
+            <div class="h-8 w-8 rounded-lg bg-slate-700 flex items-center justify-center shrink-0 text-slate-300 shadow">
+              <i data-lucide="user" class="w-4 h-4"></i>
+            </div>
+          `;
+        }
+        messagesList.appendChild(msgDiv);
+      });
+
+      // Apply syntax highlighting
+      document.querySelectorAll('pre code').forEach((block) => {
+        hljs.highlightElement(block);
+      });
+
+      addCodeCopyButtons();
+      lucide.createIcons();
+      scrollToBottom();
+    }
+
+    function addCodeCopyButtons() {
+      document.querySelectorAll('pre').forEach((pre) => {
+        if (pre.querySelector('.copy-btn')) return;
+        pre.style.position = 'relative';
+        const btn = document.createElement('button');
+        btn.className = 'copy-btn absolute top-2 right-2 px-2 py-1 bg-surface-sidebar/80 hover:bg-surface-sidebar text-[11px] text-slate-300 rounded border border-surface-border flex items-center gap-1 transition-colors';
+        btn.innerHTML = '<i data-lucide="copy" class="w-3 h-3"></i><span>Copy</span>';
+        btn.onclick = () => {
+          const code = pre.querySelector('code')?.innerText || pre.innerText;
+          navigator.clipboard.writeText(code);
+          btn.innerHTML = '<i data-lucide="check" class="w-3 h-3 text-emerald-400"></i><span>Copied!</span>';
+          setTimeout(() => {
+            btn.innerHTML = '<i data-lucide="copy" class="w-3 h-3"></i><span>Copy</span>';
+            lucide.createIcons();
+          }, 2000);
+        };
+        pre.appendChild(btn);
+      });
+    }
+
+    // --- Message Submission ---
+    async function handleSubmit(event) {
+      if (event) event.preventDefault();
+      const inputEl = document.getElementById("promptInput");
+      const prompt = inputEl.value.trim();
+      if (!prompt) return;
+
+      if (!appConfig.apiKey) {
+        openSettingsModal();
+        alert("Please enter your Proxy API Key to continue.");
+        return;
+      }
+
+      const chat = getActiveChat();
+      if (!chat) return;
+
+      // Reset textarea
+      inputEl.value = "";
+      autoResizeTextarea(inputEl);
+
+      // Add user message
+      const userMsg = {
+        role: "user",
+        content: prompt,
+        time: new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })
+      };
+      chat.messages.push(userMsg);
+
+      // Auto title if first user message
+      if (chat.messages.filter(m => m.role === "user").length === 1) {
+        chat.title = prompt.slice(0, 30) + (prompt.length > 30 ? "..." : "");
+      }
+
+      saveChats();
+      renderChatList();
+      renderActiveChatMessages();
+
+      // Send to API
+      await callCompletionsApi(chat);
+    }
+
+    async function callCompletionsApi(chat) {
+      setGeneratingUI(true);
+      const startTime = Date.now();
+
+      // Prepare conversation messages
+      const apiMessages = [];
+      if (appConfig.systemPrompt) {
+        apiMessages.push({ role: "system", content: appConfig.systemPrompt });
+      }
+      chat.messages.forEach(m => {
+        apiMessages.push({ role: m.role, content: m.content });
+      });
+
+      // Prepare assistant placeholder message
+      const assistantMsg = {
+        role: "assistant",
+        content: "",
+        model: appConfig.model,
+        time: new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })
+      };
+      chat.messages.push(assistantMsg);
+      renderActiveChatMessages();
+
+      currentAbortController = new AbortController();
+
+      try {
+        const rawTarget = appConfig.baseUrl.replace(/\/+$/, '');
+        const targetEndpoint = rawTarget.endsWith('/chat/completions')
+          ? rawTarget
+          : `${rawTarget}/chat/completions`;
+
+        // If running from web server (http/https), route through /api/proxy to ensure clean CORS & streaming
+        const useLocalProxy = window.location.protocol.startsWith("http");
+        const fetchUrl = useLocalProxy ? "/api/proxy" : targetEndpoint;
+        const fetchHeaders = {
+          "Content-Type": "application/json",
+          "Authorization": `Bearer ${appConfig.apiKey}`
+        };
+        if (useLocalProxy) {
+          fetchHeaders["x-target-url"] = targetEndpoint;
+        }
+
+        const payload = {
+          model: appConfig.model,
+          messages: apiMessages,
+          temperature: appConfig.temperature,
+          stream: appConfig.stream,
+          ...(appConfig.maxTokens ? { max_tokens: appConfig.maxTokens } : {})
+        };
+
+        const response = await fetch(fetchUrl, {
+          method: "POST",
+          headers: fetchHeaders,
+          body: JSON.stringify(payload),
+          signal: currentAbortController.signal
+        });
+
+        if (!response.ok) {
+          const errText = await response.text();
+          let parsed;
+          try { parsed = JSON.parse(errText); } catch {}
+          throw new Error(parsed?.error?.message || errText || `HTTP ${response.status}`);
+        }
+
+        if (appConfig.stream && response.body) {
+          const reader = response.body.getReader();
+          const decoder = new TextDecoder("utf-8");
+          let done = false;
+          let buffer = "";
+
+          while (!done) {
+            const { value, done: readerDone } = await reader.read();
+            done = readerDone;
+            if (value) {
+              buffer += decoder.decode(value, { stream: true });
+              const lines = buffer.split("\n");
+              buffer = lines.pop() || "";
+
+              for (const line of lines) {
+                const trimmed = line.trim();
+                if (!trimmed || trimmed.startsWith(":")) continue;
+                if (trimmed === "data: [DONE]") continue;
+
+                if (trimmed.startsWith("data:")) {
+                  const dataStr = trimmed.slice(5).trim();
+                  try {
+                    const parsed = JSON.parse(dataStr);
+                    const delta = parsed.choices?.[0]?.delta;
+                    const contentDelta = delta?.content || "";
+                    const reasoningDelta = delta?.reasoning || "";
+
+                    if (reasoningDelta) {
+                      assistantMsg.reasoning = (assistantMsg.reasoning || "") + reasoningDelta;
+                    }
+                    if (contentDelta) {
+                      assistantMsg.content = (assistantMsg.content || "") + contentDelta;
+                    }
+
+                    updateStreamingBubble(assistantMsg.content, assistantMsg.reasoning);
+
+                    if (parsed.usage) {
+                      recordTokenUsage(parsed.usage.total_tokens || 0);
+                    }
+                  } catch (e) {
+                    console.warn("Parse stream error", e);
+                  }
+                }
+              }
+            }
+          }
+        } else {
+          // Non-streaming completion
+          const data = await response.json();
+          const choice = data.choices?.[0];
+          assistantMsg.content = choice?.message?.content || "";
+          if (choice?.message?.reasoning) {
+            assistantMsg.reasoning = choice.message.reasoning;
+          }
+          if (data.usage) {
+            recordTokenUsage(data.usage.total_tokens || 0);
+          }
+        }
+
+        const latency = Date.now() - startTime;
+        document.getElementById("lastLatencyLabel").innerText = `${latency}ms`;
+
+      } catch (err) {
+        if (err.name === "AbortError") {
+          assistantMsg.content += "\n\n*(Generation stopped by user)*";
+        } else {
+          const hasPartial = Boolean(assistantMsg.content || assistantMsg.reasoning);
+          if (hasPartial) {
+            assistantMsg.content += `\n\n*(Stream interrupted: ${err.message}. Showing partial output above.)*`;
+          } else {
+            assistantMsg.content = `⚠️ **Error calling model:**\n\`\`\`\n${err.message}\n\`\`\`\nPlease check your API key, base URL, and model in Settings.`;
+          }
+        }
+      } finally {
+        setGeneratingUI(false);
+        currentAbortController = null;
+        saveChats();
+        renderActiveChatMessages();
+      }
+    }
+
+    function updateStreamingBubble(content, reasoning) {
+      const messagesList = document.getElementById("messagesList");
+      const lastMessageProse = messagesList.querySelector("div:last-child .prose");
+      if (lastMessageProse) {
+        const reasoningHtml = reasoning ? `
+          <details class="mb-3 rounded-lg bg-surface/60 border border-surface-border p-2.5 text-xs text-slate-400" open>
+            <summary class="cursor-pointer font-medium text-purple-400 select-none flex items-center gap-1.5">
+              <i data-lucide="brain" class="w-3.5 h-3.5"></i>
+              <span>Thinking Process (${reasoning.length.toLocaleString()} chars)</span>
+            </summary>
+            <div class="mt-2 text-slate-400 whitespace-pre-wrap leading-relaxed font-mono text-[11px]">${escapeHtml(reasoning)}</div>
+          </details>
+        ` : "";
+        lastMessageProse.innerHTML = reasoningHtml + (content ? marked.parse(content) : '<div class="flex items-center gap-2 text-xs text-purple-400 mt-2"><span class="inline-block h-2 w-2 rounded-full bg-purple-400 animate-ping"></span><span>Formulating response...</span></div>');
+        scrollToBottom();
+      }
+    }
+
+    function recordTokenUsage(tokens) {
+      sessionTokens += tokens;
+      document.getElementById("sessionTokensLabel").innerText = `${sessionTokens.toLocaleString()} tokens`;
+    }
+
+    function stopGeneration() {
+      if (currentAbortController) {
+        currentAbortController.abort();
+      }
+    }
+
+    function setGeneratingUI(isGenerating) {
+      const sendBtn = document.getElementById("sendBtn");
+      const stopBtn = document.getElementById("stopBtn");
+      const promptInput = document.getElementById("promptInput");
+
+      if (isGenerating) {
+        sendBtn.classList.add("hidden");
+        stopBtn.classList.remove("hidden");
+        promptInput.disabled = true;
+      } else {
+        sendBtn.classList.remove("hidden");
+        stopBtn.classList.add("hidden");
+        promptInput.disabled = false;
+        promptInput.focus();
+      }
+    }
+
+    // --- Settings UI ---
+    function openSettingsModal() {
+      document.getElementById("settingApiKey").value = appConfig.apiKey;
+      document.getElementById("settingBaseUrl").value = appConfig.baseUrl;
+      document.getElementById("settingModel").value = appConfig.model;
+      document.getElementById("settingSystemPrompt").value = appConfig.systemPrompt;
+      document.getElementById("settingTemperature").value = appConfig.temperature;
+      document.getElementById("tempValue").innerText = appConfig.temperature;
+      document.getElementById("settingMaxTokens").value = appConfig.maxTokens || 2048;
+      document.getElementById("settingStream").checked = appConfig.stream;
+
+      document.getElementById("settingsModal").classList.remove("hidden");
+      lucide.createIcons();
+    }
+
+    function closeSettingsModal() {
+      document.getElementById("settingsModal").classList.add("hidden");
+    }
+
+    function saveSettings() {
+      appConfig.apiKey = document.getElementById("settingApiKey").value.trim();
+      appConfig.baseUrl = document.getElementById("settingBaseUrl").value.trim() || DEFAULT_BASE_URL;
+      appConfig.model = document.getElementById("settingModel").value.trim() || DEFAULT_MODEL;
+      appConfig.systemPrompt = document.getElementById("settingSystemPrompt").value.trim();
+      appConfig.temperature = parseFloat(document.getElementById("settingTemperature").value);
+      const mt = parseInt(document.getElementById("settingMaxTokens").value, 10);
+      appConfig.maxTokens = Number.isFinite(mt) && mt > 0 ? mt : 2048;
+      appConfig.stream = document.getElementById("settingStream").checked;
+
+      localStorage.setItem("cb_api_key", appConfig.apiKey);
+      localStorage.setItem("cb_base_url", appConfig.baseUrl);
+      localStorage.setItem("cb_model", appConfig.model);
+      localStorage.setItem("cb_system_prompt", appConfig.systemPrompt);
+      localStorage.setItem("cb_temperature", String(appConfig.temperature));
+      localStorage.setItem("cb_max_tokens", String(appConfig.maxTokens));
+      localStorage.setItem("cb_stream", String(appConfig.stream));
+
+      updateStatusBadge();
+      closeSettingsModal();
+    }
+
+    function resetDefaultBaseUrl() {
+      document.getElementById("settingBaseUrl").value = DEFAULT_BASE_URL;
+    }
+
+    function selectModelPreset(modelName) {
+      document.getElementById("settingModel").value = modelName;
+    }
+
+    function updateStatusBadge() {
+      const indicator = document.getElementById("apiIndicator");
+      const statusText = document.getElementById("apiStatusText");
+      const modelPill = document.getElementById("modelPill");
+      const activeModelLabel = document.getElementById("activeModelLabel");
+      const streamIndicator = document.getElementById("streamIndicator");
+      const emptyKeyWarning = document.getElementById("emptyKeyWarning");
+
+      if (appConfig.apiKey) {
+        indicator.className = "h-2 w-2 rounded-full bg-emerald-400";
+        statusText.innerText = "Key Connected";
+        if (emptyKeyWarning) emptyKeyWarning.classList.add("hidden");
+      } else {
+        indicator.className = "h-2 w-2 rounded-full bg-amber-400";
+        statusText.innerText = "No API key";
+        if (emptyKeyWarning) emptyKeyWarning.classList.remove("hidden");
+      }
+
+      modelPill.innerText = appConfig.model.split("/").pop() || appConfig.model;
+      activeModelLabel.innerText = appConfig.model;
+
+      streamIndicator.innerHTML = appConfig.stream
+        ? '<span class="h-1.5 w-1.5 rounded-full bg-emerald-400"></span><span>Streaming ON</span>'
+        : '<span class="h-1.5 w-1.5 rounded-full bg-slate-500"></span><span>Streaming OFF</span>';
+    }
+
+    function togglePasswordVisibility(inputId, btn) {
+      const input = document.getElementById(inputId);
+      const isPass = input.type === "password";
+      input.type = isPass ? "text" : "password";
+      btn.innerHTML = isPass ? '<i data-lucide="eye-off" class="w-4 h-4"></i>' : '<i data-lucide="eye" class="w-4 h-4"></i>';
+      lucide.createIcons();
+    }
+
+    // --- Helpers ---
+    function useSamplePrompt(text) {
+      const inputEl = document.getElementById("promptInput");
+      inputEl.value = text;
+      autoResizeTextarea(inputEl);
+      inputEl.focus();
+    }
+
+    function handleKeyDown(event) {
+      if (event.key === "Enter" && !event.shiftKey) {
+        event.preventDefault();
+        handleSubmit();
+      }
+    }
+
+    function autoResizeTextarea(el) {
+      el.style.height = "auto";
+      el.style.height = Math.min(el.scrollHeight, 180) + "px";
+    }
+
+    function scrollToBottom() {
+      const container = document.getElementById("messagesContainer");
+      container.scrollTop = container.scrollHeight;
+    }
+
+    function toggleSidebar() {
+      const sidebar = document.getElementById("sidebar");
+      const overlay = document.getElementById("mobileOverlay");
+      sidebar.classList.toggle("-translate-x-full");
+      overlay.classList.toggle("hidden");
+    }
+
+    function closeMobileSidebar() {
+      const sidebar = document.getElementById("sidebar");
+      const overlay = document.getElementById("mobileOverlay");
+      sidebar.classList.add("-translate-x-full");
+      overlay.classList.add("hidden");
+    }
+
+    function exportCurrentChat() {
+      const chat = getActiveChat();
+      if (!chat || chat.messages.length === 0) {
+        alert("No messages to export.");
+        return;
+      }
+
+      let markdown = `# ${chat.title}\n*Exported on ${new Date().toLocaleString()}*\n*Model: ${appConfig.model}*\n\n---\n\n`;
+      chat.messages.forEach(m => {
+        const role = m.role === "user" ? "### You" : `### Assistant (${m.model || appConfig.model})`;
+        markdown += `${role} - ${m.time || ""}\n\n${m.content}\n\n---\n\n`;
+      });
+
+      const blob = new Blob([markdown], { type: "text/markdown;charset=utf-8" });
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement("a");
+      a.href = url;
+      a.download = `${chat.title.toLowerCase().replace(/[^a-z0-9]/g, "_")}.md`;
+      a.click();
+      URL.revokeObjectURL(url);
+    }
+
+    function escapeHtml(str) {
+      return (str || "")
+        .replace(/&/g, "&amp;")
+        .replace(/</g, "&lt;")
+        .replace(/>/g, "&gt;")
+        .replace(/"/g, "&quot;")
+        .replace(/'/g, "&#039;");
+    }
+  </script>
+</body>
+</html>

@@ -7,6 +7,7 @@ import { lockPricingTable, LockedPricingTable, openRouterPricingFromModels } fro
 import { meterEngine } from "../proxy/meter.js";
 import { negotiationService } from "../negotiation/matcher.js";
 import type { TermSheet } from "../negotiation/matcher.js";
+import { meteringStateStore, PendingUsage, UsageReceipt } from "../state/metering-store.js";
 
 export function parseBalance(val: any): bigint {
   if (typeof val === "bigint") return val;
@@ -113,6 +114,9 @@ export interface VaultEntry {
   lockedPricing: LockedPricingTable;
   pricingSnapshotHash: string;
   usageReceipts: UsageReceipt[];
+  processedGenerationIds: string[];
+  pendingUsage: PendingUsage | null;
+  requestInFlight: boolean;
   rateLimitPerMinute: number;
   creditAmountYocto?: string;
   active: boolean;
@@ -122,22 +126,6 @@ export interface VaultEntry {
   lastCheckpointAt: number;
   relayReceipts: RelayReceipt[];
   onChainStatus?: string;
-}
-
-export interface UsageReceipt {
-  sequence: number;
-  generationId: string | null;
-  model: string;
-  inputTokens: number;
-  outputTokens: number;
-  cachedTokens: number;
-  costUsd: number;
-  cumulativeUsedUsd: number;
-  source: "openrouter_usage" | "openrouter_generation" | "locked_pricing";
-  createdAt: string;
-  previousHash: string | null;
-  hash: string;
-  signatureHex: string;
 }
 
 export function hashLockedPricing(pricing: LockedPricingTable): string {
@@ -158,7 +146,8 @@ export interface RelayReceipt {
 }
 
 class KeyVault {
-  // Pure volatile in-memory map; never written to disk
+  // Provider and proxy secrets remain volatile. Only encrypted metering state is
+  // sealed to the CVM volume for crash recovery and duplicate-charge defense.
   private entries = new Map<number, VaultEntry>();
   private proxyKeyToDealId = new Map<string, number>();
 
@@ -336,6 +325,23 @@ class KeyVault {
       resolvedPriceUsd = agreedTerms.priceUsd;
     }
 
+    let pricingSnapshotHash = hashLockedPricing(lockedPricing);
+    let persistedState: ReturnType<typeof meteringStateStore.load> = null;
+    try {
+      persistedState = meteringStateStore.load(dealId, resolvedTermsHashHex);
+      if (persistedState) {
+        const persistedModels = Object.keys(persistedState.lockedPricing).map((item) => item.toLowerCase()).sort();
+        const requestedModels = models.map((item) => item.toLowerCase()).sort();
+        if (JSON.stringify(persistedModels) !== JSON.stringify(requestedModels)) {
+          return { ok: false, modelAvailable: true, balanceCoversCredit: false, error: `Persisted model allowlist mismatch for deal #${dealId}` };
+        }
+        lockedPricing = persistedState.lockedPricing;
+        pricingSnapshotHash = persistedState.pricingSnapshotHash;
+      }
+    } catch (err: any) {
+      return { ok: false, modelAvailable: true, balanceCoversCredit: false, error: err.message };
+    }
+
     const entry: VaultEntry = {
       dealId,
       provider,
@@ -346,14 +352,17 @@ class KeyVault {
       termsHashHex: resolvedTermsHashHex,
       creditUsd: resolvedCreditUsd,
       priceUsd: resolvedPriceUsd,
-      usedUsd: 0,
-      tokensTotal: 0,
+      usedUsd: persistedState?.usedUsd || 0,
+      tokensTotal: persistedState?.tokensTotal || 0,
       lockedPricing,
-      pricingSnapshotHash: hashLockedPricing(lockedPricing),
-      usageReceipts: [],
+      pricingSnapshotHash,
+      usageReceipts: persistedState?.usageReceipts || [],
+      processedGenerationIds: persistedState?.processedGenerationIds || [],
+      pendingUsage: persistedState?.pendingUsage || null,
+      requestInFlight: false,
       rateLimitPerMinute: CONFIG.rateLimitPerMinute,
       creditAmountYocto: resolvedCreditYocto,
-      active: true,
+      active: (persistedState?.usedUsd || 0) < resolvedCreditUsd,
       registeredAt: new Date().toISOString(),
       signedPayloads: [],
       lastCheckpointAt: Date.now(),
@@ -363,6 +372,7 @@ class KeyVault {
 
     this.entries.set(dealId, entry);
     this.proxyKeyToDealId.set(proxyKey, dealId);
+    meteringStateStore.save(entry);
 
     // Continue the on-chain per-deal nonce sequence. A fresh funded deal starts at
     // zero, while a recovered enclave instance resumes after the latest accepted

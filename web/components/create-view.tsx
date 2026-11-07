@@ -46,8 +46,23 @@ export function CreateView() {
   };
 
   const addCustomModel = () => {
-    const model = customModel.trim();
+    let model = customModel.trim();
     if (!model) return;
+    if (provider === "OpenRouter" && !model.includes("/")) {
+      if (model === "claude-sonnet-4-6" || model === "claude-sonnet-4.6") {
+        model = "anthropic/claude-sonnet-4.6";
+      } else if (model.startsWith("claude-") || model.startsWith("haiku-") || model.startsWith("opus-")) {
+        model = `anthropic/${model}`;
+      } else if (model.startsWith("gpt-") || model.startsWith("o1-") || model.startsWith("o3-") || model.startsWith("o4-")) {
+        model = `openai/${model}`;
+      } else if (model.startsWith("llama-")) {
+        model = `meta-llama/${model}`;
+      } else if (model.startsWith("deepseek-")) {
+        model = `deepseek/${model}`;
+      } else if (model.startsWith("glm-")) {
+        model = `z-ai/${model}`;
+      }
+    }
     setModels((current) => current.includes(model) ? current : [...current, model]);
     setCustomModel("");
   };

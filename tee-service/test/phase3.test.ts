@@ -9,6 +9,7 @@ import { calculateCost } from "../src/proxy/pricing.js";
 import { proxyRateLimiter } from "../src/proxy/rate-limit.js";
 import {
   classifyProviderError,
+  computeAffordableOutputTokens,
   extractProviderErrorCode,
   requestWithProviderUsage,
   resolveMeteredCostUsd,
@@ -385,10 +386,55 @@ async function runPhase3Tests() {
   });
   assert(websocketMessages.some((message) => message.type === "authenticated"), "WebSocket authentication acknowledgement missing");
   assert(websocketMessages.some((message) => message.type === "meter.update"), "WebSocket meter update missing");
+
+  console.log("[P3-12] Dynamic upstream token budget clamping...");
+  const mockEntry: any = {
+    creditUsd: 0.05,
+    usedUsd: 0.049, // $0.001 remaining
+    lockedPricing: {
+      "test-model": { inputPerMillion: 1.0, outputPerMillion: 2.0 },
+    },
+  };
+  const affordable = computeAffordableOutputTokens(mockEntry, "test-model", 100);
+  assert(affordable === 450, `Expected 450 affordable tokens, got ${affordable}`);
+
+  let interceptedForwardedBody: any;
+  const originalFetchBeforeClamping = globalThis.fetch;
+  const savedKeyForClamping = entry.apiKey;
+  const savedUsedUsdForClamping = entry.usedUsd;
+  entry.apiKey = "sk-real-shape-for-fetch-stub";
+  // Simulate only $0.05 remaining credit on the deal (at $10/1M, affordable is ~5,000 tokens)
+  entry.usedUsd = entry.creditUsd - 0.05;
+  globalThis.fetch = (async (_url: string | URL | Request, init?: RequestInit) => {
+    interceptedForwardedBody = JSON.parse(String(init?.body || "{}"));
+    return new Response(JSON.stringify({
+      id: "stub-clamped-completion",
+      choices: [{ message: { role: "assistant", content: "clamped answer" }, finish_reason: "stop" }],
+      usage: { prompt_tokens: 10, completion_tokens: 5, total_tokens: 15 },
+    }), { status: 200, headers: { "content-type": "application/json" } });
+  }) as typeof fetch;
+
+  const clampingResponse = await app.inject({
+    method: "POST",
+    url: "/v1/chat/completions",
+    headers: auth,
+    payload: {
+      model: "gpt-4o",
+      max_tokens: 100_000,
+      messages: [{ role: "user", content: "test token clamping" }],
+    },
+  });
+  globalThis.fetch = originalFetchBeforeClamping;
+  entry.apiKey = savedKeyForClamping;
+  entry.usedUsd = savedUsedUsdForClamping;
+  assert(clampingResponse.statusCode === 200, `Clamping request failed: ${clampingResponse.body}`);
+  assert(interceptedForwardedBody?.max_tokens !== undefined, "Upstream request omitted max_tokens");
+  assert(interceptedForwardedBody.max_tokens <= 5_000, `Expected clamped max_tokens <= 5000, got ${interceptedForwardedBody.max_tokens}`);
+
   await app.close();
 
   console.log("=======================================================");
-  console.log("  ALL PHASE 3 ACCEPTANCE TESTS PASSED (11/11)          ");
+  console.log("  ALL PHASE 3 ACCEPTANCE TESTS PASSED (12/12)          ");
   console.log("=======================================================");
 }
 

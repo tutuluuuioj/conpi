@@ -136,21 +136,9 @@ export function DealView({ id }: { id: string }) {
   };
 
   const cancel = () => {
-    const isDeadlineActive = deal.status === "Created" && deal.depositDeadline && new Date(deal.depositDeadline).getTime() > Date.now();
-    if (isDeadlineActive) {
-      const deadlineStr = new Date(deal.depositDeadline).toLocaleString();
-      app.ask({
-        title: "Deposit deadline still active",
-        body: `The smart contract enforces a deposit lock until ${deadlineStr}. Escrow funds can only be refunded via timeout_refund after this deadline expires. Submitting now will be rejected on-chain with "Deposit deadline has not passed yet".`,
-        confirm: "Attempt refund anyway",
-        danger: true,
-        run: () => app.cancelDeal(deal.id),
-      });
-      return;
-    }
     app.ask({
       title: "Cancel this deal",
-      body: "Cancellation is only available before the proxy key goes live. Any deposit you made is refunded.",
+      body: "Cancellation will return any locked deposits and storage fees to your wallet.",
       confirm: "Cancel deal",
       danger: true,
       run: () => app.cancelDeal(deal.id),

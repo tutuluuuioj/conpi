@@ -18,6 +18,7 @@ import {
   handleEmbeddings,
   handleModels,
   publicSignedPayload,
+  reconcilePendingUsage,
 } from "./proxy/server.js";
 import { meterEvents } from "./proxy/events.js";
 import { DefaultReason } from "./crypto/borsh.js";
@@ -220,6 +221,14 @@ export async function buildApp() {
       priceUsd: entry.priceUsd,
       usageReceiptCount: entry.usageReceipts.length,
       lastUsageReceipt: entry.usageReceipts.at(-1) || null,
+      processedGenerationCount: entry.processedGenerationIds.length,
+      billingBlocked: Boolean(entry.pendingUsage),
+      pendingUsage: entry.pendingUsage ? {
+        generationId: entry.pendingUsage.generationId,
+        createdAt: entry.pendingUsage.createdAt,
+        attempts: entry.pendingUsage.attempts,
+        lastError: entry.pendingUsage.lastError || null,
+      } : null,
       registeredAt: entry.registeredAt,
       lastCheckpointAt: new Date(entry.lastCheckpointAt).toISOString(),
       relayReceipts: entry.relayReceipts,
@@ -237,7 +246,49 @@ export async function buildApp() {
       signerPublicKeyNear: enclaveKeys.getSignerPublicKeyNear(),
       pricingSnapshotHash: entry.pricingSnapshotHash,
       receipts: entry.usageReceipts,
+      processedGenerationCount: entry.processedGenerationIds.length,
+      billingBlocked: Boolean(entry.pendingUsage),
+      pendingUsage: entry.pendingUsage ? {
+        generationId: entry.pendingUsage.generationId,
+        createdAt: entry.pendingUsage.createdAt,
+        attempts: entry.pendingUsage.attempts,
+        lastError: entry.pendingUsage.lastError || null,
+      } : null,
     };
+  });
+
+  // Retry only the unresolved provider charge. This never sends a new model
+  // request, so operators can safely recover billing after OpenRouter's
+  // generation endpoint becomes available again.
+  app.post("/v1/deals/:id/reconcile", async (req, reply) => {
+    const { id } = req.params as { id: string };
+    const dealId = parseInt(id, 10);
+    const entry = authenticateDealRequest(req, reply, dealId);
+    if (!entry) return;
+    if (entry.requestInFlight) {
+      return reply.status(409).send({ error: { message: "Another request is already being metered", code: "billing_request_in_flight" } });
+    }
+    entry.requestInFlight = true;
+    try {
+      const usage = await reconcilePendingUsage(entry);
+      return {
+        dealId,
+        reconciled: Boolean(usage),
+        billingBlocked: Boolean(entry.pendingUsage),
+        usedUsd: entry.usedUsd,
+        usageReceiptCount: entry.usageReceipts.length,
+      };
+    } catch (error: any) {
+      return reply.status(409).send({
+        error: {
+          message: error.message,
+          code: "cost_reconciliation_pending",
+          generationId: entry.pendingUsage?.generationId || null,
+        },
+      });
+    } finally {
+      entry.requestInFlight = false;
+    }
   });
 
   // 6. Signed Payloads & Attestation Retrieval

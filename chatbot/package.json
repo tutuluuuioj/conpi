@@ -1,0 +1,19 @@
+{
+  "name": "ai-proxy-chatbot",
+  "version": "1.0.0",
+  "type": "module",
+  "description": "Standalone lightweight AI Chatbot for custom proxy API keys and models",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js"
+  },
+  "keywords": [
+    "chatbot",
+    "ai",
+    "openai",
+    "proxy",
+    "deepseek"
+  ],
+  "author": "",
+  "license": "MIT"
+}

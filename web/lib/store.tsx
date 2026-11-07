@@ -5,7 +5,7 @@ import { BASE_URL, CONFIG, CONTRACT_ID, MARKET_SNAPSHOT, TEE_SIGNER_PUBLIC_KEY, 
 import { KEY_CHECKS, listingTerms } from "./data";
 import { maskKey, round2, sameTerms, usd } from "./format";
 import { escrowOf, settleComplete, settleRevoke, stageFor } from "./money";
-import type { Asset, Claim, Deal, DealStatus, DealStep, Listing, Notice, Proposal, SignResult, Terms, ThemeMode, Toast, WalletName } from "./types";
+import type { Asset, Claim, Deal, DealStatus, DealStep, Listing, Notice, Proposal, Provider, SignResult, Terms, ThemeMode, Toast, WalletName } from "./types";
 import { teeApi, MeterStreamEvent } from "./tee-api";
 import { encryptApiKeyToEnclave, encryptPayloadToEnclave } from "./crypto";
 import { verifyLiveAttestation } from "./attestation-verifier";
@@ -131,6 +131,26 @@ function withExplicitListingUsd(listing: Listing): Listing {
     creditUsd: listing.creditUsd ?? listing.credit,
     priceUsd: listing.priceUsd ?? listing.price,
   };
+}
+
+export const KNOWN_PRICING: Record<string, { input: string; output: string }> = {
+  "deepseek/deepseek-v4-flash-0731": { input: "$0.0566 / 1M", output: "$0.3000 / 1M" },
+  "deepseek/deepseek-v4.1-flash-1017": { input: "$0.0566 / 1M", output: "$0.3000 / 1M" },
+  "z-ai/glm-5.3-flash": { input: "$0.0566 / 1M", output: "$0.3000 / 1M" },
+  "claude-sonnet-4-6": { input: "$3.0000 / 1M", output: "$15.0000 / 1M" },
+  "anthropic/claude-sonnet-4.6": { input: "$3.0000 / 1M", output: "$15.0000 / 1M" },
+  "meta-llama/llama-3-70b": { input: "$0.5900 / 1M", output: "$0.7900 / 1M" },
+  "gpt-4o": { input: "$2.5000 / 1M", output: "$10.0000 / 1M" },
+  "gpt-4o-mini": { input: "$0.1500 / 1M", output: "$0.6000 / 1M" },
+};
+
+export function defaultPricesForModels(models: string[]): Deal["prices"] {
+  const list = models && models.length ? models : ["gpt-4o", "gpt-4o-mini"];
+  return list.map((m) => {
+    const known = KNOWN_PRICING[m] || KNOWN_PRICING[m.toLowerCase()];
+    if (known) return { model: m, input: known.input, output: known.output };
+    return { model: m, input: "$0.0566 / 1M", output: "$0.3000 / 1M" };
+  });
 }
 
 function priceRowsFromLockedPricing(lockedPricing: any): Deal["prices"] {
@@ -317,7 +337,7 @@ export function useApp() {
   return value;
 }
 
-function mapOnChainDeal(d: OnChainDeal, currentAccount: string | null): Deal {
+function mapOnChainDeal(d: OnChainDeal, currentAccount: string | null, listing?: Listing | Deal): Deal {
   const raw = d as any;
   const chainStatus = String(d.status);
   const priceNear = Number(d.price) / 1e24;
@@ -366,25 +386,30 @@ function mapOnChainDeal(d: OnChainDeal, currentAccount: string | null): Deal {
   const buyerCollateralPct = rawPrice > 0 ? Math.round((Number(d.buyer_collateral) / rawPrice) * 100) : 10;
   const sellerCollateralPct = rawPrice > 0 ? Math.round((Number(d.seller_collateral) / rawPrice) * 100) : 20;
 
+  const provider = (listing?.provider || "OpenAI") as Provider;
+  const model = listing?.model || "gpt-4o";
+  const models = listing?.models?.length ? listing.models : [model];
+  const prices = (listing as Deal)?.prices?.length ? (listing as Deal).prices : defaultPricesForModels(models);
+
   const defaultTerms: Terms = {
     credit: creditNear || 10,
     price: priceNear || 10,
     buyerCollateralPct,
     sellerCollateralPct,
     token,
-    models: ["gpt-4o", "gpt-4o-mini"],
+    models,
     deadline: new Date(Date.now() + 86400000 * 7).toISOString(),
   };
 
   return {
     id: String(d.id),
-    listingId: `lst-${d.id}`,
+    listingId: listing?.id || `lst-${d.id}`,
     role,
     status,
     step,
-    provider: "OpenAI",
-    model: "gpt-4o",
-    models: ["gpt-4o", "gpt-4o-mini"],
+    provider,
+    model,
+    models,
     credit: creditNear || 10,
     price: priceNear || 10,
     buyerCollateralPct,
@@ -413,13 +438,22 @@ function mapOnChainDeal(d: OnChainDeal, currentAccount: string | null): Deal {
     baseUrl: BASE_URL,
     usedUsd: meteredNear,
     tokens: Math.round(meteredNear * 100000),
-    stage: currentStage,
-    releasedUsd: releasedNear,
+    stage: (chainStatus === "Settled" || chainStatus === "Completed") ? 100 : currentStage,
+    releasedUsd: (chainStatus === "Settled" || chainStatus === "Completed") ? priceNear : releasedNear,
     lastUpdate: "On-chain NEAR Testnet",
     heartbeat: "live",
     lastCheckpoint: d.last_checkpoint_time ? new Date(Number(d.last_checkpoint_time) / 1e6).toLocaleTimeString() : "Recent",
     outcome: chainStatus === "Settled" || chainStatus === "Completed" ? "completed" : chainStatus === "Defaulted" ? "revoked" : null,
-    split: null,
+    split: (chainStatus === "Settled" || chainStatus === "Completed") ? {
+      seller: priceNear + (priceNear * (sellerCollateralPct / 100)),
+      buyer: priceNear * (buyerCollateralPct / 100),
+      slashed: 0,
+      lines: [
+        { label: "Price released to seller", amount: priceNear, note: "Full price metered & released", tone: "mint" },
+        { label: "Seller collateral returned", amount: priceNear * (sellerCollateralPct / 100), note: "100% returned upon completion", tone: "mint" },
+        { label: "Buyer collateral refunded", amount: priceNear * (buyerCollateralPct / 100), note: "100% refunded upon completion", tone: "mint" },
+      ],
+    } : null,
     messages: [
       { id: "m1", sender: d.seller, text: `Created on-chain deal #${d.id} for ${priceNear} NEAR`, time: "On-chain" },
       { id: "m2", sender: d.buyer, text: `Escrow terms recorded at ${termsHashHex ? termsHashHex.slice(0, 12) + "..." : "pending"}`, time: "On-chain" },
@@ -427,10 +461,7 @@ function mapOnChainDeal(d: OnChainDeal, currentAccount: string | null): Deal {
     activity: [
       { id: "a1", title: `On-chain Deal #${d.id} ${d.status}`, detail: `Status: ${d.status} · Stage: ${currentStage}% · Metered: ${meteredNear} NEAR`, time: "Live" }
     ],
-    prices: [
-      { model: "gpt-4o", input: "$2.50 / 1M", output: "$10.00 / 1M" },
-      { model: "gpt-4o-mini", input: "$0.15 / 1M", output: "$0.60 / 1M" },
-    ],
+    prices,
     steps: {
       negotiate: { time: "Completed" },
       terms: { time: "Completed" },
@@ -506,11 +537,10 @@ export function Providers({ children }: { children: React.ReactNode }) {
         .map(withExplicitListingUsd)
         .filter((listing, index, all) => all.findIndex((item) => item.id === listing.id) === index);
 
-      // For any deal in Active status, fetch live TEE meter!
-      const activeDeals = onChainDeals.filter((d) => String(d.status) === "Active");
+      // Fetch live TEE meter for any deal that has a proxy key
       const meterMap = new Map<number, any>();
       await Promise.all(
-        activeDeals.map(async (d) => {
+        onChainDeals.map(async (d) => {
           const proxyKey = storedKeys[String(d.id)] || stateRef.current.deals.find((item) => item.id === String(d.id))?.proxyKey;
           if (!proxyKey) return;
           try {
@@ -521,6 +551,11 @@ export function Providers({ children }: { children: React.ReactNode }) {
             if (res.ok) {
               const data = await res.json();
               meterMap.set(Number(d.id), data);
+              if (typeof window !== "undefined" && data.lockedPricing) {
+                try {
+                  localStorage.setItem(`conpi:locked_pricing_${d.id}`, JSON.stringify(data.lockedPricing));
+                } catch {}
+              }
             }
           } catch {}
         })
@@ -528,9 +563,9 @@ export function Providers({ children }: { children: React.ReactNode }) {
 
       const currentAccount = stateRef.current.account;
       const mappedDeals = onChainDeals.map((d) => {
-        const mapped = mapOnChainDeal(d, currentAccount);
         const existing = stateRef.current.deals.find((item) => item.id === String(d.id));
         const listing = metadataListings.find((item) => String(item.dealId || "") === String(d.id));
+        const mapped = mapOnChainDeal(d, currentAccount, listing || existing);
         const resolvedProxyKey = existing?.proxyKey || storedKeys[String(d.id)] || "";
         const liveMeter = meterMap.get(Number(d.id));
 
@@ -548,7 +583,21 @@ export function Providers({ children }: { children: React.ReactNode }) {
           ? liveMeter.models
           : listing?.models?.length ? listing.models : existing?.models?.length ? existing.models : mapped.models;
         const model = liveMeter?.model || listing?.model || existing?.model || models[0] || mapped.model;
-        const lockedPriceRows = priceRowsFromLockedPricing(liveMeter?.lockedPricing);
+
+        let cachedPricing: any = null;
+        if (typeof window !== "undefined") {
+          try {
+            const raw = localStorage.getItem(`conpi:locked_pricing_${d.id}`);
+            if (raw) cachedPricing = JSON.parse(raw);
+          } catch {}
+        }
+        const effectiveLockedPricing = liveMeter?.lockedPricing || cachedPricing;
+        const lockedPriceRows = priceRowsFromLockedPricing(effectiveLockedPricing);
+        const prices = lockedPriceRows.length
+          ? lockedPriceRows
+          : existing?.prices?.length
+            ? existing.prices
+            : mapped.prices;
 
         return {
           ...mapped,
@@ -563,7 +612,7 @@ export function Providers({ children }: { children: React.ReactNode }) {
           priceUsd,
           stage,
           lastUpdate,
-          prices: lockedPriceRows.length ? lockedPriceRows : existing?.prices || mapped.prices,
+          prices,
           pricingSnapshotHash: liveMeter?.pricingSnapshotHash || existing?.pricingSnapshotHash,
           usageReceiptCount: Number(liveMeter?.usageReceiptCount ?? existing?.usageReceiptCount ?? 0),
           lastUsageReceipt: liveMeter?.lastUsageReceipt ?? existing?.lastUsageReceipt ?? null,
@@ -1411,6 +1460,11 @@ export function Providers({ children }: { children: React.ReactNode }) {
           });
           if (res.ok) {
             const data = await res.json();
+            if (typeof window !== "undefined" && data.lockedPricing) {
+              try {
+                localStorage.setItem(`conpi:locked_pricing_${dealId}`, JSON.stringify(data.lockedPricing));
+              } catch {}
+            }
             patchDeal(dealId, (item) => {
               const creditUsd = Number(data.creditUsd) || item.creditUsd || (item.token === "NEAR" ? item.credit * 4.02 : item.credit);
               const priceUsd = Number(data.priceUsd) || item.priceUsd || (item.token === "NEAR" ? item.price * 4.02 : item.price);

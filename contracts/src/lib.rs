@@ -942,7 +942,12 @@ impl ConpiEscrow {
         );
 
         require!(deal.credit_amount > 0, "Deal has zero credit amount");
-        let required_metered = (stage as u128 * deal.credit_amount) / 100;
+        let required_metered = if stage == 100 {
+            // 5 bps (0.05%) completion tolerance: >= 99.95% metered usage triggers 100% full release
+            (9995 * deal.credit_amount) / 10000
+        } else {
+            (stage as u128 * deal.credit_amount) / 100
+        };
         require!(
             payload.metered_value.0 >= required_metered && payload.metered_value.0 > 0,
             "Metered value is below threshold for this stage"
@@ -1112,11 +1117,14 @@ impl ConpiEscrow {
     pub fn timeout_refund(&mut self, deal_id: u64) {
         let mut deal = self.get_deal_or_panic(deal_id);
         let now = env::block_timestamp();
+        let caller = env::predecessor_account_id();
 
         match deal.status {
             DealStatus::Created => {
+                let can_cancel_early = (caller == deal.buyer && deal.seller_deposited == 0)
+                    || (caller == deal.seller && deal.buyer_deposited == 0);
                 require!(
-                    now > deal.deposit_deadline,
+                    now > deal.deposit_deadline || can_cancel_early,
                     "Deposit deadline has not passed yet"
                 );
                 deal.status = DealStatus::Cancelled;
@@ -1132,7 +1140,7 @@ impl ConpiEscrow {
                 self.deals.insert(&deal_id, &deal);
                 emit_event(ConpiEvent::DealCancelled {
                     deal_id,
-                    reason: "DEPOSIT_TIMEOUT",
+                    reason: if can_cancel_early { "EARLY_CANCEL" } else { "DEPOSIT_TIMEOUT" },
                 });
             }
             DealStatus::Funded => {
@@ -1234,6 +1242,49 @@ impl ConpiEscrow {
         );
 
         deal.status = DealStatus::Completed;
+
+        let remaining_price = deal.price.saturating_sub(deal.released_to_seller);
+        let total_to_seller = remaining_price + deal.seller_collateral;
+
+        if total_to_seller > 0 {
+            let _ = self.payout(&deal.seller, total_to_seller, &deal.token);
+        }
+        if deal.buyer_collateral > 0 {
+            let _ = self.payout(&deal.buyer, deal.buyer_collateral, &deal.token);
+        }
+
+        self.refund_storage_deposit(deal_id);
+        self.deals.insert(&deal_id, &deal);
+
+        emit_event(ConpiEvent::DealCompleted {
+            deal_id,
+            seller_total: U128(deal.released_to_seller + total_to_seller),
+        });
+    }
+
+    pub fn finalize_exhausted_deal(&mut self, deal_id: u64) {
+        let mut deal = self.get_deal_or_panic(deal_id);
+        require!(
+            deal.status == DealStatus::Active,
+            "Deal must be Active to finalize"
+        );
+        require!(deal.credit_amount > 0, "Deal has zero credit amount");
+
+        let last_metered = deal
+            .last_signed
+            .as_ref()
+            .map(|s| s.metered_value.0)
+            .unwrap_or(0);
+
+        // Require >= 99.95% (5 bps tolerance) of credit_amount signed by attested TEE
+        let required_metered = (9995 * deal.credit_amount) / 10000;
+        require!(
+            last_metered >= required_metered,
+            "Attested metered usage is below 99.95% completion threshold"
+        );
+
+        deal.status = DealStatus::Completed;
+        deal.stage_reached = 100;
 
         let remaining_price = deal.price.saturating_sub(deal.released_to_seller);
         let total_to_seller = remaining_price + deal.seller_collateral;

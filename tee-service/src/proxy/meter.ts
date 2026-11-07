@@ -80,12 +80,17 @@ export class MeterEngine {
     const STAGES = [25, 50, 75, 100];
     for (const targetStage of STAGES) {
       const currentLast = this.lastStageEmitted.get(entry.dealId) || 0;
-      if (targetStage > currentLast && pct >= targetStage) {
+      // 5 basis points (0.05%) completion tolerance: >= 99.95% metered usage triggers 100% stage release
+      const stageThreshold = targetStage === 100 ? 99.95 : targetStage;
+      if (targetStage > currentLast && pct >= stageThreshold) {
         this.lastStageEmitted.set(entry.dealId, targetStage);
 
         // Unit scaling: if creditAmountYocto is present, scale to contract's deal.credit_amount
         // Strictly capped at deal.credit_amount (100%) to prevent overspending
-        const meteredYocto = this.meteredValue(entry);
+        // For 100% stage release, ensure meteredYocto matches 100% of deal credit amount
+        const meteredYocto = targetStage === 100 && entry.creditAmountYocto
+          ? toBigIntYocto(entry.creditAmountYocto)
+          : this.meteredValue(entry);
 
         const payload: SignedPayloadDto = {
           domain: "conpi:v1",

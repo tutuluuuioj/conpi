@@ -20,6 +20,9 @@ export interface MeterEvent {
   pricingSnapshotHash: string;
   usageReceiptCount: number;
   lastUsageReceipt: VaultEntry["usageReceipts"][number] | null;
+  processedGenerationCount: number;
+  billingBlocked: boolean;
+  pendingGenerationId: string | null;
   stages: number[];
   timestamp: string;
 }
@@ -45,6 +48,9 @@ class MeterEventHub {
       pricingSnapshotHash: entry.pricingSnapshotHash || "",
       usageReceiptCount: entry.usageReceipts?.length || 0,
       lastUsageReceipt: entry.usageReceipts?.at(-1) || null,
+      processedGenerationCount: entry.processedGenerationIds?.length || 0,
+      billingBlocked: Boolean(entry.pendingUsage),
+      pendingGenerationId: entry.pendingUsage?.generationId || null,
       stages,
       timestamp: new Date().toISOString(),
     };

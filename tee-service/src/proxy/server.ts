@@ -1,5 +1,4 @@
 import { FastifyReply, FastifyRequest } from "fastify";
-import crypto from "crypto";
 import { DefaultReason } from "../crypto/borsh.js";
 import { enclaveKeys } from "../crypto/keys.js";
 import { CONFIG } from "../config.js";
@@ -10,6 +9,7 @@ import { meterEngine } from "./meter.js";
 import { calculateCost, PricingRate } from "./pricing.js";
 import { proxyRateLimiter } from "./rate-limit.js";
 import { countChatInputTokens, countEmbeddingInputTokens, countTextTokens, extractText } from "./tokenizer.js";
+import { meteringStateStore, PendingUsage, usageReceiptHash } from "../state/metering-store.js";
 
 type ProviderKind = "openai" | "openrouter" | "redpill" | "anthropic";
 export type ProviderErrorKind = "transient_rate_limit" | "insufficient_quota" | "invalid_key" | "provider_ban" | "upstream";
@@ -67,6 +67,9 @@ export function resolveMeteredCostUsd(provider: string, calculatedCostUsd: numbe
 export interface OpenRouterCostResolution {
   costUsd: number;
   source: "openrouter_usage" | "openrouter_generation";
+  inputTokens?: number;
+  outputTokens?: number;
+  cachedTokens?: number;
 }
 
 export async function resolveOpenRouterCost(
@@ -75,13 +78,12 @@ export async function resolveOpenRouterCost(
   generationId: unknown,
   options: { fetchImpl?: typeof fetch; retryDelaysMs?: number[] } = {}
 ): Promise<OpenRouterCostResolution> {
-  const direct = typeof providerCost === "number" ? providerCost : Number.parseFloat(String(providerCost ?? ""));
-  if (Number.isFinite(direct) && direct >= 0) return { costUsd: direct, source: "openrouter_usage" };
-
   const normalizedId = typeof generationId === "string" ? generationId.trim() : "";
   if (!normalizedId) {
-    throw new Error("OpenRouter omitted both usage.cost and the generation ID; metering was stopped without releasing funds");
+    throw new Error("OpenRouter omitted the generation ID; metering was stopped without releasing funds");
   }
+  const direct = typeof providerCost === "number" ? providerCost : Number.parseFloat(String(providerCost ?? ""));
+  if (Number.isFinite(direct) && direct >= 0) return { costUsd: direct, source: "openrouter_usage" };
 
   const fetchImpl = options.fetchImpl || fetch;
   const retryDelaysMs = options.retryDelaysMs || [250, 500, 1_000, 2_000];
@@ -95,7 +97,13 @@ export async function resolveOpenRouterCost(
       const data: any = await response.json().catch(() => null);
       const observed = Number(data?.data?.total_cost ?? data?.data?.usage);
       if (Number.isFinite(observed) && observed >= 0) {
-        return { costUsd: observed, source: "openrouter_generation" };
+        return {
+          costUsd: observed,
+          source: "openrouter_generation",
+          inputTokens: finitePriceCeiling(data?.data?.tokens_prompt ?? data?.data?.native_tokens_prompt),
+          outputTokens: finitePriceCeiling(data?.data?.tokens_completion ?? data?.data?.native_tokens_completion),
+          cachedTokens: finitePriceCeiling(data?.data?.native_tokens_cached),
+        };
       }
       throw new Error("OpenRouter generation record did not contain an authoritative total cost");
     }
@@ -134,15 +142,113 @@ function providerKind(entry: VaultEntry): ProviderKind {
   return "openai";
 }
 
-async function authoritativeCostForEntry(
+function stagePendingUsage(entry: VaultEntry, pending: Omit<PendingUsage, "createdAt" | "attempts">): void {
+  const generationId = pending.generationId?.trim() || null;
+  if (generationId && entry.processedGenerationIds.includes(generationId)) {
+    throw new Error(`OpenRouter generation '${generationId}' was already recorded; duplicate billing was rejected`);
+  }
+  if (entry.pendingUsage && entry.pendingUsage.generationId !== generationId) {
+    throw new Error(`Deal #${entry.dealId} is blocked by unresolved generation '${entry.pendingUsage.generationId || "unknown"}'`);
+  }
+  entry.pendingUsage = {
+    ...pending,
+    generationId,
+    createdAt: entry.pendingUsage?.createdAt || new Date().toISOString(),
+    attempts: entry.pendingUsage?.attempts || 0,
+    lastError: entry.pendingUsage?.lastError,
+  };
+  meteringStateStore.save(entry);
+}
+
+export async function reconcilePendingUsage(entry: VaultEntry): Promise<UsageResult | null> {
+  const pending = entry.pendingUsage;
+  if (!pending) return null;
+  if (providerKind(entry) !== "openrouter") {
+    throw new Error(`Deal #${entry.dealId} has unresolved provider usage and is blocked`);
+  }
+  try {
+    const resolved = await resolveOpenRouterCost(entry.apiKey, pending.providerCost, pending.generationId);
+    return recordUsage(
+      entry,
+      pending.model,
+      resolved.inputTokens ?? pending.inputTokens,
+      resolved.outputTokens ?? pending.outputTokens,
+      resolved.cachedTokens ?? pending.cachedTokens,
+      resolved.costUsd,
+      pending.generationId || undefined,
+      resolved.source
+    );
+  } catch (error: any) {
+    entry.pendingUsage = {
+      ...pending,
+      attempts: pending.attempts + 1,
+      lastError: error.message,
+    };
+    meteringStateStore.save(entry);
+    throw error;
+  }
+}
+
+async function finalizeProviderUsage(
   entry: VaultEntry,
-  providerCost: unknown,
-  generationId: unknown
-): Promise<{ providerCost?: number; generationId?: string; source?: OpenRouterCostResolution["source"] }> {
-  if (providerKind(entry) !== "openrouter") return {};
-  const normalizedId = typeof generationId === "string" && generationId.trim() ? generationId.trim() : undefined;
-  const resolved = await resolveOpenRouterCost(entry.apiKey, providerCost, normalizedId);
-  return { providerCost: resolved.costUsd, generationId: normalizedId, source: resolved.source };
+  pending: Omit<PendingUsage, "createdAt" | "attempts">
+): Promise<{ usage: UsageResult; generationId?: string; source: string }> {
+  if (providerKind(entry) !== "openrouter") {
+    return {
+      usage: recordUsage(entry, pending.model, pending.inputTokens, pending.outputTokens, pending.cachedTokens),
+      generationId: pending.generationId || undefined,
+      source: "locked_pricing",
+    };
+  }
+  stagePendingUsage(entry, pending);
+  const usage = await reconcilePendingUsage(entry);
+  const receipt = entry.usageReceipts.at(-1);
+  return {
+    usage: usage!,
+    generationId: receipt?.generationId || undefined,
+    source: receipt?.source || "openrouter_usage",
+  };
+}
+
+async function acquireBillingLock(entry: VaultEntry, reply: FastifyReply): Promise<boolean> {
+  if (providerKind(entry) !== "openrouter") return true;
+  if (entry.defaultPayload) {
+    reply.status(502).send({
+      error: { message: "Provider credentials or quota failed; deterministic default settlement payload created", code: "seller_self_drain" },
+      defaultPayload: publicSignedPayload(entry.defaultPayload),
+    });
+    return false;
+  }
+  const start = Date.now();
+  while (entry.requestInFlight) {
+    if (Date.now() - start > 1_000) {
+      reply.status(409).send({ error: { message: "Another request is already being metered for this deal", code: "billing_request_in_flight" } });
+      return false;
+    }
+    await new Promise((resolve) => setTimeout(resolve, 10));
+    if (entry.defaultPayload) {
+      reply.status(502).send({
+        error: { message: "Provider credentials or quota failed; deterministic default settlement payload created", code: "seller_self_drain" },
+        defaultPayload: publicSignedPayload(entry.defaultPayload),
+      });
+      return false;
+    }
+  }
+  entry.requestInFlight = true;
+  try {
+    await reconcilePendingUsage(entry);
+    return true;
+  } catch (error: any) {
+    entry.requestInFlight = false;
+    reply.status(409).send({
+      error: {
+        message: error.message,
+        code: "cost_reconciliation_pending",
+        generationId: entry.pendingUsage?.generationId || null,
+      },
+    });
+    return false;
+  }
 }
 
 function openAiBaseUrl(kind: ProviderKind): string {
@@ -250,6 +356,24 @@ function enforceRateLimit(entry: VaultEntry, reply: FastifyReply): boolean {
   return false;
 }
 
+export function computeAffordableOutputTokens(
+  entry: VaultEntry,
+  model: string,
+  inputTokens: number,
+  cachedTokens = 0
+): number {
+  const rate = entry.lockedPricing[model];
+  if (!rate || rate.outputPerMillion <= 0) return 1_000_000;
+  const remainingBudgetUsd = Math.max(0, entry.creditUsd - entry.usedUsd);
+  const inputRate = rate.inputPerMillion;
+  const cachedRate = rate.cachedInputPerMillion ?? inputRate;
+  const uncachedInput = Math.max(0, inputTokens - cachedTokens);
+  const inputCost = (uncachedInput * inputRate + cachedTokens * cachedRate) / 1_000_000;
+  const remainingForOutputUsd = Math.max(0, remainingBudgetUsd - inputCost);
+  const outputPricePerToken = rate.outputPerMillion / 1_000_000;
+  return Math.floor(remainingForOutputUsd / outputPricePerToken);
+}
+
 function enforceModelAndBudget(entry: VaultEntry, model: string, inputTokens: number, maximumOutputTokens: number, reply: FastifyReply): boolean {
   const normalizedModel = model.trim().toLowerCase();
   if (!entry.models.some((item) => item.trim().toLowerCase() === normalizedModel)) {
@@ -288,13 +412,18 @@ function recordUsage(
   generationId?: string,
   costSource?: OpenRouterCostResolution["source"]
 ): UsageResult {
+  entry.usageReceipts ||= [];
+  entry.processedGenerationIds ||= [];
+  if (generationId && entry.processedGenerationIds.includes(generationId)) {
+    throw new Error(`OpenRouter generation '${generationId}' was already recorded; duplicate billing was rejected`);
+  }
   const calculated = calculateCost(model, inputTokens, outputTokens, cachedTokens, entry.lockedPricing);
   const usage = {
     ...calculated,
     costUsd: resolveMeteredCostUsd(entry.provider, calculated.costUsd, providerCost),
   };
-  entry.usedUsd = Math.min(entry.creditUsd, entry.usedUsd + usage.costUsd);
-  entry.tokensTotal += usage.inputTokens + usage.outputTokens;
+  const nextUsedUsd = Math.min(entry.creditUsd, entry.usedUsd + usage.costUsd);
+  const nextTokensTotal = entry.tokensTotal + usage.inputTokens + usage.outputTokens;
   const previousHash = entry.usageReceipts.at(-1)?.hash || null;
   const receiptBody = {
     sequence: entry.usageReceipts.length + 1,
@@ -304,17 +433,37 @@ function recordUsage(
     outputTokens: usage.outputTokens,
     cachedTokens: usage.cachedTokens,
     costUsd: usage.costUsd,
-    cumulativeUsedUsd: entry.usedUsd,
+    cumulativeUsedUsd: nextUsedUsd,
     source: costSource || "locked_pricing" as const,
     createdAt: new Date().toISOString(),
     previousHash,
   };
-  const hash = crypto.createHash("sha256").update(JSON.stringify(receiptBody)).digest("hex");
-  entry.usageReceipts.push({
+  const hash = usageReceiptHash(receiptBody);
+  const receipt = {
     ...receiptBody,
     hash,
     signatureHex: Buffer.from(enclaveKeys.sign(Buffer.from(hash, "hex"))).toString("hex"),
+  };
+  const nextReceipts = [...entry.usageReceipts, receipt];
+  const nextProcessedGenerationIds = generationId
+    ? [...entry.processedGenerationIds, generationId]
+    : [...entry.processedGenerationIds];
+
+  // The durable ledger is the commit point. Do not mutate the in-memory meter or
+  // emit a payout until the complete next state has been encrypted and fsynced.
+  meteringStateStore.save({
+    ...entry,
+    usedUsd: nextUsedUsd,
+    tokensTotal: nextTokensTotal,
+    usageReceipts: nextReceipts,
+    processedGenerationIds: nextProcessedGenerationIds,
+    pendingUsage: null,
   });
+  entry.usedUsd = nextUsedUsd;
+  entry.tokensTotal = nextTokensTotal;
+  entry.usageReceipts = nextReceipts;
+  entry.processedGenerationIds = nextProcessedGenerationIds;
+  entry.pendingUsage = null;
   const signedStages = meterEngine.checkAndEmitStages(entry, entry.termsHashHex);
   for (const stage of signedStages) entry.signedPayloads.push(stage);
   if (signedStages.length > 0) {
@@ -448,7 +597,7 @@ function anthropicMessagesToOpenAi(body: any) {
   };
 }
 
-async function streamOpenAiResponse(response: Response, reply: FastifyReply, entry: VaultEntry, model: string, fallbackInputTokens: number, transformToAnthropic = false) {
+async function streamOpenAiResponse(response: Response, reply: FastifyReply, entry: VaultEntry, model: string, fallbackInputTokens: number, transformToAnthropic = false, maxOutputLimit = Infinity) {
   reply.raw.setHeader("Content-Type", "text/event-stream");
   reply.raw.setHeader("Cache-Control", "no-cache, no-transform");
   reply.raw.setHeader("Connection", "keep-alive");
@@ -460,6 +609,7 @@ async function streamOpenAiResponse(response: Response, reply: FastifyReply, ent
   let providerCost: unknown;
   let providerUsageSeen = false;
   let generationId: string | undefined;
+  let pendingStaged = false;
 
   if (transformToAnthropic) {
     reply.raw.write(`event: message_start\ndata: ${JSON.stringify({ type: "message_start", message: { id: `msg_${Date.now()}`, type: "message", role: "assistant", model, content: [], stop_reason: null, usage: { input_tokens: fallbackInputTokens, output_tokens: 0 } } })}\n\n`);
@@ -482,6 +632,20 @@ async function streamOpenAiResponse(response: Response, reply: FastifyReply, ent
       let data: any;
       try { data = JSON.parse(raw); } catch { continue; }
       if (!generationId && typeof data.id === "string") generationId = data.id;
+      if (providerKind(entry) === "openrouter" && generationId && !pendingStaged) {
+        // Persist the provider generation before forwarding its first chunk.
+        // If reconciliation fails or the process restarts, later calls remain
+        // blocked until this exact generation is recovered and committed.
+        stagePendingUsage(entry, {
+          generationId,
+          model,
+          inputTokens: fallbackInputTokens,
+          outputTokens: 0,
+          cachedTokens: 0,
+          providerCost: null,
+        });
+        pendingStaged = true;
+      }
       const text = data.choices?.[0]?.delta?.content;
       if (typeof text === "string") {
         outputText += text;
@@ -498,42 +662,46 @@ async function streamOpenAiResponse(response: Response, reply: FastifyReply, ent
         if (data.usage.cost !== undefined) providerCost = data.usage.cost;
       }
     }
+    if (Number.isFinite(maxOutputLimit)) {
+      const currentEstimated = outputTokens || countTextTokens(entry.provider, model, outputText);
+      if (currentEstimated >= maxOutputLimit) {
+        await reader.cancel().catch(() => {});
+        break;
+      }
+    }
   }
 
   inputTokens ||= fallbackInputTokens;
   outputTokens ||= countTextTokens(entry.provider, model, outputText);
-  let authoritative: Awaited<ReturnType<typeof authoritativeCostForEntry>>;
   try {
-    authoritative = await authoritativeCostForEntry(entry, providerCost, generationId);
+    const committed = await finalizeProviderUsage(entry, {
+      generationId: generationId || null,
+      model,
+      inputTokens,
+      outputTokens,
+      cachedTokens,
+      providerCost: Number.isFinite(Number(providerCost)) ? Number(providerCost) : null,
+    });
+    const usage = committed.usage;
+    const usageSource = committed.source || (providerUsageSeen ? "provider" : "tokenizer");
+    if (transformToAnthropic) {
+      reply.raw.write(`event: content_block_stop\ndata: ${JSON.stringify({ type: "content_block_stop", index: 0 })}\n\n`);
+      reply.raw.write(`event: message_delta\ndata: ${JSON.stringify({ type: "message_delta", delta: { stop_reason: "end_turn", stop_sequence: null }, usage: { output_tokens: outputTokens } })}\n\n`);
+      reply.raw.write(`event: message_stop\ndata: ${JSON.stringify({ type: "message_stop", conpi_cost_usd: usage.costUsd, conpi_usage_source: usageSource })}\n\n`);
+    } else {
+      reply.raw.write(`data: ${JSON.stringify({ object: "conpi.meter", usage: { prompt_tokens: inputTokens, completion_tokens: outputTokens, total_tokens: inputTokens + outputTokens, conpi_cost_usd: usage.costUsd, conpi_usage_source: usageSource }, stages: usage.stages })}\n\n`);
+      reply.raw.write("data: [DONE]\n\n");
+    }
   } catch (error: any) {
     const payload = { error: { message: error.message, code: "cost_reconciliation_failed" } };
     if (transformToAnthropic) reply.raw.write(`event: error\ndata: ${JSON.stringify(payload)}\n\n`);
     else reply.raw.write(`data: ${JSON.stringify(payload)}\n\ndata: [DONE]\n\n`);
     return reply.raw.end();
   }
-  const usage = recordUsage(
-    entry,
-    model,
-    inputTokens,
-    outputTokens,
-    cachedTokens,
-    authoritative.providerCost,
-    authoritative.generationId,
-    authoritative.source
-  );
-  const usageSource = authoritative.source || (providerUsageSeen ? "provider" : "tokenizer");
-  if (transformToAnthropic) {
-    reply.raw.write(`event: content_block_stop\ndata: ${JSON.stringify({ type: "content_block_stop", index: 0 })}\n\n`);
-    reply.raw.write(`event: message_delta\ndata: ${JSON.stringify({ type: "message_delta", delta: { stop_reason: "end_turn", stop_sequence: null }, usage: { output_tokens: outputTokens } })}\n\n`);
-    reply.raw.write(`event: message_stop\ndata: ${JSON.stringify({ type: "message_stop", conpi_cost_usd: usage.costUsd, conpi_usage_source: usageSource })}\n\n`);
-  } else {
-    reply.raw.write(`data: ${JSON.stringify({ object: "conpi.meter", usage: { prompt_tokens: inputTokens, completion_tokens: outputTokens, total_tokens: inputTokens + outputTokens, conpi_cost_usd: usage.costUsd, conpi_usage_source: usageSource }, stages: usage.stages })}\n\n`);
-    reply.raw.write("data: [DONE]\n\n");
-  }
   return reply.raw.end();
 }
 
-async function streamAnthropicResponse(response: Response, reply: FastifyReply, entry: VaultEntry, model: string, fallbackInputTokens: number, transformToOpenAi = false) {
+async function streamAnthropicResponse(response: Response, reply: FastifyReply, entry: VaultEntry, model: string, fallbackInputTokens: number, transformToOpenAi = false, maxOutputLimit = Infinity) {
   reply.raw.setHeader("Content-Type", "text/event-stream");
   reply.raw.setHeader("Cache-Control", "no-cache, no-transform");
   reply.raw.setHeader("Connection", "keep-alive");
@@ -570,6 +738,13 @@ async function streamAnthropicResponse(response: Response, reply: FastifyReply, 
         }
       }
     }
+    if (Number.isFinite(maxOutputLimit)) {
+      const currentEstimated = outputTokens || countTextTokens(entry.provider, model, outputText);
+      if (currentEstimated >= maxOutputLimit) {
+        await reader.cancel().catch(() => {});
+        break;
+      }
+    }
   }
   inputTokens ||= fallbackInputTokens;
   outputTokens ||= countTextTokens(entry.provider, model, outputText);
@@ -596,8 +771,20 @@ export async function handleChatCompletions(req: FastifyRequest, reply: FastifyR
     }
   }
   const inputTokens = countChatInputTokens(entry.provider, model, body.messages);
-  const maxOutputTokens = Math.max(1, Number(body.max_tokens ?? body.max_completion_tokens ?? 1_000));
-  if (!enforceModelAndBudget(entry, model, inputTokens, maxOutputTokens, reply)) return;
+  const affordableOutputTokens = computeAffordableOutputTokens(entry, model, inputTokens);
+  if (affordableOutputTokens <= 0) {
+    return reply.status(402).send({
+      error: {
+        message: `Remaining locked credit ($${Math.max(0, entry.creditUsd - entry.usedUsd).toFixed(6)}) cannot cover prompt and output tokens`,
+        code: "budget_cap_exceeded",
+      },
+    });
+  }
+  const requestedMaxTokens = body.max_tokens ?? body.max_completion_tokens;
+  const effectiveMaxTokens = requestedMaxTokens != null
+    ? Math.min(Math.max(1, Number(requestedMaxTokens)), Math.max(1, affordableOutputTokens))
+    : Math.max(1, affordableOutputTokens);
+  if (!enforceModelAndBudget(entry, model, inputTokens, effectiveMaxTokens, reply)) return;
 
   if (entry.apiKey.startsWith("mock_") || entry.apiKey.startsWith("test_") || entry.apiKey.startsWith("sk-test")) {
     if (process.env.NODE_ENV !== "test") return reply.status(403).send({ error: { message: "Mock keys are disabled", code: "mock_forbidden" } });
@@ -606,14 +793,26 @@ export async function handleChatCompletions(req: FastifyRequest, reply: FastifyR
     return handleMockChatCompletion(req, reply, entry, model);
   }
 
+  if (!(await acquireBillingLock(entry, reply))) return;
+  if (!enforceModelAndBudget(entry, model, inputTokens, effectiveMaxTokens, reply)) {
+    entry.requestInFlight = false;
+    return;
+  }
+
+  const forwardBody = {
+    ...body,
+    max_tokens: effectiveMaxTokens,
+    ...(body.max_completion_tokens != null ? { max_completion_tokens: effectiveMaxTokens } : {}),
+  };
+
   try {
     const kind = providerKind(entry);
     if (kind === "anthropic") {
       const response = await fetchWithTransientBackoff("https://api.anthropic.com/v1/messages", {
-        method: "POST", headers: providerHeaders(entry, kind), body: JSON.stringify(openAiMessagesToAnthropic(body)),
+        method: "POST", headers: providerHeaders(entry, kind), body: JSON.stringify(openAiMessagesToAnthropic(forwardBody)),
       });
       if (!response.ok) return handleProviderFailure(response, entry, reply);
-      if (body.stream) return streamAnthropicResponse(response, reply, entry, model, inputTokens, true);
+      if (body.stream) return await streamAnthropicResponse(response, reply, entry, model, inputTokens, true, effectiveMaxTokens);
       const data: any = await response.json();
       const outputText = extractText(data.content);
       const providerUsageSeen = data.usage?.input_tokens !== undefined && data.usage?.output_tokens !== undefined;
@@ -629,22 +828,34 @@ export async function handleChatCompletions(req: FastifyRequest, reply: FastifyR
 
     const response = await fetchWithTransientBackoff(`${openAiBaseUrl(kind)}/chat/completions`, {
       method: "POST", headers: providerHeaders(entry, kind),
-      body: JSON.stringify(requestWithProviderUsage(body, kind, entry.lockedPricing[model])),
+      body: JSON.stringify(requestWithProviderUsage(forwardBody, kind, entry.lockedPricing[model])),
     });
     if (!response.ok) return handleProviderFailure(response, entry, reply);
-    if (body.stream) return streamOpenAiResponse(response, reply, entry, model, inputTokens);
+    if (body.stream) return await streamOpenAiResponse(response, reply, entry, model, inputTokens, false, effectiveMaxTokens);
     const data: any = await response.json();
     const outputText = extractText(data.choices?.[0]?.message?.content);
     const providerUsageSeen = data.usage?.prompt_tokens !== undefined && data.usage?.completion_tokens !== undefined;
     const finalInput = Number(data.usage?.prompt_tokens || inputTokens);
     const finalOutput = Number(data.usage?.completion_tokens || countTextTokens(entry.provider, model, outputText));
     const cachedTokens = Number(data.usage?.prompt_tokens_details?.cached_tokens || 0);
-    const authoritative = await authoritativeCostForEntry(entry, data.usage?.cost, data.id);
-    const usage = recordUsage(entry, model, finalInput, finalOutput, cachedTokens, authoritative.providerCost, authoritative.generationId, authoritative.source);
-    data.usage = { ...(data.usage || {}), prompt_tokens: finalInput, completion_tokens: finalOutput, total_tokens: finalInput + finalOutput, conpi_cost_usd: usage.costUsd, conpi_usage_source: authoritative.source || (providerUsageSeen ? "provider" : "tokenizer") };
+    const committed = await finalizeProviderUsage(entry, {
+      generationId: typeof data.id === "string" ? data.id : null,
+      model,
+      inputTokens: finalInput,
+      outputTokens: finalOutput,
+      cachedTokens,
+      providerCost: Number.isFinite(Number(data.usage?.cost)) ? Number(data.usage.cost) : null,
+      lastError: undefined,
+    });
+    const conpiUsageSource = providerKind(entry) === "openrouter"
+      ? (committed.source || "openrouter_usage")
+      : (providerUsageSeen ? "provider" : "tokenizer");
+    data.usage = { ...(data.usage || {}), prompt_tokens: finalInput, completion_tokens: finalOutput, total_tokens: finalInput + finalOutput, conpi_cost_usd: committed.usage.costUsd, conpi_usage_source: conpiUsageSource };
     return reply.status(response.status).send(data);
   } catch (err: any) {
     return reply.status(502).send({ error: { message: err.message, code: "proxy_error" } });
+  } finally {
+    entry.requestInFlight = false;
   }
 }
 
@@ -663,8 +874,20 @@ export async function handleAnthropicMessages(req: FastifyRequest, reply: Fastif
     }
   }
   const inputTokens = countChatInputTokens(entry.provider, model, body.messages, body.system);
-  const maxOutputTokens = Math.max(1, Number(body.max_tokens ?? 1_000));
-  if (!enforceModelAndBudget(entry, model, inputTokens, maxOutputTokens, reply)) return;
+  const affordableOutputTokens = computeAffordableOutputTokens(entry, model, inputTokens);
+  if (affordableOutputTokens <= 0) {
+    return reply.status(402).send({
+      error: {
+        type: "budget_cap_exceeded",
+        message: `Remaining locked credit ($${Math.max(0, entry.creditUsd - entry.usedUsd).toFixed(6)}) cannot cover prompt and output tokens`,
+      },
+    });
+  }
+  const requestedMaxTokens = body.max_tokens;
+  const effectiveMaxTokens = requestedMaxTokens != null
+    ? Math.min(Math.max(1, Number(requestedMaxTokens)), Math.max(1, affordableOutputTokens))
+    : Math.max(1, affordableOutputTokens);
+  if (!enforceModelAndBudget(entry, model, inputTokens, effectiveMaxTokens, reply)) return;
 
   if (entry.apiKey.startsWith("mock_") || entry.apiKey.startsWith("test_") || entry.apiKey.startsWith("sk-test")) {
     if (process.env.NODE_ENV !== "test") return reply.status(403).send({ error: { type: "permission_error", message: "Mock keys are disabled" } });
@@ -673,14 +896,25 @@ export async function handleAnthropicMessages(req: FastifyRequest, reply: Fastif
     return handleMockAnthropicMessage(req, reply, entry, model);
   }
 
+  if (!(await acquireBillingLock(entry, reply))) return;
+  if (!enforceModelAndBudget(entry, model, inputTokens, effectiveMaxTokens, reply)) {
+    entry.requestInFlight = false;
+    return;
+  }
+
+  const forwardBody = {
+    ...body,
+    max_tokens: effectiveMaxTokens,
+  };
+
   try {
     const kind = providerKind(entry);
     if (kind === "anthropic") {
       const response = await fetchWithTransientBackoff("https://api.anthropic.com/v1/messages", {
-        method: "POST", headers: providerHeaders(entry, kind), body: JSON.stringify(body),
+        method: "POST", headers: providerHeaders(entry, kind), body: JSON.stringify(forwardBody),
       });
       if (!response.ok) return handleProviderFailure(response, entry, reply, true);
-      if (body.stream) return streamAnthropicResponse(response, reply, entry, model, inputTokens);
+      if (body.stream) return await streamAnthropicResponse(response, reply, entry, model, inputTokens, false, effectiveMaxTokens);
       const data: any = await response.json();
       const outputText = extractText(data.content);
       const providerUsageSeen = data.usage?.input_tokens !== undefined && data.usage?.output_tokens !== undefined;
@@ -692,26 +926,34 @@ export async function handleAnthropicMessages(req: FastifyRequest, reply: Fastif
     }
 
     const response = await fetchWithTransientBackoff(`${openAiBaseUrl(kind)}/chat/completions`, {
-      method: "POST", headers: providerHeaders(entry, kind), body: JSON.stringify(requestWithProviderUsage(anthropicMessagesToOpenAi(body), kind, entry.lockedPricing[model])),
+      method: "POST", headers: providerHeaders(entry, kind), body: JSON.stringify(requestWithProviderUsage(anthropicMessagesToOpenAi(forwardBody), kind, entry.lockedPricing[model])),
     });
     if (!response.ok) return handleProviderFailure(response, entry, reply, true);
-    if (body.stream) return streamOpenAiResponse(response, reply, entry, model, inputTokens, true);
+    if (body.stream) return await streamOpenAiResponse(response, reply, entry, model, inputTokens, true, effectiveMaxTokens);
     const data: any = await response.json();
     const outputText = extractText(data.choices?.[0]?.message?.content);
     const providerUsageSeen = data.usage?.prompt_tokens !== undefined && data.usage?.completion_tokens !== undefined;
     const finalInput = Number(data.usage?.prompt_tokens || inputTokens);
     const finalOutput = Number(data.usage?.completion_tokens || countTextTokens(entry.provider, model, outputText));
     const cachedTokens = Number(data.usage?.prompt_tokens_details?.cached_tokens || 0);
-    const authoritative = await authoritativeCostForEntry(entry, data.usage?.cost, data.id);
-    const usage = recordUsage(entry, model, finalInput, finalOutput, cachedTokens, authoritative.providerCost, authoritative.generationId, authoritative.source);
+    const committed = await finalizeProviderUsage(entry, {
+      generationId: typeof data.id === "string" ? data.id : null,
+      model,
+      inputTokens: finalInput,
+      outputTokens: finalOutput,
+      cachedTokens,
+      providerCost: Number.isFinite(Number(data.usage?.cost)) ? Number(data.usage.cost) : null,
+    });
     return reply.send({
       id: `msg_${data.id || Date.now()}`, type: "message", role: "assistant", model,
       content: [{ type: "text", text: outputText }],
       stop_reason: data.choices?.[0]?.finish_reason === "length" ? "max_tokens" : "end_turn", stop_sequence: null,
-      usage: { input_tokens: finalInput, output_tokens: finalOutput, conpi_cost_usd: usage.costUsd, conpi_usage_source: authoritative.source || (providerUsageSeen ? "provider" : "tokenizer") },
+      usage: { input_tokens: finalInput, output_tokens: finalOutput, conpi_cost_usd: committed.usage.costUsd, conpi_usage_source: committed.source || (providerUsageSeen ? "provider" : "tokenizer") },
     });
   } catch (err: any) {
     return reply.status(502).send({ error: { type: "api_error", message: err.message } });
+  } finally {
+    entry.requestInFlight = false;
   }
 }
 
@@ -743,6 +985,11 @@ export async function handleEmbeddings(req: FastifyRequest, reply: FastifyReply)
       usage: { prompt_tokens: inputTokens, total_tokens: inputTokens, conpi_cost_usd: usage.costUsd },
     });
   }
+  if (!(await acquireBillingLock(entry, reply))) return;
+  if (!enforceModelAndBudget(entry, model, inputTokens, 0, reply)) {
+    entry.requestInFlight = false;
+    return;
+  }
   try {
     const response = await fetchWithTransientBackoff(`${openAiBaseUrl(kind)}/embeddings`, {
       method: "POST", headers: providerHeaders(entry, kind), body: JSON.stringify(requestWithProviderUsage(body, kind, entry.lockedPricing[model])),
@@ -752,12 +999,20 @@ export async function handleEmbeddings(req: FastifyRequest, reply: FastifyReply)
     const providerUsageSeen = data.usage?.prompt_tokens !== undefined || data.usage?.total_tokens !== undefined;
     const finalInput = Number(data.usage?.prompt_tokens || data.usage?.total_tokens || inputTokens);
     const cachedTokens = Number(data.usage?.prompt_tokens_details?.cached_tokens || 0);
-    const authoritative = await authoritativeCostForEntry(entry, data.usage?.cost, data.id);
-    const usage = recordUsage(entry, model, finalInput, 0, cachedTokens, authoritative.providerCost, authoritative.generationId, authoritative.source);
-    data.usage = { ...(data.usage || {}), prompt_tokens: finalInput, total_tokens: finalInput, conpi_cost_usd: usage.costUsd, conpi_usage_source: authoritative.source || (providerUsageSeen ? "provider" : "tokenizer") };
+    const committed = await finalizeProviderUsage(entry, {
+      generationId: typeof data.id === "string" ? data.id : null,
+      model,
+      inputTokens: finalInput,
+      outputTokens: 0,
+      cachedTokens,
+      providerCost: Number.isFinite(Number(data.usage?.cost)) ? Number(data.usage.cost) : null,
+    });
+    data.usage = { ...(data.usage || {}), prompt_tokens: finalInput, total_tokens: finalInput, conpi_cost_usd: committed.usage.costUsd, conpi_usage_source: committed.source || (providerUsageSeen ? "provider" : "tokenizer") };
     return reply.status(response.status).send(data);
   } catch (err: any) {
     return reply.status(502).send({ error: { message: err.message, code: "proxy_error" } });
+  } finally {
+    entry.requestInFlight = false;
   }
 }
 

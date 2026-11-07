@@ -11,6 +11,8 @@ export class EnclaveKeyManager {
   private x25519PrivKey!: Uint8Array;
   public x25519PubKey!: Uint8Array;
 
+  private stateStorageKey!: Uint8Array;
+
   private initialized: boolean = false;
   private initPromise: Promise<void> | null = null;
 
@@ -44,12 +46,15 @@ export class EnclaveKeyManager {
 
           const encRes = await client.getKey("conpi/encryption/v1");
           this.x25519PrivKey = encRes.key.subarray(0, 32);
+          const stateRes = await client.getKey("conpi/metering-state/v1");
+          this.stateStorageKey = stateRes.key.subarray(0, 32);
           console.log(`[Keys] In-enclave hardware key derivation successful!`);
         } catch (err: any) {
           if (process.env.NODE_ENV === "test") {
             console.warn(`[Keys] Hardware key derivation failed in test mode, using ephemeral test keys: ${err.message}`);
             this.ed25519PrivKey = ed25519.utils.randomPrivateKey();
             this.x25519PrivKey = x25519.utils.randomPrivateKey();
+            this.stateStorageKey = ed25519.utils.randomPrivateKey();
           } else {
             throw new Error(`Failed to derive hardware keys via dstack: ${err.message}`);
           }
@@ -58,6 +63,7 @@ export class EnclaveKeyManager {
         // Ephemeral random keys strictly for unit tests in non-TEE local test environment
         this.ed25519PrivKey = ed25519.utils.randomPrivateKey();
         this.x25519PrivKey = x25519.utils.randomPrivateKey();
+        this.stateStorageKey = ed25519.utils.randomPrivateKey();
       } else {
         throw new Error(
           "Dstack hardware environment required: /var/run/dstack.sock not reachable outside test mode (NODE_ENV !== 'test'). No fallback seeds permitted."
@@ -79,6 +85,7 @@ export class EnclaveKeyManager {
         this.x25519PrivKey = x25519.utils.randomPrivateKey();
         this.ed25519PubKey = ed25519.getPublicKey(this.ed25519PrivKey);
         this.x25519PubKey = x25519.getPublicKey(this.x25519PrivKey);
+        this.stateStorageKey = ed25519.utils.randomPrivateKey();
         this.initialized = true;
         return;
       }
@@ -104,6 +111,11 @@ export class EnclaveKeyManager {
   public getEncryptionPublicKeyBytes(): Uint8Array {
     this.ensureInit();
     return this.x25519PubKey;
+  }
+
+  public getStateStorageKeyBytes(): Uint8Array {
+    this.ensureInit();
+    return Uint8Array.from(this.stateStorageKey);
   }
 
   public sign(message: Uint8Array): Uint8Array {
