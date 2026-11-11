@@ -805,10 +805,13 @@ async fn test_workspaces_multisig_dao_upgrade_execution_with_timelock_and_migrat
 
     let worker = near_workspaces::sandbox().await?;
 
+    let migration_source_override = std::env::var_os("CONPI_MIGRATION_SOURCE_WASM");
     let wasm_p1 = std::path::Path::new("res/conpi_escrow.wasm");
     let wasm_p2 = std::path::Path::new("contracts/res/conpi_escrow.wasm");
     let wasm_p3 = std::path::Path::new("./target/near/conpi_escrow.wasm");
-    let wasm_bytes = if wasm_p1.exists() {
+    let wasm_bytes = if let Some(path) = migration_source_override {
+        std::fs::read(path)?
+    } else if wasm_p1.exists() {
         std::fs::read(wasm_p1)?
     } else if wasm_p2.exists() {
         std::fs::read(wasm_p2)?

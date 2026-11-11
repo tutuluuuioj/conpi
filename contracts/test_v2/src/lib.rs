@@ -143,6 +143,28 @@ pub struct ConpiEscrowCurrent {
     pub mpc_signer_contract: Option<AccountId>,
 }
 
+// State deployed immediately before foreign-chain settlement fields were
+// appended. The upgrade fixture must accept both this schema and the current
+// schema so old production images remain safely migratable.
+#[near(serializers = [borsh])]
+pub struct ConpiEscrowPreForeignState {
+    pub owner: AccountId,
+    pub chain_id: String,
+    pub paused: bool,
+    pub tee_signers: UnorderedMap<PublicKey, TeeSigner>,
+    pub deals: LookupMap<DealId, Deal>,
+    pub deal_creators: LookupMap<DealId, AccountId>,
+    pub pending_payouts: LookupMap<(AccountId, Option<AccountId>), Balance>,
+    pub next_deal_id: u64,
+    pub config: Config,
+    pub next_proposal_id: u64,
+    pub staged_proposals: UnorderedMap<u64, StagedAction>,
+    pub timelock_duration: Duration,
+    pub state_version: u32,
+    pub approved_measurement: Option<String>,
+    pub staged_upgrade_code: Option<Vec<u8>>,
+}
+
 #[near(serializers = [borsh])]
 pub struct ConpiEscrowV2State {
     pub owner: AccountId,
@@ -233,6 +255,22 @@ impl ConpiEscrowV2 {
                 cur.staged_proposals,
                 cur.timelock_duration,
                 cur.state_version,
+            )
+        } else if let Ok(previous) = ConpiEscrowPreForeignState::try_from_slice(&state_bytes) {
+            (
+                previous.owner,
+                previous.chain_id,
+                previous.paused,
+                previous.tee_signers,
+                previous.deals,
+                previous.deal_creators,
+                previous.pending_payouts,
+                previous.next_deal_id,
+                previous.config,
+                previous.next_proposal_id,
+                previous.staged_proposals,
+                previous.timelock_duration,
+                previous.state_version,
             )
         } else if let Ok(v2) = ConpiEscrowV2State::try_from_slice(&state_bytes) {
             (
