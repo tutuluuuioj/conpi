@@ -8,7 +8,7 @@
     "dev": "tsx watch src/index.ts",
     "build": "tsc",
     "start": "node dist/index.js",
-    "test": "NODE_ENV=test tsx test/index.test.ts && NODE_ENV=test tsx test/phase3.test.ts && NODE_ENV=test tsx test/phase4.test.ts && NODE_ENV=test tsx test/base-client.test.ts && NODE_ENV=test tsx test/foreign-relayer.test.ts",
+    "test": "NODE_ENV=test tsx test/seller-auth.test.ts && NODE_ENV=test tsx test/index.test.ts && NODE_ENV=test tsx test/phase3.test.ts && NODE_ENV=test tsx test/phase4.test.ts && NODE_ENV=test tsx test/base-client.test.ts && NODE_ENV=test tsx test/foreign-relayer.test.ts",
     "test:phase3": "NODE_ENV=test tsx test/phase3.test.ts",
     "test:phase4": "NODE_ENV=test tsx test/phase4.test.ts",
     "test:multichain": "NODE_ENV=test tsx test/base-client.test.ts && NODE_ENV=test tsx test/foreign-relayer.test.ts",

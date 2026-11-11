@@ -1,4 +1,5 @@
 import { FastifyReply, FastifyRequest } from "fastify";
+import crypto from "crypto";
 import { DefaultReason } from "../crypto/borsh.js";
 import { enclaveKeys } from "../crypto/keys.js";
 import { CONFIG } from "../config.js";
@@ -9,7 +10,7 @@ import { meterEngine } from "./meter.js";
 import { calculateCost, calculateWorstCaseCost, pricingCeiling, PricingRate, UsageTokenDetails } from "./pricing.js";
 import { proxyRateLimiter } from "./rate-limit.js";
 import {
-  conservativeChatInputTokenUpperBound,
+  conservativeChatRequestTokenUpperBound,
   conservativeEmbeddingInputTokenUpperBound,
   countChatInputTokens,
   countEmbeddingInputTokens,
@@ -120,12 +121,56 @@ export async function reconcilePendingUsage(entry: VaultEntry): Promise<UsageRes
     pending.cachedTokens,
     undefined,
     pending.generationId || undefined,
-    "locked_pricing",
+    "locked_pricing_reserved",
     {
       cacheWriteTokens: pending.cacheWriteTokens,
       reasoningTokens: pending.reasoningTokens,
     }
   );
+}
+
+export function stagePendingUsage(
+  entry: VaultEntry,
+  model: string,
+  reservedInputTokens: number,
+  reservedOutputTokens: number
+): void {
+  if (entry.pendingUsage) {
+    throw new Error(`Deal #${entry.dealId} already has an unresolved pending charge`);
+  }
+  const pending = {
+    generationId: `conpi-reservation:${entry.dealId}:${crypto.randomUUID()}`,
+    model,
+    inputTokens: Math.max(0, Math.floor(reservedInputTokens)),
+    outputTokens: Math.max(0, Math.floor(reservedOutputTokens)),
+    cachedTokens: 0,
+    providerCost: null,
+    createdAt: new Date().toISOString(),
+    attempts: 0,
+  };
+  // Persist first. No provider request is allowed until this fsynced commit
+  // succeeds, so a crash or broken stream always leaves a recoverable charge.
+  meteringStateStore.save({ ...entry, pendingUsage: pending });
+  entry.pendingUsage = pending;
+}
+
+function clearPendingUsage(entry: VaultEntry): void {
+  if (!entry.pendingUsage) return;
+  meteringStateStore.save({ ...entry, pendingUsage: null });
+  entry.pendingUsage = null;
+}
+
+async function settleAmbiguousPendingCharge(entry: VaultEntry): Promise<void> {
+  if (!entry.pendingUsage) return;
+  try {
+    await reconcilePendingUsage(entry);
+  } catch (error: any) {
+    console.error("[conpi:pending-charge]", {
+      dealId: entry.dealId,
+      generationId: entry.pendingUsage?.generationId || null,
+      error: error?.message || String(error),
+    });
+  }
 }
 
 interface LocalUsageCommit {
@@ -171,12 +216,7 @@ async function acquireBillingLock(entry: VaultEntry, reply: FastifyReply): Promi
     });
     return false;
   }
-  const start = Date.now();
   while (entry.requestInFlight) {
-    if (Date.now() - start > 1_000) {
-      reply.status(409).send({ error: { message: "Another request is already being metered for this deal", code: "billing_request_in_flight" } });
-      return false;
-    }
     await new Promise((resolve) => setTimeout(resolve, 10));
     if (entry.defaultPayload) {
       reply.status(502).send({
@@ -335,6 +375,15 @@ function parseRequestedOutputTokens(value: unknown): number | undefined {
   return parsed;
 }
 
+export function modelOutputTokenLimit(entry: VaultEntry, model: string, reservedInputTokens: number): number {
+  const rate = entry.lockedPricing[model];
+  const declaredOutputLimit = rate?.maxOutputTokens || rate?.contextLength || 4_096;
+  const remainingContext = rate?.contextLength
+    ? Math.max(1, rate.contextLength - Math.max(0, Math.floor(reservedInputTokens)))
+    : declaredOutputLimit;
+  return Math.max(1, Math.min(declaredOutputLimit, remainingContext));
+}
+
 function enforceModelAndBudget(entry: VaultEntry, model: string, inputTokens: number, maximumOutputTokens: number, reply: FastifyReply): boolean {
   const normalizedModel = model.trim().toLowerCase();
   if (!entry.models.some((item) => item.trim().toLowerCase() === normalizedModel)) {
@@ -363,6 +412,10 @@ function enforceModelAndBudget(entry: VaultEntry, model: string, inputTokens: nu
   return true;
 }
 
+export function accumulateUsedUsd(currentUsedUsd: number, chargeUsd: number): number {
+  return currentUsedUsd + chargeUsd;
+}
+
 function recordUsage(
   entry: VaultEntry,
   model: string,
@@ -384,7 +437,9 @@ function recordUsage(
     ...calculated,
     costUsd: resolveMeteredCostUsd(entry.provider, calculated.costUsd, providerCost),
   };
-  const nextUsedUsd = Math.min(entry.creditUsd, entry.usedUsd + usage.costUsd);
+  // Keep the real provider-side overage visible in the signed receipt ledger.
+  // Settlement is still capped at 100% by the stage engine; accounting is not.
+  const nextUsedUsd = accumulateUsedUsd(entry.usedUsd, usage.costUsd);
   const nextTokensTotal = entry.tokensTotal + usage.inputTokens + usage.outputTokens;
   const previousHash = entry.usageReceipts.at(-1)?.hash || null;
   const receiptBody = {
@@ -396,6 +451,7 @@ function recordUsage(
     cachedTokens: usage.cachedTokens,
     cacheWriteTokens: usage.cacheWriteTokens,
     reasoningTokens: usage.reasoningTokens,
+    requestFeeUsd: usage.requestFeeUsd,
     costUsd: usage.costUsd,
     cumulativeUsedUsd: nextUsedUsd,
     source: costSource,
@@ -472,9 +528,15 @@ export function publicSignedPayload(item: { payload: any; signatureHex: string }
   };
 }
 
-async function fetchWithTransientBackoff(url: string, init: RequestInit): Promise<Response> {
+export async function fetchWithTransientBackoff(
+  url: string,
+  init: RequestInit,
+  timeoutMs = CONFIG.upstreamFetchTimeoutMs
+): Promise<Response> {
   for (let attempt = 0; ; attempt += 1) {
-    const response = await fetch(url, init);
+    const timeoutSignal = AbortSignal.timeout(timeoutMs);
+    const signal = init.signal ? AbortSignal.any([init.signal, timeoutSignal]) : timeoutSignal;
+    const response = await fetch(url, { ...init, signal });
     if (response.status !== 429) return response;
     const body = await response.clone().text();
     if (classifyProviderError(response.status, body) !== "transient_rate_limit" || attempt >= CONFIG.transientRateLimitRetries) return response;
@@ -488,6 +550,10 @@ async function fetchWithTransientBackoff(url: string, init: RequestInit): Promis
 
 async function handleProviderFailure(response: Response, entry: VaultEntry, reply: FastifyReply, anthropicFormat = false) {
   const text = await response.text();
+  // A completed HTTP error is known not to contain a billable generation. A
+  // network/parse/stream exception deliberately does not take this path and
+  // leaves the reservation for crash-safe reconciliation.
+  clearPendingUsage(entry);
   const kind = classifyProviderError(response.status, text);
   const upstreamCode = extractProviderErrorCode(text);
   console.warn("[conpi:upstream-error]", {
@@ -666,6 +732,7 @@ async function streamOpenAiResponse(
       reply.raw.write("data: [DONE]\n\n");
     }
   } catch (error: any) {
+    await settleAmbiguousPendingCharge(entry);
     const payload = { error: { message: error.message, code: "meter_commit_failed" } };
     if (transformToAnthropic) reply.raw.write(`event: error\ndata: ${JSON.stringify(payload)}\n\n`);
     else reply.raw.write(`data: ${JSON.stringify(payload)}\n\ndata: [DONE]\n\n`);
@@ -691,6 +758,8 @@ async function streamAnthropicResponse(
   let outputText = "";
   let inputTokens = 0;
   let outputTokens = 0;
+  let cachedTokens = 0;
+  let cacheWriteTokens = 0;
   let providerInputSeen = false;
   let providerOutputSeen = false;
   const reader = response.body?.getReader();
@@ -712,6 +781,7 @@ async function streamAnthropicResponse(
       try { data = JSON.parse(raw); } catch { continue; }
       const reportedInput = data.message?.usage?.input_tokens ?? data.usage?.input_tokens;
       const reportedOutput = data.usage?.output_tokens;
+      const usageDetails = data.message?.usage || data.usage || {};
       if (Number.isFinite(Number(reportedInput))) {
         providerInputSeen = true;
         inputTokens = Number(reportedInput);
@@ -719,6 +789,12 @@ async function streamAnthropicResponse(
       if (Number.isFinite(Number(reportedOutput))) {
         providerOutputSeen = true;
         outputTokens = Number(reportedOutput);
+      }
+      if (Number.isFinite(Number(usageDetails.cache_read_input_tokens))) {
+        cachedTokens = Number(usageDetails.cache_read_input_tokens);
+      }
+      if (Number.isFinite(Number(usageDetails.cache_creation_input_tokens))) {
+        cacheWriteTokens = Number(usageDetails.cache_creation_input_tokens);
       }
       const text = data.delta?.text;
       if (typeof text === "string") {
@@ -743,18 +819,20 @@ async function streamAnthropicResponse(
       ? Math.max(outputTokens, Math.floor(maxOutputLimit))
       : Math.max(outputTokens, countTextTokens(entry.provider, model, outputText));
   }
+  const meteredInputTokens = reservedFallback ? inputTokens : inputTokens + cachedTokens + cacheWriteTokens;
   const usage = recordUsage(
     entry,
     model,
-    inputTokens,
+    meteredInputTokens,
     outputTokens,
-    0,
+    cachedTokens,
     undefined,
     undefined,
-    reservedFallback ? "locked_pricing_reserved" : "locked_pricing"
+    reservedFallback ? "locked_pricing_reserved" : "locked_pricing",
+    { cacheWriteTokens }
   );
   if (transformToOpenAi) {
-    reply.raw.write(`data: ${JSON.stringify({ id: `chatcmpl-${Date.now()}`, object: "chat.completion.chunk", created: Math.floor(Date.now() / 1000), model, choices: [{ index: 0, delta: {}, finish_reason: "stop" }], usage: { prompt_tokens: inputTokens, completion_tokens: outputTokens, total_tokens: inputTokens + outputTokens, conpi_cost_usd: usage.costUsd, conpi_usage_source: reservedFallback ? "locked_pricing_reserved" : "locked_pricing" } })}\n\n`);
+    reply.raw.write(`data: ${JSON.stringify({ id: `chatcmpl-${Date.now()}`, object: "chat.completion.chunk", created: Math.floor(Date.now() / 1000), model, choices: [{ index: 0, delta: {}, finish_reason: "stop" }], usage: { prompt_tokens: meteredInputTokens, completion_tokens: outputTokens, total_tokens: meteredInputTokens + outputTokens, prompt_tokens_details: { cached_tokens: cachedTokens, cache_write_tokens: cacheWriteTokens }, conpi_cost_usd: usage.costUsd, conpi_usage_source: reservedFallback ? "locked_pricing_reserved" : "locked_pricing" } })}\n\n`);
     reply.raw.write("data: [DONE]\n\n");
   }
   return reply.raw.end();
@@ -766,6 +844,9 @@ export async function handleChatCompletions(req: FastifyRequest, reply: FastifyR
   const body = (req.body || {}) as any;
   const model = String(body.model || "");
   if (!model) return reply.status(400).send({ error: { message: "model is required", code: "invalid_request" } });
+  if (body.n !== undefined && Number(body.n) > 1) {
+    return reply.status(400).send({ error: { message: "n > 1 is not supported by metered deals", code: "multiple_choices_not_supported" } });
+  }
   if (providerKind(entry) === "openrouter") {
     const unpricedFeature = validatePricedOpenRouterRequest(body);
     if (unpricedFeature) {
@@ -775,7 +856,7 @@ export async function handleChatCompletions(req: FastifyRequest, reply: FastifyR
     }
   }
   const inputTokens = countChatInputTokens(entry.provider, model, body.messages);
-  const reservedInputTokens = Math.max(inputTokens, conservativeChatInputTokenUpperBound(body.messages));
+  const reservedInputTokens = Math.max(inputTokens, conservativeChatRequestTokenUpperBound(body));
   const affordableOutputTokens = computeAffordableOutputTokens(entry, model, reservedInputTokens);
   if (affordableOutputTokens <= 0) {
     return reply.status(402).send({
@@ -792,8 +873,8 @@ export async function handleChatCompletions(req: FastifyRequest, reply: FastifyR
     return reply.status(400).send({ error: { message: error.message, code: "invalid_request" } });
   }
   const effectiveMaxTokens = requestedMaxTokens != null
-    ? Math.min(requestedMaxTokens, Math.max(1, affordableOutputTokens))
-    : Math.max(1, affordableOutputTokens);
+    ? Math.min(requestedMaxTokens, Math.max(1, affordableOutputTokens), modelOutputTokenLimit(entry, model, reservedInputTokens))
+    : Math.min(Math.max(1, affordableOutputTokens), modelOutputTokenLimit(entry, model, reservedInputTokens));
   if (!enforceModelAndBudget(entry, model, reservedInputTokens, effectiveMaxTokens, reply)) return;
 
   if (entry.apiKey.startsWith("mock_") || entry.apiKey.startsWith("test_") || entry.apiKey.startsWith("sk-test")) {
@@ -816,6 +897,7 @@ export async function handleChatCompletions(req: FastifyRequest, reply: FastifyR
   };
 
   try {
+    stagePendingUsage(entry, model, reservedInputTokens, effectiveMaxTokens);
     const kind = providerKind(entry);
     if (kind === "anthropic") {
       const response = await fetchWithTransientBackoff("https://api.anthropic.com/v1/messages", {
@@ -826,9 +908,11 @@ export async function handleChatCompletions(req: FastifyRequest, reply: FastifyR
       const data: any = await response.json();
       const outputText = extractText(data.content);
       const providerUsageSeen = Number.isFinite(Number(data.usage?.input_tokens)) && Number.isFinite(Number(data.usage?.output_tokens));
-      const finalInput = providerUsageSeen ? Number(data.usage.input_tokens) : reservedInputTokens;
+      const cachedTokens = providerUsageSeen ? Number(data.usage?.cache_read_input_tokens || 0) : 0;
+      const cacheWriteTokens = providerUsageSeen ? Number(data.usage?.cache_creation_input_tokens || 0) : 0;
+      const finalInput = providerUsageSeen ? Number(data.usage.input_tokens) + cachedTokens + cacheWriteTokens : reservedInputTokens;
       const finalOutput = providerUsageSeen ? Number(data.usage.output_tokens) : effectiveMaxTokens;
-      const usage = recordUsage(entry, model, finalInput, finalOutput, 0, undefined, undefined, providerUsageSeen ? "locked_pricing" : "locked_pricing_reserved");
+      const usage = recordUsage(entry, model, finalInput, finalOutput, cachedTokens, undefined, undefined, providerUsageSeen ? "locked_pricing" : "locked_pricing_reserved", { cacheWriteTokens });
       return reply.send({
         id: `chatcmpl-${data.id || Date.now()}`, object: "chat.completion", created: Math.floor(Date.now() / 1000), model,
         choices: [{ index: 0, message: { role: "assistant", content: outputText }, finish_reason: data.stop_reason === "max_tokens" ? "length" : "stop" }],
@@ -864,6 +948,7 @@ export async function handleChatCompletions(req: FastifyRequest, reply: FastifyR
     data.usage = { ...(data.usage || {}), prompt_tokens: finalInput, completion_tokens: finalOutput, total_tokens: finalInput + finalOutput, conpi_cost_usd: committed.usage.costUsd, conpi_usage_source: conpiUsageSource };
     return reply.status(response.status).send(data);
   } catch (err: any) {
+    await settleAmbiguousPendingCharge(entry);
     return reply.status(502).send({ error: { message: err.message, code: "proxy_error" } });
   } finally {
     entry.requestInFlight = false;
@@ -876,6 +961,9 @@ export async function handleAnthropicMessages(req: FastifyRequest, reply: Fastif
   const body = (req.body || {}) as any;
   const model = String(body.model || "");
   if (!model) return reply.status(400).send({ error: { type: "invalid_request_error", message: "model is required" } });
+  if (body.n !== undefined && Number(body.n) > 1) {
+    return reply.status(400).send({ error: { type: "invalid_request_error", message: "n > 1 is not supported by metered deals" } });
+  }
   if (providerKind(entry) === "openrouter") {
     const unpricedFeature = validatePricedOpenRouterRequest(body);
     if (unpricedFeature) {
@@ -885,7 +973,7 @@ export async function handleAnthropicMessages(req: FastifyRequest, reply: Fastif
     }
   }
   const inputTokens = countChatInputTokens(entry.provider, model, body.messages, body.system);
-  const reservedInputTokens = Math.max(inputTokens, conservativeChatInputTokenUpperBound(body.messages, body.system));
+  const reservedInputTokens = Math.max(inputTokens, conservativeChatRequestTokenUpperBound(body));
   const affordableOutputTokens = computeAffordableOutputTokens(entry, model, reservedInputTokens);
   if (affordableOutputTokens <= 0) {
     return reply.status(402).send({
@@ -902,8 +990,8 @@ export async function handleAnthropicMessages(req: FastifyRequest, reply: Fastif
     return reply.status(400).send({ error: { type: "invalid_request_error", message: error.message } });
   }
   const effectiveMaxTokens = requestedMaxTokens != null
-    ? Math.min(requestedMaxTokens, Math.max(1, affordableOutputTokens))
-    : Math.max(1, affordableOutputTokens);
+    ? Math.min(requestedMaxTokens, Math.max(1, affordableOutputTokens), modelOutputTokenLimit(entry, model, reservedInputTokens))
+    : Math.min(Math.max(1, affordableOutputTokens), modelOutputTokenLimit(entry, model, reservedInputTokens));
   if (!enforceModelAndBudget(entry, model, reservedInputTokens, effectiveMaxTokens, reply)) return;
 
   if (entry.apiKey.startsWith("mock_") || entry.apiKey.startsWith("test_") || entry.apiKey.startsWith("sk-test")) {
@@ -925,6 +1013,7 @@ export async function handleAnthropicMessages(req: FastifyRequest, reply: Fastif
   };
 
   try {
+    stagePendingUsage(entry, model, reservedInputTokens, effectiveMaxTokens);
     const kind = providerKind(entry);
     if (kind === "anthropic") {
       const response = await fetchWithTransientBackoff("https://api.anthropic.com/v1/messages", {
@@ -935,9 +1024,11 @@ export async function handleAnthropicMessages(req: FastifyRequest, reply: Fastif
       const data: any = await response.json();
       const outputText = extractText(data.content);
       const providerUsageSeen = Number.isFinite(Number(data.usage?.input_tokens)) && Number.isFinite(Number(data.usage?.output_tokens));
-      const finalInput = providerUsageSeen ? Number(data.usage.input_tokens) : reservedInputTokens;
+      const cachedTokens = providerUsageSeen ? Number(data.usage?.cache_read_input_tokens || 0) : 0;
+      const cacheWriteTokens = providerUsageSeen ? Number(data.usage?.cache_creation_input_tokens || 0) : 0;
+      const finalInput = providerUsageSeen ? Number(data.usage.input_tokens) + cachedTokens + cacheWriteTokens : reservedInputTokens;
       const finalOutput = providerUsageSeen ? Number(data.usage.output_tokens) : effectiveMaxTokens;
-      const usage = recordUsage(entry, model, finalInput, finalOutput, 0, undefined, undefined, providerUsageSeen ? "locked_pricing" : "locked_pricing_reserved");
+      const usage = recordUsage(entry, model, finalInput, finalOutput, cachedTokens, undefined, undefined, providerUsageSeen ? "locked_pricing" : "locked_pricing_reserved", { cacheWriteTokens });
       data.usage = { ...(data.usage || {}), input_tokens: finalInput, output_tokens: finalOutput, conpi_cost_usd: usage.costUsd, conpi_usage_source: providerUsageSeen ? "locked_pricing" : "locked_pricing_reserved" };
       return reply.send(data);
     }
@@ -972,6 +1063,7 @@ export async function handleAnthropicMessages(req: FastifyRequest, reply: Fastif
       usage: { input_tokens: finalInput, output_tokens: finalOutput, conpi_cost_usd: committed.usage.costUsd, conpi_usage_source: committed.source },
     });
   } catch (err: any) {
+    await settleAmbiguousPendingCharge(entry);
     return reply.status(502).send({ error: { type: "api_error", message: err.message } });
   } finally {
     entry.requestInFlight = false;
@@ -1013,6 +1105,7 @@ export async function handleEmbeddings(req: FastifyRequest, reply: FastifyReply)
     return;
   }
   try {
+    stagePendingUsage(entry, model, reservedInputTokens, 0);
     const response = await fetchWithTransientBackoff(`${openAiBaseUrl(kind)}/embeddings`, {
       method: "POST", headers: providerHeaders(entry, kind), body: JSON.stringify(requestWithProviderUsage(body, kind, entry.lockedPricing[model])),
     });
@@ -1034,6 +1127,7 @@ export async function handleEmbeddings(req: FastifyRequest, reply: FastifyReply)
     data.usage = { ...(data.usage || {}), prompt_tokens: finalInput, total_tokens: finalInput, conpi_cost_usd: committed.usage.costUsd, conpi_usage_source: committed.source };
     return reply.status(response.status).send(data);
   } catch (err: any) {
+    await settleAmbiguousPendingCharge(entry);
     return reply.status(502).send({ error: { message: err.message, code: "proxy_error" } });
   } finally {
     entry.requestInFlight = false;

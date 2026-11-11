@@ -16,6 +16,19 @@ jobs:
       - name: Checkout code
         uses: actions/checkout@v4
 
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: tee-service/package-lock.json
+
+      - name: Install and test TEE service
+        working-directory: tee-service
+        run: |
+          npm ci
+          npm test
+
       - name: Set up QEMU
         uses: docker/setup-qemu-action@v3
 

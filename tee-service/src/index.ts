@@ -27,8 +27,13 @@ import { settlementEngine } from "./settlement/engine.js";
 import { foreignVaultManager } from "./chain/foreign-vault.js";
 import { foreignRelayer } from "./chain/foreign-relayer.js";
 import { baseClient, BASE_SEPOLIA_USDC, BASE_SEPOLIA_CHAIN_ID } from "./chain/base-client.js";
+import {
+  verifySellerKeyAuthorization,
+  type SellerKeyAuthorization,
+} from "./auth/seller-key.js";
 
 export const app = Fastify({ logger: false });
+const keyInjectionLocks = new Set<number>();
 
 let initialized = false;
 export async function buildApp() {
@@ -135,9 +140,96 @@ export async function buildApp() {
   app.post("/v1/deals/:id/key", async (req, reply) => {
     const { id } = req.params as { id: string };
     const dealId = parseInt(id, 10);
-    const { provider, model, models, termsHashHex, encryptedEnvelope, plainApiKey } = req.body as any;
+    const { provider, model, models, termsHashHex, encryptedEnvelope, plainApiKey, sellerAuthorization } = req.body as any;
 
+    let injectionLocked = false;
     try {
+      if (!Number.isSafeInteger(dealId) || dealId <= 0) {
+        return reply.status(400).send({ ok: false, error: "Invalid deal id" });
+      }
+      const onChainDeal = await nearRelayer.getDeal(dealId);
+      if (!onChainDeal?.seller) {
+        return reply.status(404).send({ ok: false, error: `Deal #${dealId} was not found on-chain` });
+      }
+      await verifySellerKeyAuthorization({
+        dealId,
+        seller: String(onChainDeal.seller),
+        provider,
+        model,
+        models: models || [model],
+        termsHashHex,
+        encryptedEnvelope,
+        plainApiKey,
+        authorization: sellerAuthorization as SellerKeyAuthorization,
+      });
+      const requestedDealStatus = String(onChainDeal.status || "").toLowerCase();
+      if (requestedDealStatus !== "funded" && requestedDealStatus !== "active") {
+        return reply.status(409).send({
+          ok: false,
+          error: `Deal #${dealId} is ${onChainDeal.status || "not funded"}; provider keys can only be submitted for funded deals`,
+        });
+      }
+      if (keyInjectionLocks.has(dealId)) {
+        return reply.status(409).send({ ok: false, error: `Key injection is already in progress for deal #${dealId}` });
+      }
+      keyInjectionLocks.add(dealId);
+      injectionLocked = true;
+
+      const existing = keyVault.getByDealId(dealId);
+      const chainStatus = String(onChainDeal.status || "").toLowerCase();
+      const localStatus = String(existing?.onChainStatus || "").toLowerCase();
+      const authoritativeStatus = chainStatus === "active" || localStatus === "active" ? "active" : chainStatus || localStatus;
+      if (existing && authoritativeStatus === "active") {
+        return reply.status(409).send({
+          ok: false,
+          error: `Deal #${dealId} is already active; its provider key cannot be replaced`,
+        });
+      }
+      if (existing) {
+        const activation = existing.signedPayloads.find((item) => item.payload.kind === PayloadKind.Activate);
+        if (!activation) {
+          return reply.status(409).send({ ok: false, error: `Deal #${dealId} already has a provider key` });
+        }
+        const publicActivation = publicSignedPayload(activation);
+        let activationTxHash: string | undefined;
+        let activationRelayed = false;
+        if (nearRelayer.isConfigured()) {
+          try {
+            const submitted = await nearRelayer.submitActivate(dealId, publicActivation.payload, publicActivation.signatureHex);
+            activationTxHash = submitted.transactionHash;
+            activationRelayed = true;
+            existing.onChainStatus = "Active";
+          } catch (error: any) {
+            const refreshed = await nearRelayer.getDeal(dealId).catch(() => null);
+            if (String(refreshed?.status || "").toLowerCase() === "active") {
+              activationRelayed = true;
+              existing.onChainStatus = "Active";
+            } else {
+              return reply.status(502).send({
+                ok: false,
+                error: `TEE activation relay failed: ${error?.message || String(error)}`,
+                proxyKey: existing.proxyKey,
+                activatePayload: publicActivation.payload,
+                activateSignatureHex: publicActivation.signatureHex,
+                keyAlreadyInjected: true,
+              });
+            }
+          }
+        }
+        return {
+          ok: true,
+          modelAvailable: true,
+          balanceCoversCredit: true,
+          proxyKey: existing.proxyKey,
+          activatePayload: publicActivation.payload,
+          activateSignatureHex: publicActivation.signatureHex,
+          activationRelayed,
+          activationAlreadyActive: authoritativeStatus === "active",
+          activationTxHash,
+          keyAlreadyInjected: true,
+        };
+      }
+
       const result = await keyVault.validateAndInjectKey(
         dealId,
         provider,
@@ -204,7 +296,11 @@ export async function buildApp() {
 
       return result;
     } catch (err: any) {
-      return reply.status(500).send({ ok: false, error: err.message });
+      const message = err?.message || String(err);
+      const authFailure = /seller|signature|authorization|wallet|nonce|public key/i.test(message);
+      return reply.status(authFailure ? 401 : 500).send({ ok: false, error: message });
+    } finally {
+      if (injectionLocked) keyInjectionLocks.delete(dealId);
     }
   });
 

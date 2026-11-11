@@ -24,6 +24,9 @@ services:
       - METERING_STATE_DIR=/var/lib/conpi
       - RELAYER_ACCOUNT_ID=${RELAYER_ACCOUNT_ID}
       - RELAYER_PRIVATE_KEY=${RELAYER_PRIVATE_KEY}
+      - BASE_SEPOLIA_RPC
+      - OPERATOR_EVM_PRIVATE_KEY
+      - BASE_SEPOLIA_RELAYER_KEY
 
 volumes:
   conpi-meter-state:

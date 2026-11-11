@@ -72,6 +72,32 @@ export function conservativeChatInputTokenUpperBound(messages: unknown, system?:
   return Buffer.byteLength(serialized, "utf8") + Math.max(32, rows.length * 16);
 }
 
+/**
+ * Reserve against every request field that the provider tokenizes, not only
+ * visible chat messages. Tool/function schemas and structured-output schemas
+ * can be much larger than the prompt itself.
+ */
+export function conservativeChatRequestTokenUpperBound(body: unknown): number {
+  const request = body && typeof body === "object" ? body as Record<string, unknown> : {};
+  const tokenizedRequest = {
+    system: request.system,
+    messages: Array.isArray(request.messages) ? request.messages : [],
+    tools: request.tools,
+    functions: request.functions,
+    response_format: request.response_format,
+    tool_choice: request.tool_choice,
+    function_call: request.function_call,
+    parallel_tool_calls: request.parallel_tool_calls,
+  };
+  const serialized = JSON.stringify(tokenizedRequest);
+  const messages = tokenizedRequest.messages as unknown[];
+  const tools = Array.isArray(tokenizedRequest.tools) ? tokenizedRequest.tools : [];
+  const functions = Array.isArray(tokenizedRequest.functions) ? tokenizedRequest.functions : [];
+  return Buffer.byteLength(serialized, "utf8")
+    + Math.max(32, messages.length * 16)
+    + (tools.length + functions.length) * 16;
+}
+
 export function conservativeEmbeddingInputTokenUpperBound(input: unknown): number {
   return Buffer.byteLength(JSON.stringify(input ?? ""), "utf8") + 16;
 }

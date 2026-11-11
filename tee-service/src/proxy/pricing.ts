@@ -5,6 +5,7 @@ export interface PricingOverride {
   readonly cachedInputPerMillion?: number;
   readonly cacheWritePerMillion?: number;
   readonly reasoningPerMillion?: number;
+  readonly requestFeeUsd?: number;
 }
 
 export interface PricingRate {
@@ -13,6 +14,9 @@ export interface PricingRate {
   readonly cachedInputPerMillion?: number;
   readonly cacheWritePerMillion?: number;
   readonly reasoningPerMillion?: number;
+  readonly requestFeeUsd?: number;
+  readonly maxOutputTokens?: number;
+  readonly contextLength?: number;
   readonly overrides?: readonly PricingOverride[];
 }
 
@@ -22,6 +26,11 @@ function finiteNonNegative(value: unknown, label: string): number {
   const parsed = typeof value === "number" ? value : Number.parseFloat(String(value ?? ""));
   if (!Number.isFinite(parsed) || parsed < 0) throw new Error(`Invalid ${label} price from provider catalogue`);
   return parsed;
+}
+
+function optionalPositiveInteger(value: unknown): number | undefined {
+  const parsed = Number(value);
+  return Number.isFinite(parsed) && parsed >= 1 ? Math.floor(parsed) : undefined;
 }
 
 /**
@@ -59,6 +68,13 @@ export function openRouterPricingFromModels(
     const reasoningPerMillion = reasoning === undefined || reasoning === null || reasoning === ""
       ? outputPerMillion
       : finiteNonNegative(reasoning, `${model} internal reasoning`) * 1_000_000;
+    const contextLength = optionalPositiveInteger(row.context_length);
+    const maxOutputTokens = optionalPositiveInteger(
+      row.top_provider?.max_completion_tokens ?? row.max_completion_tokens ?? contextLength
+    );
+    const requestFeeUsd = pricing.request === undefined || pricing.request === null || pricing.request === ""
+      ? undefined
+      : finiteNonNegative(pricing.request, `${model} request`);
     const overrides = Array.isArray(pricing.overrides)
       ? pricing.overrides
           .map((override: any): PricingOverride | null => {
@@ -86,6 +102,9 @@ export function openRouterPricingFromModels(
       cachedInputPerMillion,
       cacheWritePerMillion,
       reasoningPerMillion,
+      ...(requestFeeUsd !== undefined ? { requestFeeUsd } : {}),
+      ...(maxOutputTokens ? { maxOutputTokens } : {}),
+      ...(contextLength ? { contextLength } : {}),
       ...(overrides.length ? { overrides: Object.freeze(overrides) } : {}),
     });
   }
@@ -100,22 +119,22 @@ export function openRouterPricingFromModels(
  * active deal's accounting.
  */
 export const PRICING_TABLE: LockedPricingTable = Object.freeze({
-  "gpt-4o": Object.freeze({ inputPerMillion: 2.5, outputPerMillion: 10, cachedInputPerMillion: 1.25 }),
-  "gpt-4o-mini": Object.freeze({ inputPerMillion: 0.15, outputPerMillion: 0.6, cachedInputPerMillion: 0.075 }),
-  "text-embedding-3-small": Object.freeze({ inputPerMillion: 0.02, outputPerMillion: 0 }),
-  "text-embedding-3-large": Object.freeze({ inputPerMillion: 0.13, outputPerMillion: 0 }),
-  "claude-3-5-sonnet": Object.freeze({ inputPerMillion: 3, outputPerMillion: 15, cachedInputPerMillion: 0.3 }),
-  "claude-3-5-sonnet-20241022": Object.freeze({ inputPerMillion: 3, outputPerMillion: 15, cachedInputPerMillion: 0.3 }),
-  "claude-3-5-haiku": Object.freeze({ inputPerMillion: 0.8, outputPerMillion: 4, cachedInputPerMillion: 0.08 }),
-  "claude-3-5-haiku-20241022": Object.freeze({ inputPerMillion: 0.8, outputPerMillion: 4, cachedInputPerMillion: 0.08 }),
-  "claude-sonnet-4-6": Object.freeze({ inputPerMillion: 3, outputPerMillion: 15, cachedInputPerMillion: 0.3 }),
-  "anthropic/claude-sonnet-4.6": Object.freeze({ inputPerMillion: 3, outputPerMillion: 15, cachedInputPerMillion: 0.3 }),
-  "openai/gpt-4o": Object.freeze({ inputPerMillion: 2.5, outputPerMillion: 10, cachedInputPerMillion: 1.25 }),
-  "openai/gpt-4o-mini": Object.freeze({ inputPerMillion: 0.15, outputPerMillion: 0.6, cachedInputPerMillion: 0.075 }),
-  "meta-llama/llama-3-70b": Object.freeze({ inputPerMillion: 0.59, outputPerMillion: 0.79 }),
-  "meta-llama/llama-3.2-1b-instruct": Object.freeze({ inputPerMillion: 0.04, outputPerMillion: 0.16 }),
-  "meta-llama/llama-3.2-1b": Object.freeze({ inputPerMillion: 0.04, outputPerMillion: 0.16 }),
-  "meta-llama/llama-3.2-3b-instruct": Object.freeze({ inputPerMillion: 0.06, outputPerMillion: 0.24 }),
+  "gpt-4o": Object.freeze({ inputPerMillion: 2.5, outputPerMillion: 10, cachedInputPerMillion: 1.25, maxOutputTokens: 16_384, contextLength: 128_000 }),
+  "gpt-4o-mini": Object.freeze({ inputPerMillion: 0.15, outputPerMillion: 0.6, cachedInputPerMillion: 0.075, maxOutputTokens: 16_384, contextLength: 128_000 }),
+  "text-embedding-3-small": Object.freeze({ inputPerMillion: 0.02, outputPerMillion: 0, maxOutputTokens: 1, contextLength: 8_191 }),
+  "text-embedding-3-large": Object.freeze({ inputPerMillion: 0.13, outputPerMillion: 0, maxOutputTokens: 1, contextLength: 8_191 }),
+  "claude-3-5-sonnet": Object.freeze({ inputPerMillion: 3, outputPerMillion: 15, cachedInputPerMillion: 0.3, maxOutputTokens: 8_192, contextLength: 200_000 }),
+  "claude-3-5-sonnet-20241022": Object.freeze({ inputPerMillion: 3, outputPerMillion: 15, cachedInputPerMillion: 0.3, maxOutputTokens: 8_192, contextLength: 200_000 }),
+  "claude-3-5-haiku": Object.freeze({ inputPerMillion: 0.8, outputPerMillion: 4, cachedInputPerMillion: 0.08, maxOutputTokens: 8_192, contextLength: 200_000 }),
+  "claude-3-5-haiku-20241022": Object.freeze({ inputPerMillion: 0.8, outputPerMillion: 4, cachedInputPerMillion: 0.08, maxOutputTokens: 8_192, contextLength: 200_000 }),
+  "claude-sonnet-4-6": Object.freeze({ inputPerMillion: 3, outputPerMillion: 15, cachedInputPerMillion: 0.3, maxOutputTokens: 64_000, contextLength: 200_000 }),
+  "anthropic/claude-sonnet-4.6": Object.freeze({ inputPerMillion: 3, outputPerMillion: 15, cachedInputPerMillion: 0.3, maxOutputTokens: 64_000, contextLength: 200_000 }),
+  "openai/gpt-4o": Object.freeze({ inputPerMillion: 2.5, outputPerMillion: 10, cachedInputPerMillion: 1.25, maxOutputTokens: 16_384, contextLength: 128_000 }),
+  "openai/gpt-4o-mini": Object.freeze({ inputPerMillion: 0.15, outputPerMillion: 0.6, cachedInputPerMillion: 0.075, maxOutputTokens: 16_384, contextLength: 128_000 }),
+  "meta-llama/llama-3-70b": Object.freeze({ inputPerMillion: 0.59, outputPerMillion: 0.79, maxOutputTokens: 8_192, contextLength: 8_192 }),
+  "meta-llama/llama-3.2-1b-instruct": Object.freeze({ inputPerMillion: 0.04, outputPerMillion: 0.16, maxOutputTokens: 131_072, contextLength: 131_072 }),
+  "meta-llama/llama-3.2-1b": Object.freeze({ inputPerMillion: 0.04, outputPerMillion: 0.16, maxOutputTokens: 131_072, contextLength: 131_072 }),
+  "meta-llama/llama-3.2-3b-instruct": Object.freeze({ inputPerMillion: 0.06, outputPerMillion: 0.24, maxOutputTokens: 131_072, contextLength: 131_072 }),
 });
 
 export interface UsageCalculation {
@@ -124,6 +143,7 @@ export interface UsageCalculation {
   cachedTokens: number;
   cacheWriteTokens: number;
   reasoningTokens: number;
+  requestFeeUsd: number;
   costUsd: number;
 }
 
@@ -192,7 +212,8 @@ export function calculateWorstCaseCost(
     rate.cacheWritePerMillion ?? rate.inputPerMillion
   );
   const outputRate = Math.max(rate.outputPerMillion, rate.reasoningPerMillion ?? rate.outputPerMillion);
-  return (Math.max(0, Math.floor(inputTokens)) * inputRate + Math.max(0, Math.floor(outputTokens)) * outputRate) / 1_000_000;
+  return (Math.max(0, Math.floor(inputTokens)) * inputRate + Math.max(0, Math.floor(outputTokens)) * outputRate) / 1_000_000
+    + (rate.requestFeeUsd || 0);
 }
 
 export function calculateCost(
@@ -231,6 +252,7 @@ export function calculateCost(
     cachedTokens: safeCached,
     cacheWriteTokens: safeCacheWrite,
     reasoningTokens: safeReasoning,
-    costUsd: inputCost + cachedCost + cacheWriteCost + outputCost + reasoningCost,
+    requestFeeUsd: rate.requestFeeUsd || 0,
+    costUsd: inputCost + cachedCost + cacheWriteCost + outputCost + reasoningCost + (rate.requestFeeUsd || 0),
   };
 }

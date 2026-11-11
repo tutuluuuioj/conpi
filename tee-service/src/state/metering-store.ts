@@ -20,6 +20,7 @@ export interface UsageReceipt {
   cachedTokens: number;
   cacheWriteTokens?: number;
   reasoningTokens?: number;
+  requestFeeUsd?: number;
   costUsd: number;
   cumulativeUsedUsd: number;
   source: UsageCostSource;
@@ -184,6 +185,7 @@ class MeteringStateStore {
       finiteNonNegative(receipt.cachedTokens, "receipt cached tokens");
       if (receipt.cacheWriteTokens !== undefined) finiteNonNegative(receipt.cacheWriteTokens, "receipt cache write tokens");
       if (receipt.reasoningTokens !== undefined) finiteNonNegative(receipt.reasoningTokens, "receipt reasoning tokens");
+      if (receipt.requestFeeUsd !== undefined) finiteNonNegative(receipt.requestFeeUsd, "receipt request fee");
       finiteNonNegative(receipt.costUsd, "receipt cost");
       finiteNonNegative(receipt.cumulativeUsedUsd, "receipt cumulative usage");
       receiptTokensTotal += receipt.inputTokens + receipt.outputTokens;

@@ -9,14 +9,22 @@ import { calculateCost, openRouterPricingFromModels } from "../src/proxy/pricing
 import { proxyRateLimiter } from "../src/proxy/rate-limit.js";
 import {
   classifyProviderError,
+  accumulateUsedUsd,
   computeAffordableOutputTokens,
   extractProviderErrorCode,
+  fetchWithTransientBackoff,
+  modelOutputTokenLimit,
   requestWithProviderUsage,
+  reconcilePendingUsage,
   resolveMeteredCostUsd,
+  stagePendingUsage,
   validatePricedOpenRouterRequest,
 } from "../src/proxy/server.js";
-import { countChatInputTokens, countEmbeddingInputTokens } from "../src/proxy/tokenizer.js";
+import { conservativeChatRequestTokenUpperBound, countChatInputTokens, countEmbeddingInputTokens } from "../src/proxy/tokenizer.js";
 import { enclaveKeys } from "../src/crypto/keys.js";
+import { privateKeyToAccount } from "viem/accounts";
+import { buildSellerKeyAuthorizationMessage, canonicalSellerAccount } from "../src/auth/seller-key.js";
+import { meteringStateStore } from "../src/state/metering-store.js";
 
 function assert(condition: unknown, message: string): asserts condition {
   if (!condition) throw new Error(message);
@@ -55,6 +63,7 @@ async function runPhase3Tests() {
   assert(Object.isFrozen(entry.lockedPricing["gpt-4o"]), "Locked model rate must be immutable");
   const priced = calculateCost("gpt-4o", 1_000, 500, 0, entry.lockedPricing);
   assert(Math.abs(priced.costUsd - 0.0075) < 1e-12, "Locked price calculation is incorrect");
+  assert(Math.abs(accumulateUsedUsd(0.049, 0.003) - 0.052) < 1e-12, "Meter hid real usage above the deal credit cap");
   assert(
     Math.abs(resolveMeteredCostUsd("OpenRouter", 0.05, 0.0251) - 0.05) < 1e-12,
     "Delayed OpenRouter spend was allowed to override locked-price accounting"
@@ -85,6 +94,7 @@ async function runPhase3Tests() {
     pricing: {
       prompt: "0.000001",
       completion: "0.000002",
+      request: "0.0007",
       input_cache_read: "0.0000001",
       input_cache_write: "0.00000125",
       internal_reasoning: "0.000003",
@@ -92,14 +102,29 @@ async function runPhase3Tests() {
     },
   }]);
   const complexUsage = calculateCost("model/tiered", 1_100, 100, 100, complexSnapshot, { cacheWriteTokens: 200, reasoningTokens: 20 });
-  const complexExpected = (800 * 4 + 100 * 0.1 + 200 * 1.25 + 80 * 5 + 20 * 3) / 1_000_000;
+  const complexExpected = (800 * 4 + 100 * 0.1 + 200 * 1.25 + 80 * 5 + 20 * 3) / 1_000_000 + 0.0007;
   assert(Math.abs(complexUsage.costUsd - complexExpected) < 1e-12, "Tier/cache/reasoning pricing was not calculated locally");
+  assert(complexUsage.requestFeeUsd === 0.0007, "Catalogue per-request fee was not billed by local accounting");
 
   console.log("[P3-2] Production tokenizer fallbacks...");
   const chatTokens = countChatInputTokens("OpenAI", "gpt-4o", [{ role: "user", content: "Tokenize this exact request." }]);
   const embeddingTokens = countEmbeddingInputTokens("OpenAI", "text-embedding-3-small", ["alpha", "beta"]);
   assert(chatTokens > 5, "Chat tokenizer returned an implausible token count");
   assert(embeddingTokens >= 2, "Embedding tokenizer returned an implausible token count");
+  const toolHeavyRequest = {
+    messages: [{ role: "user", content: "hi" }],
+    tools: Array.from({ length: 200 }, (_, index) => ({
+      type: "function",
+      function: {
+        name: `large_tool_${index}`,
+        description: "x".repeat(220),
+        parameters: { type: "object", properties: { payload: { type: "string", description: "y".repeat(120) } } },
+      },
+    })),
+    response_format: { type: "json_schema", json_schema: { name: "answer", schema: { type: "object", properties: { result: { type: "string" } } } } },
+  };
+  const toolReservation = conservativeChatRequestTokenUpperBound(toolHeavyRequest);
+  assert(toolReservation > 80_000, `Tool-heavy request was under-reserved at ${toolReservation} tokens`);
 
   console.log("[P3-3] Proxy authentication, allowlist, and model discovery...");
   const unauthModels = await app.inject({ method: "GET", url: "/v1/models" });
@@ -359,7 +384,7 @@ async function runPhase3Tests() {
       model: "claude-sonnet-4-6",
       content: [{ type: "text", text: "Anthropic adapter verified" }],
       stop_reason: "end_turn",
-      usage: { input_tokens: 9, output_tokens: 4 },
+      usage: { input_tokens: 9, cache_read_input_tokens: 3, cache_creation_input_tokens: 2, output_tokens: 4 },
     }), { status: 200, headers: { "content-type": "application/json" } });
   }) as typeof fetch;
   const anthropicAuth = { authorization: `Bearer ${anthropicResult.proxyKey}` };
@@ -370,6 +395,8 @@ async function runPhase3Tests() {
     payload: { model: "claude-sonnet-4-6", max_tokens: 16, messages: [{ role: "user", content: "native request" }] },
   });
   assert(nativeAnthropic.statusCode === 200 && JSON.parse(nativeAnthropic.body).type === "message", `Native Anthropic request failed: ${nativeAnthropic.body}`);
+  const anthropicReceipt = anthropicEntry.usageReceipts.at(-1);
+  assert(anthropicReceipt?.inputTokens === 14 && anthropicReceipt.cachedTokens === 3 && anthropicReceipt.cacheWriteTokens === 2, "Direct Anthropic cache tokens were not billed by category");
   const adaptedAnthropic = await app.inject({
     method: "POST",
     url: "/v1/chat/completions",
@@ -412,6 +439,14 @@ async function runPhase3Tests() {
   assert(websocketMessages.some((message) => message.type === "meter.update"), "WebSocket meter update missing");
 
   console.log("[P3-12] Dynamic upstream token budget clamping...");
+  assert(modelOutputTokenLimit(entry, "gpt-4o", 100) === 16_384, "Model output ceiling was not locked to the selected model");
+  const multipleChoices = await app.inject({
+    method: "POST",
+    url: "/v1/chat/completions",
+    headers: auth,
+    payload: { model: "gpt-4o", n: 2, messages: [{ role: "user", content: "two answers" }] },
+  });
+  assert(multipleChoices.statusCode === 400 && multipleChoices.body.includes("multiple_choices_not_supported"), "n > 1 was not rejected");
   const mockEntry: any = {
     creditUsd: 0.05,
     usedUsd: 0.049, // $0.001 remaining
@@ -454,33 +489,162 @@ async function runPhase3Tests() {
   assert(clampingResponse.statusCode === 200, `Clamping request failed: ${clampingResponse.body}`);
   assert(interceptedForwardedBody?.max_tokens !== undefined, "Upstream request omitted max_tokens");
   assert(interceptedForwardedBody.max_tokens <= 5_000, `Expected clamped max_tokens <= 5000, got ${interceptedForwardedBody.max_tokens}`);
+  const timeoutFetch = globalThis.fetch;
+  globalThis.fetch = ((_url: string | URL | Request, init?: RequestInit) => new Promise((_resolve, reject) => {
+    init?.signal?.addEventListener("abort", () => reject(new Error("upstream timeout observed")), { once: true });
+  })) as typeof fetch;
+  let timeoutObserved = false;
+  try {
+    await fetchWithTransientBackoff("https://provider.invalid/test", { method: "POST" }, 20);
+  } catch (error: any) {
+    timeoutObserved = /timeout/i.test(error?.message || "");
+  } finally {
+    globalThis.fetch = timeoutFetch;
+  }
+  assert(timeoutObserved, "Upstream fetch did not enforce its timeout");
+
+  const savedKeyForAmbiguousFailure = entry.apiKey;
+  const usedBeforeAmbiguousFailure = entry.usedUsd;
+  entry.apiKey = "sk-real-shape-for-ambiguous-failure";
+  globalThis.fetch = (async () => { throw new Error("stream disconnected after upstream accepted request"); }) as typeof fetch;
+  const ambiguousFailure = await app.inject({
+    method: "POST",
+    url: "/v1/chat/completions",
+    headers: auth,
+    payload: { model: "gpt-4o", max_tokens: 4, messages: [{ role: "user", content: "ambiguous failure" }] },
+  });
+  globalThis.fetch = timeoutFetch;
+  entry.apiKey = savedKeyForAmbiguousFailure;
+  assert(ambiguousFailure.statusCode === 502, "Ambiguous upstream failure did not return a proxy error");
+  assert(entry.usedUsd > usedBeforeAmbiguousFailure, "Ambiguous upstream failure was not charged from its durable reservation");
+  assert(entry.pendingUsage === null && entry.usageReceipts.at(-1)?.source === "locked_pricing_reserved", "Ambiguous charge reservation was not settled exactly once");
+
+  console.log("[P3-12b] Crash-safe pending charge reservation...");
+  const crashEntry: any = {
+    ...entry,
+    dealId: 3901,
+    proxyKey: "cpk_live_crash_recovery_test",
+    usedUsd: 0,
+    tokensTotal: 0,
+    creditUsd: 100,
+    usageReceipts: [],
+    processedGenerationIds: [],
+    pendingUsage: null,
+    requestInFlight: false,
+    active: true,
+    signedPayloads: [],
+    relayReceipts: [],
+  };
+  stagePendingUsage(crashEntry, "gpt-4o", toolReservation, 64);
+  const persistedPending = meteringStateStore.load(crashEntry.dealId, crashEntry.termsHashHex);
+  assert(persistedPending?.pendingUsage?.inputTokens === toolReservation, "Pending charge was not durably written before upstream execution");
+  const recoveredEntry: any = {
+    ...crashEntry,
+    usedUsd: persistedPending.usedUsd,
+    tokensTotal: persistedPending.tokensTotal,
+    usageReceipts: persistedPending.usageReceipts,
+    processedGenerationIds: persistedPending.processedGenerationIds,
+    pendingUsage: persistedPending.pendingUsage,
+  };
+  const recoveredUsage = await reconcilePendingUsage(recoveredEntry);
+  assert(Boolean(recoveredUsage) && recoveredEntry.usedUsd > 0, "Restart recovery did not commit the pending charge");
+  assert(recoveredEntry.pendingUsage === null, "Recovered pending charge was not settled");
+  assert(recoveredEntry.usageReceipts[0]?.source === "locked_pricing_reserved", "Recovered charge was not marked as a reservation fallback");
 
   console.log("[P3-13] TEE relays activation for non-NEAR wallets...");
   const originalIsConfigured = nearRelayer.isConfigured.bind(nearRelayer);
   const originalSubmitActivate = nearRelayer.submitActivate.bind(nearRelayer);
+  const originalGetDeal = nearRelayer.getDeal.bind(nearRelayer);
   let relayedActivation: any = null;
+  const sellerAccount = privateKeyToAccount(`0x${"34".repeat(32)}`);
+  const seller = canonicalSellerAccount("base", sellerAccount.address);
+  let mockDealStatus = "Created";
+  (nearRelayer as any).getDeal = async (dealId: number) => ({
+    id: dealId,
+    seller,
+    status: mockDealStatus,
+    token: "usdc.testnet",
+    credit_amount: "100000000",
+    price: "80000000",
+    terms_hash: Array.from(Buffer.from("11".repeat(32), "hex")),
+    last_nonce: 0,
+    stage_reached: 0,
+  });
   (nearRelayer as any).isConfigured = () => true;
   (nearRelayer as any).submitActivate = async (dealId: number, payload: any, signatureHex: string) => {
     relayedActivation = { dealId, payload, signatureHex };
     return { transactionHash: "tee-relayed-activation-tx", status: { SuccessValue: "" } };
   };
+  const keyPayload: any = {
+    provider: "OpenAI",
+    model: "gpt-4o",
+    models: ["gpt-4o"],
+    termsHashHex: "11".repeat(32),
+    plainApiKey: "mock_foreign_wallet_activation_key",
+  };
+  const sellerAuthorization: any = {
+    chain: "base",
+    address: sellerAccount.address,
+    nonce: Buffer.alloc(32, 9).toString("base64"),
+    issuedAtMs: Date.now(),
+    signature: "",
+  };
+  sellerAuthorization.signature = await sellerAccount.signMessage({
+    message: buildSellerKeyAuthorizationMessage({
+      dealId: 3004,
+      seller,
+      ...keyPayload,
+      authorization: sellerAuthorization,
+    }),
+  });
+  keyPayload.sellerAuthorization = sellerAuthorization;
+
+  const unsignedResponse = await app.inject({
+    method: "POST",
+    url: "/v1/deals/3004/key",
+    payload: { ...keyPayload, sellerAuthorization: undefined },
+  });
+  assert(unsignedResponse.statusCode === 401, "Unsigned provider-key injection was not rejected");
+
+  const unfundedResponse = await app.inject({ method: "POST", url: "/v1/deals/3004/key", payload: keyPayload });
+  assert(unfundedResponse.statusCode === 409 && unfundedResponse.body.includes("only be submitted for funded deals"), "Created deal was allowed to inject a key");
+  mockDealStatus = "Funded";
+
   const relayedResponse = await app.inject({
     method: "POST",
     url: "/v1/deals/3004/key",
-    payload: {
-      provider: "OpenAI",
-      model: "gpt-4o",
-      models: ["gpt-4o"],
-      termsHashHex: "11".repeat(32),
-      plainApiKey: "mock_foreign_wallet_activation_key",
-    },
+    payload: keyPayload,
   });
-  (nearRelayer as any).isConfigured = originalIsConfigured;
-  (nearRelayer as any).submitActivate = originalSubmitActivate;
   const relayedBody = JSON.parse(relayedResponse.body);
   assert(relayedResponse.statusCode === 200, `TEE activation relay failed: ${relayedResponse.body}`);
   assert(relayedBody.activationRelayed === true && relayedBody.activationTxHash === "tee-relayed-activation-tx", "TEE activation transaction was not returned to the foreign-wallet client");
   assert(relayedActivation?.dealId === 3004 && relayedActivation?.signatureHex, "TEE-signed activation payload was not sent through the NEAR relayer");
+
+  const activeEntry = keyVault.getByDealId(3004)!;
+  const originalProviderKey = activeEntry.apiKey;
+  const replacementPayload: any = { ...keyPayload, plainApiKey: "mock_attacker_replacement_key" };
+  const replacementAuthorization: any = {
+    ...sellerAuthorization,
+    nonce: Buffer.alloc(32, 10).toString("base64"),
+    issuedAtMs: Date.now(),
+    signature: "",
+  };
+  replacementAuthorization.signature = await sellerAccount.signMessage({
+    message: buildSellerKeyAuthorizationMessage({
+      dealId: 3004,
+      seller,
+      ...replacementPayload,
+      authorization: replacementAuthorization,
+    }),
+  });
+  replacementPayload.sellerAuthorization = replacementAuthorization;
+  const replacementResponse = await app.inject({ method: "POST", url: "/v1/deals/3004/key", payload: replacementPayload });
+  assert(replacementResponse.statusCode === 409, "An active deal allowed its provider key to be replaced");
+  assert(activeEntry.apiKey === originalProviderKey, "The active deal vault entry was overwritten");
+
+  (nearRelayer as any).isConfigured = originalIsConfigured;
+  (nearRelayer as any).submitActivate = originalSubmitActivate;
+  (nearRelayer as any).getDeal = originalGetDeal;
 
   await app.close();
 
