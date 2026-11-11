@@ -5,7 +5,11 @@ import { CONFIG } from "../config.js";
 import { enclaveKeys } from "../crypto/keys.js";
 import type { LockedPricingTable } from "../proxy/pricing.js";
 
-export type UsageCostSource = "openrouter_usage" | "openrouter_generation" | "locked_pricing";
+export type UsageCostSource =
+  | "openrouter_usage"
+  | "openrouter_generation"
+  | "locked_pricing"
+  | "locked_pricing_reserved";
 
 export interface UsageReceipt {
   sequence: number;
@@ -14,6 +18,8 @@ export interface UsageReceipt {
   inputTokens: number;
   outputTokens: number;
   cachedTokens: number;
+  cacheWriteTokens?: number;
+  reasoningTokens?: number;
   costUsd: number;
   cumulativeUsedUsd: number;
   source: UsageCostSource;
@@ -29,6 +35,8 @@ export interface PendingUsage {
   inputTokens: number;
   outputTokens: number;
   cachedTokens: number;
+  cacheWriteTokens?: number;
+  reasoningTokens?: number;
   providerCost: number | null;
   createdAt: string;
   attempts: number;
@@ -174,6 +182,8 @@ class MeteringStateStore {
       finiteNonNegative(receipt.inputTokens, "receipt input tokens");
       finiteNonNegative(receipt.outputTokens, "receipt output tokens");
       finiteNonNegative(receipt.cachedTokens, "receipt cached tokens");
+      if (receipt.cacheWriteTokens !== undefined) finiteNonNegative(receipt.cacheWriteTokens, "receipt cache write tokens");
+      if (receipt.reasoningTokens !== undefined) finiteNonNegative(receipt.reasoningTokens, "receipt reasoning tokens");
       finiteNonNegative(receipt.costUsd, "receipt cost");
       finiteNonNegative(receipt.cumulativeUsedUsd, "receipt cumulative usage");
       receiptTokensTotal += receipt.inputTokens + receipt.outputTokens;
@@ -199,6 +209,8 @@ class MeteringStateStore {
       finiteNonNegative(state.pendingUsage.inputTokens, "pending input tokens");
       finiteNonNegative(state.pendingUsage.outputTokens, "pending output tokens");
       finiteNonNegative(state.pendingUsage.cachedTokens, "pending cached tokens");
+      if (state.pendingUsage.cacheWriteTokens !== undefined) finiteNonNegative(state.pendingUsage.cacheWriteTokens, "pending cache write tokens");
+      if (state.pendingUsage.reasoningTokens !== undefined) finiteNonNegative(state.pendingUsage.reasoningTokens, "pending reasoning tokens");
       finiteNonNegative(state.pendingUsage.attempts, "pending reconciliation attempts");
       if (state.pendingUsage.providerCost !== null) finiteNonNegative(state.pendingUsage.providerCost, "pending provider cost");
     }

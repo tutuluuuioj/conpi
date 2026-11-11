@@ -5,7 +5,7 @@ import { buildApp } from "../src/index.js";
 import { nearRelayer } from "../src/chain/relayer.js";
 import { keyVault } from "../src/vault/preflight.js";
 import { meterEvents } from "../src/proxy/events.js";
-import { calculateCost } from "../src/proxy/pricing.js";
+import { calculateCost, openRouterPricingFromModels } from "../src/proxy/pricing.js";
 import { proxyRateLimiter } from "../src/proxy/rate-limit.js";
 import {
   classifyProviderError,
@@ -13,7 +13,6 @@ import {
   extractProviderErrorCode,
   requestWithProviderUsage,
   resolveMeteredCostUsd,
-  resolveOpenRouterCost,
   validatePricedOpenRouterRequest,
 } from "../src/proxy/server.js";
 import { countChatInputTokens, countEmbeddingInputTokens } from "../src/proxy/tokenizer.js";
@@ -57,15 +56,15 @@ async function runPhase3Tests() {
   const priced = calculateCost("gpt-4o", 1_000, 500, 0, entry.lockedPricing);
   assert(Math.abs(priced.costUsd - 0.0075) < 1e-12, "Locked price calculation is incorrect");
   assert(
-    Math.abs(resolveMeteredCostUsd("OpenRouter", 0.05, 0.0251) - 0.0251) < 1e-12,
-    "OpenRouter authoritative usage.cost was not used"
+    Math.abs(resolveMeteredCostUsd("OpenRouter", 0.05, 0.0251) - 0.05) < 1e-12,
+    "Delayed OpenRouter spend was allowed to override locked-price accounting"
   );
   assert(
     Math.abs(resolveMeteredCostUsd("OpenAI", 0.05, 0.0251) - 0.05) < 1e-12,
     "A non-OpenRouter provider was allowed to override locked-price accounting"
   );
   const openRouterBody = requestWithProviderUsage({ model: "z-ai/glm-5.3-flash", stream: true }, "openrouter");
-  assert(openRouterBody.usage?.include === true, "OpenRouter requests must require authoritative cost metadata");
+  assert(openRouterBody.usage?.include === true, "OpenRouter requests must request immediate token metadata");
   assert(openRouterBody.stream_options?.include_usage === true, "OpenRouter streams must include their final usage chunk");
   const priceCappedBody = requestWithProviderUsage(
     { model: "z-ai/glm-5.3-flash", provider: { max_price: { prompt: 99, completion: 0.25 } } },
@@ -74,15 +73,27 @@ async function runPhase3Tests() {
   );
   assert(priceCappedBody.provider.max_price.prompt === 0.15, "Locked prompt price ceiling was not enforced");
   assert(priceCappedBody.provider.max_price.completion === 0.25, "A stricter buyer completion ceiling was not preserved");
-  let missingCostRejected = false;
-  try { resolveMeteredCostUsd("OpenRouter", 0.05, undefined); } catch { missingCostRejected = true; }
-  assert(missingCostRejected, "OpenRouter missing-cost responses must never use an estimate");
-  const directCost = await resolveOpenRouterCost("sk-or-test", 0.0251, "gen-direct", {
-    fetchImpl: (async () => { throw new Error("Direct cost must not perform a lookup"); }) as typeof fetch,
-  });
-  assert(directCost.costUsd === 0.0251 && directCost.source === "openrouter_usage", "Direct OpenRouter cost resolution failed");
+  assert(resolveMeteredCostUsd("OpenRouter", 0.05, undefined) === 0.05, "Missing provider cost changed deterministic local billing");
   assert(validatePricedOpenRouterRequest({ model: "x", plugins: [{ id: "web" }] }) === "plugins", "Unpriced OpenRouter plugins were accepted");
   assert(validatePricedOpenRouterRequest({ model: "x", models: ["x", "y"] }) === "model_fallbacks", "Alternate model routing was accepted");
+  assert(
+    validatePricedOpenRouterRequest({ model: "x", messages: [{ role: "user", content: [{ type: "image_url", image_url: { url: "x" } }] }] }) === "non_text_content",
+    "Unpriced non-text message content was accepted"
+  );
+  const complexSnapshot = openRouterPricingFromModels(["model/tiered"], [{
+    id: "model/tiered",
+    pricing: {
+      prompt: "0.000001",
+      completion: "0.000002",
+      input_cache_read: "0.0000001",
+      input_cache_write: "0.00000125",
+      internal_reasoning: "0.000003",
+      overrides: [{ min_prompt_tokens: 1000, prompt: "0.000004", completion: "0.000005" }],
+    },
+  }]);
+  const complexUsage = calculateCost("model/tiered", 1_100, 100, 100, complexSnapshot, { cacheWriteTokens: 200, reasoningTokens: 20 });
+  const complexExpected = (800 * 4 + 100 * 0.1 + 200 * 1.25 + 80 * 5 + 20 * 3) / 1_000_000;
+  assert(Math.abs(complexUsage.costUsd - complexExpected) < 1e-12, "Tier/cache/reasoning pricing was not calculated locally");
 
   console.log("[P3-2] Production tokenizer fallbacks...");
   const chatTokens = countChatInputTokens("OpenAI", "gpt-4o", [{ role: "user", content: "Tokenize this exact request." }]);
@@ -208,19 +219,30 @@ async function runPhase3Tests() {
   );
   assert(fallbackResponse.statusCode === 200, `Tokenizer fallback request failed: ${fallbackResponse.body}`);
   assert(fallbackBody.usage?.prompt_tokens > 0 && fallbackBody.usage?.completion_tokens > 0, "Tokenizer fallback did not synthesize usage");
-  assert(fallbackBody.usage?.conpi_usage_source === "tokenizer", "Tokenizer fallback was not identified in the metered response");
+  assert(
+    fallbackBody.usage?.conpi_usage_source === "locked_pricing_reserved",
+    "Missing provider usage was not charged from the fail-safe reservation"
+  );
   assert(Math.abs(fallbackBody.usage.conpi_cost_usd - fallbackExpected.costUsd) < 1e-12, "Tokenizer fallback was not charged against the locked table");
+  assert(entry.usageReceipts.at(-1)?.source === "locked_pricing_reserved", "Reserved fallback provenance was not written to the signed ledger");
+
+  const malformedLimit = await app.inject({
+    method: "POST",
+    url: "/v1/chat/completions",
+    headers: auth,
+    payload: { model: "gpt-4o", max_tokens: "not-a-number", messages: [{ role: "user", content: "reject malformed limit" }] },
+  });
+  assert(malformedLimit.statusCode === 400 && malformedLimit.body.includes("invalid_request"), "Malformed max_tokens bypassed the budget reservation");
 
   const savedProvider = entry.provider;
   entry.provider = "OpenRouter";
   entry.apiKey = "sk-or-v1-provider-shape-for-fetch-stub";
   let forwardedOpenRouterBody: any;
+  let generationLookups = 0;
   globalThis.fetch = (async (url: string | URL | Request, init?: RequestInit) => {
     if (String(url).includes("/generation?")) {
-      return new Response(JSON.stringify({ data: { id: "gen-reconcile", total_cost: 0.000321 } }), {
-        status: 200,
-        headers: { "content-type": "application/json" },
-      });
+      generationLookups += 1;
+      throw new Error("Production metering must not poll OpenRouter generation usage");
     }
     forwardedOpenRouterBody = JSON.parse(String(init?.body || "{}"));
     return new Response(JSON.stringify({
@@ -237,14 +259,16 @@ async function runPhase3Tests() {
     payload: { model: "gpt-4o", max_tokens: 4, messages: [{ role: "user", content: "reconcile exact cost" }] },
   });
   const reconciledBody = JSON.parse(reconciled.body);
-  assert(reconciled.statusCode === 200, `Generation cost reconciliation failed: ${reconciled.body}`);
-  assert(Math.abs((entry.usedUsd - beforeReconciled) - 0.000321) < 1e-12, "Reconciled OpenRouter cost did not advance the exact meter amount");
-  assert(reconciledBody.usage?.conpi_usage_source === "openrouter_generation", "Reconciled cost source was not exposed");
-  assert(forwardedOpenRouterBody.usage?.include === true, "OpenRouter authoritative usage was not requested");
+  const expectedLocalCost = calculateCost("gpt-4o", 5, 2, 0, entry.lockedPricing).costUsd;
+  assert(reconciled.statusCode === 200, `Local OpenRouter metering failed: ${reconciled.body}`);
+  assert(Math.abs((entry.usedUsd - beforeReconciled) - expectedLocalCost) < 1e-12, "Locked-price local cost did not advance the meter exactly");
+  assert(reconciledBody.usage?.conpi_usage_source === "locked_pricing", "Local locked-price source was not exposed");
+  assert(generationLookups === 0, "Metering performed a delayed OpenRouter generation lookup");
+  assert(forwardedOpenRouterBody.usage?.include === true, "Immediate OpenRouter token metadata was not requested");
   assert(forwardedOpenRouterBody.provider?.max_price?.prompt === entry.lockedPricing["gpt-4o"].inputPerMillion, "Locked OpenRouter prompt ceiling was not forwarded");
   assert(forwardedOpenRouterBody.provider?.max_price?.completion === entry.lockedPricing["gpt-4o"].outputPerMillion, "Locked OpenRouter completion ceiling was not forwarded");
   const receipt = entry.usageReceipts.at(-1)!;
-  assert(receipt.generationId === "gen-reconcile" && receipt.source === "openrouter_generation", "Signed ledger omitted reconciliation provenance");
+  assert(receipt.generationId === "gen-reconcile" && receipt.source === "locked_pricing", "Signed ledger omitted deterministic local pricing provenance");
   assert(enclaveKeys.verify(Buffer.from(receipt.hash, "hex"), Buffer.from(receipt.signatureHex, "hex")), "TEE usage receipt signature is invalid");
   const receiptsResponse = await app.inject({ method: "GET", url: "/v1/deals/3001/usage-receipts", headers: auth });
   assert(receiptsResponse.statusCode === 200 && JSON.parse(receiptsResponse.body).receipts.length > 0, "Authenticated usage receipt ledger was unavailable");
@@ -298,7 +322,7 @@ async function runPhase3Tests() {
   assert(new Set(responseDefaults.map((item) => item.signatureHex)).size === 1, "In-flight requests did not receive the same default signature");
   assert(new Set(responseDefaults.map((item) => item.payload.nonce)).size === 1, "In-flight requests did not receive the same default nonce");
   assert(defaultPayloads[defaultPayloads.length - 1].payload.reason === 5, "Default payload reason must be SellerSelfDrain");
-  assert(warningRows.length === 5, "Each upstream failure must emit one sanitized diagnostic log");
+  assert(warningRows.length === 1, "Per-deal billing lock did not collapse concurrent upstream failures");
   assert(warningRows.every((row) => row[1]?.status === 402 && row[1]?.code === "402"), "Upstream diagnostics must contain status and error code");
   assert(!JSON.stringify(warningRows).includes("sk-real-shape-for-fetch-stub"), "Upstream diagnostics leaked provider credentials");
   globalThis.fetch = originalFetch;

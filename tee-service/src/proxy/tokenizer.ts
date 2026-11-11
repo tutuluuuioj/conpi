@@ -60,6 +60,22 @@ export function countEmbeddingInputTokens(provider: string, model: string, input
   return countTextTokens(provider, model, contentToText(input));
 }
 
+/**
+ * A byte-level upper bound used only for reserving budget before the provider
+ * request. Modern tokenizers cannot produce more tokens than their UTF-8 byte
+ * fallback plus a small amount of message framing, so this deliberately
+ * over-reserves instead of risking a cross-model tokenizer undercount.
+ */
+export function conservativeChatInputTokenUpperBound(messages: unknown, system?: unknown): number {
+  const rows = Array.isArray(messages) ? messages : [];
+  const serialized = JSON.stringify({ ...(system === undefined ? {} : { system }), messages: rows });
+  return Buffer.byteLength(serialized, "utf8") + Math.max(32, rows.length * 16);
+}
+
+export function conservativeEmbeddingInputTokenUpperBound(input: unknown): number {
+  return Buffer.byteLength(JSON.stringify(input ?? ""), "utf8") + 16;
+}
+
 export function extractText(content: unknown): string {
   return contentToText(content);
 }

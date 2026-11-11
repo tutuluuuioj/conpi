@@ -5,8 +5,11 @@ import { fileURLToPath } from "node:url";
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
-
-const PORT = process.env.PORT || 4000;
+const PORT = Number(process.env.PORT || 4000);
+const TEE_BASE_URL = (
+  process.env.TEE_BASE_URL ||
+  "https://b1b35377079ac7b7937afc607481587bc6d22665-3000.dstack-pha-prod9.phala.network"
+).replace(/\/$/, "");
 
 const MIME_TYPES = {
   ".html": "text/html; charset=utf-8",
@@ -16,127 +19,108 @@ const MIME_TYPES = {
   ".png": "image/png",
   ".jpg": "image/jpeg",
   ".svg": "image/svg+xml",
-  ".ico": "image/x-icon"
+  ".ico": "image/x-icon",
 };
 
-const server = http.createServer(async (req, res) => {
-  // Disable socket timeouts for long-running AI streams
-  if (req.socket) {
-    req.socket.setTimeout(0);
-    req.socket.setKeepAlive(true, 5000);
-    req.socket.setNoDelay(true);
-  }
-
-  // Global CORS headers
+function cors(res) {
   res.setHeader("Access-Control-Allow-Origin", "*");
   res.setHeader("Access-Control-Allow-Methods", "GET, POST, OPTIONS");
-  res.setHeader("Access-Control-Allow-Headers", "*");
+  res.setHeader("Access-Control-Allow-Headers", "Authorization, Content-Type, X-API-Key");
+}
 
+async function readBody(req) {
+  const chunks = [];
+  for await (const chunk of req) chunks.push(chunk);
+  return Buffer.concat(chunks);
+}
+
+async function relay(req, res, upstreamPath) {
+  const authorization = String(req.headers.authorization || "");
+  const xApiKey = String(req.headers["x-api-key"] || "");
+  const body = req.method === "GET" ? undefined : await readBody(req);
+  const abortController = new AbortController();
+  res.on("close", () => {
+    if (!res.writableEnded) abortController.abort();
+  });
+
+  try {
+    const upstream = await fetch(`${TEE_BASE_URL}${upstreamPath}`, {
+      method: req.method,
+      headers: {
+        ...(authorization ? { Authorization: authorization } : {}),
+        ...(xApiKey ? { "X-API-Key": xApiKey } : {}),
+        ...(body ? { "Content-Type": String(req.headers["content-type"] || "application/json") } : {}),
+      },
+      body,
+      signal: abortController.signal,
+    });
+    res.writeHead(upstream.status, {
+      "Content-Type": upstream.headers.get("content-type") || "application/json",
+      "Cache-Control": upstream.headers.get("cache-control") || "no-store",
+      ...(upstream.headers.get("retry-after") ? { "Retry-After": upstream.headers.get("retry-after") } : {}),
+    });
+    if (!upstream.body) return res.end();
+    const reader = upstream.body.getReader();
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      res.write(value);
+    }
+    res.end();
+  } catch (error) {
+    if (error?.name === "AbortError") return;
+    if (!res.headersSent) res.writeHead(502, { "Content-Type": "application/json" });
+    res.end(JSON.stringify({ error: { message: error?.message || "TEE proxy unavailable", code: "tee_unavailable" } }));
+  }
+}
+
+const server = http.createServer(async (req, res) => {
+  cors(res);
   if (req.method === "OPTIONS") {
     res.writeHead(204);
-    res.end();
-    return;
+    return res.end();
   }
 
-  const reqUrl = req.url.split("?")[0];
-
-  // API Proxy Route: forwards client chat completions to target proxy with proper streaming & CORS
-  if (reqUrl === "/api/proxy") {
-    const targetUrl = req.headers["x-target-url"] || "https://b1b35377079ac7b7937afc607481587bc6d22665-3000.dstack-pha-prod9.phala.network/v1/chat/completions";
-    const authHeader = req.headers["authorization"] || "";
-
-    const chunks = [];
-    for await (const chunk of req) {
-      chunks.push(chunk);
-    }
-    const bodyBuffer = Buffer.concat(chunks);
-
-    const abortController = new AbortController();
-    req.on("close", () => {
-      if (!res.writableEnded) abortController.abort();
-    });
-
-    try {
-      const upstreamRes = await fetch(targetUrl, {
-        method: "POST",
-        headers: {
-          "Content-Type": "application/json",
-          "Authorization": authHeader
-        },
-        body: bodyBuffer,
-        signal: abortController.signal
-      });
-
-      const responseHeaders = {
-        "Access-Control-Allow-Origin": "*",
-        "Content-Type": upstreamRes.headers.get("content-type") || "application/json"
-      };
-
-      if (upstreamRes.headers.get("content-type")?.includes("text/event-stream")) {
-        responseHeaders["Cache-Control"] = "no-cache, no-transform";
-        responseHeaders["Connection"] = "keep-alive";
-      }
-
-      res.writeHead(upstreamRes.status, responseHeaders);
-      if (res.flushHeaders) res.flushHeaders();
-
-      if (upstreamRes.body) {
-        const reader = upstreamRes.body.getReader();
-        while (true) {
-          const { done, value } = await reader.read();
-          if (done) break;
-          res.write(value);
-        }
-      }
-      res.end();
-    } catch (err) {
-      if (err.name !== "AbortError") {
-        console.error("[proxy-error]", err.message);
-        if (!res.headersSent) {
-          res.writeHead(502, { "Content-Type": "application/json" });
-          res.end(JSON.stringify({ error: { message: `Proxy gateway error: ${err.message}` } }));
-        } else {
-          res.end();
-        }
-      }
-    }
-    return;
+  const requestUrl = new URL(req.url || "/", "http://localhost");
+  const pathname = requestUrl.pathname;
+  const meterMatch = pathname.match(/^\/?(?:v1\/)?deals\/(\d+)\/meter$/);
+  if (req.method === "GET" && meterMatch) {
+    return relay(req, res, `/v1/deals/${meterMatch[1]}/meter`);
+  }
+  if (req.method === "POST" && ["/api/proxy", "/v1/chat/completions", "/chat/completions"].includes(pathname)) {
+    return relay(req, res, "/v1/chat/completions");
+  }
+  if (req.method === "POST" && ["/v1/messages", "/messages"].includes(pathname)) {
+    return relay(req, res, "/v1/messages");
+  }
+  if (req.method === "POST" && ["/v1/embeddings", "/embeddings"].includes(pathname)) {
+    return relay(req, res, "/v1/embeddings");
+  }
+  if (req.method === "GET" && ["/v1/models", "/models"].includes(pathname)) {
+    return relay(req, res, "/v1/models");
   }
 
-  // Static files
-  let filePath = path.join(__dirname, reqUrl === "/" ? "index.html" : reqUrl);
-
-  if (!filePath.startsWith(__dirname)) {
+  const requested = pathname === "/" ? "index.html" : pathname.replace(/^\/+/, "");
+  let filePath = path.resolve(__dirname, requested);
+  if (!filePath.startsWith(`${__dirname}${path.sep}`) && filePath !== path.join(__dirname, "index.html")) {
     res.writeHead(403, { "Content-Type": "text/plain" });
-    res.end("Forbidden");
-    return;
+    return res.end("Forbidden");
   }
-
-  fs.stat(filePath, (err, stats) => {
-    if (err || !stats.isFile()) {
-      filePath = path.join(__dirname, "index.html");
+  if (!fs.existsSync(filePath) || !fs.statSync(filePath).isFile()) filePath = path.join(__dirname, "index.html");
+  fs.readFile(filePath, (error, data) => {
+    if (error) {
+      res.writeHead(500, { "Content-Type": "text/plain" });
+      return res.end("Internal Server Error");
     }
-
-    const ext = path.extname(filePath);
-    const contentType = MIME_TYPES[ext] || "text/plain";
-
-    fs.readFile(filePath, (readErr, data) => {
-      if (readErr) {
-        res.writeHead(500, { "Content-Type": "text/plain" });
-        res.end("Internal Server Error");
-        return;
-      }
-
-      res.writeHead(200, {
-        "Content-Type": contentType,
-        "Cache-Control": "no-cache"
-      });
-      res.end(data);
+    res.writeHead(200, {
+      "Content-Type": MIME_TYPES[path.extname(filePath)] || "application/octet-stream",
+      "Cache-Control": "no-cache, no-store, must-revalidate",
     });
+    res.end(data);
   });
 });
 
 server.listen(PORT, () => {
-  console.log(`🤖 AI Chatbot running at: http://localhost:${PORT}`);
-  console.log(`📂 Serving directory: ${__dirname}`);
+  console.log(`Conpi chatbot gateway running at http://localhost:${PORT}`);
+  console.log(`All authenticated inference and metering is relayed to ${TEE_BASE_URL}`);
 });
