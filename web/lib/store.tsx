@@ -1286,10 +1286,13 @@ export function Providers({ children }: { children: React.ReactNode }) {
             return;
           }
 
-          pushToast({ kind: "pending", title: "Submitting deal activation transaction to NEAR..." });
-          const outcome: any = await txActivateDeal(Number(dealId), res.activatePayload, res.activateSignatureHex);
-          const txHash = outcome?.transaction?.hash || outcome?.transaction_outcome?.id;
-          if (!txHash) {
+          let txHash = res.activationTxHash || "";
+          if (!res.activationRelayed && !res.activationAlreadyActive) {
+            pushToast({ kind: "pending", title: "Submitting deal activation transaction to NEAR..." });
+            const outcome: any = await txActivateDeal(Number(dealId), res.activatePayload, res.activateSignatureHex);
+            txHash = outcome?.transaction?.hash || outcome?.transaction_outcome?.id || "";
+          }
+          if (!txHash && !res.activationAlreadyActive) {
             throw new Error("Activation transaction was rejected or failed on-chain");
           }
 
@@ -1311,10 +1314,15 @@ export function Providers({ children }: { children: React.ReactNode }) {
             proxyKey: res.proxyKey || "",
             keyStatus: "verified",
             keyChecks: KEY_CHECKS.map((label) => ({ label, ok: true })),
-            activity: [{ id: crypto.randomUUID(), title: "Deal Activated via TEE", detail: "Hardware proof verified. Proxy key live.", tx: txHash, time: "Now" }, ...item.activity],
+            activity: [{ id: crypto.randomUUID(), title: "Deal Activated via TEE", detail: "Hardware proof verified. Proxy key live.", tx: txHash || undefined, time: "Now" }, ...item.activity],
           }));
 
-          pushToast({ kind: "success", title: "Deal Activated!", body: "Proxy key is active and ready for inference.", href: `https://testnet.nearblocks.io/txns/${txHash}` });
+          pushToast({
+            kind: "success",
+            title: "Deal Activated!",
+            body: res.activationRelayed ? "TEE relayer activated the deal. Proxy key is ready for inference." : "Proxy key is active and ready for inference.",
+            href: txHash ? `https://testnet.nearblocks.io/txns/${txHash}` : undefined,
+          });
           setTimeout(loadOnChainData, 2000);
         } catch (err: any) {
           pushToast({ kind: "error", title: "Key activation failed", body: err.message });

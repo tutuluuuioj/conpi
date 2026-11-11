@@ -150,6 +150,55 @@ export async function buildApp() {
       if (!result.ok) {
         return reply.status(400).send(result);
       }
+
+      const entry = keyVault.getByDealId(dealId);
+      const onChainStatus = String(entry?.onChainStatus || "").toLowerCase();
+      if (onChainStatus === "active") {
+        return {
+          ...result,
+          activationRelayed: true,
+          activationAlreadyActive: true,
+        };
+      }
+
+      if (
+        nearRelayer.isConfigured()
+        && result.activatePayload
+        && result.activateSignatureHex
+      ) {
+        try {
+          const activation = await nearRelayer.submitActivate(
+            dealId,
+            result.activatePayload,
+            result.activateSignatureHex
+          );
+          if (entry) entry.onChainStatus = "Active";
+          return {
+            ...result,
+            activationRelayed: true,
+            activationTxHash: activation.transactionHash,
+          };
+        } catch (error: any) {
+          // A submitted transaction may have reached finality even if the RPC
+          // response was lost. Re-read chain state before reporting failure so
+          // retrying activation cannot create a confusing false negative.
+          const refreshed = await nearRelayer.getDeal(dealId).catch(() => null);
+          if (String(refreshed?.status || "").toLowerCase() === "active") {
+            if (entry) entry.onChainStatus = "Active";
+            return {
+              ...result,
+              activationRelayed: true,
+              activationAlreadyActive: true,
+            };
+          }
+          return reply.status(502).send({
+            ...result,
+            ok: false,
+            error: `TEE activation relay failed: ${error?.message || String(error)}`,
+          });
+        }
+      }
+
       return result;
     } catch (err: any) {
       return reply.status(500).send({ ok: false, error: err.message });

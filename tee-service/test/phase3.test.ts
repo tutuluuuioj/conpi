@@ -455,10 +455,37 @@ async function runPhase3Tests() {
   assert(interceptedForwardedBody?.max_tokens !== undefined, "Upstream request omitted max_tokens");
   assert(interceptedForwardedBody.max_tokens <= 5_000, `Expected clamped max_tokens <= 5000, got ${interceptedForwardedBody.max_tokens}`);
 
+  console.log("[P3-13] TEE relays activation for non-NEAR wallets...");
+  const originalIsConfigured = nearRelayer.isConfigured.bind(nearRelayer);
+  const originalSubmitActivate = nearRelayer.submitActivate.bind(nearRelayer);
+  let relayedActivation: any = null;
+  (nearRelayer as any).isConfigured = () => true;
+  (nearRelayer as any).submitActivate = async (dealId: number, payload: any, signatureHex: string) => {
+    relayedActivation = { dealId, payload, signatureHex };
+    return { transactionHash: "tee-relayed-activation-tx", status: { SuccessValue: "" } };
+  };
+  const relayedResponse = await app.inject({
+    method: "POST",
+    url: "/v1/deals/3004/key",
+    payload: {
+      provider: "OpenAI",
+      model: "gpt-4o",
+      models: ["gpt-4o"],
+      termsHashHex: "11".repeat(32),
+      plainApiKey: "mock_foreign_wallet_activation_key",
+    },
+  });
+  (nearRelayer as any).isConfigured = originalIsConfigured;
+  (nearRelayer as any).submitActivate = originalSubmitActivate;
+  const relayedBody = JSON.parse(relayedResponse.body);
+  assert(relayedResponse.statusCode === 200, `TEE activation relay failed: ${relayedResponse.body}`);
+  assert(relayedBody.activationRelayed === true && relayedBody.activationTxHash === "tee-relayed-activation-tx", "TEE activation transaction was not returned to the foreign-wallet client");
+  assert(relayedActivation?.dealId === 3004 && relayedActivation?.signatureHex, "TEE-signed activation payload was not sent through the NEAR relayer");
+
   await app.close();
 
   console.log("=======================================================");
-  console.log("  ALL PHASE 3 ACCEPTANCE TESTS PASSED (12/12)          ");
+  console.log("  ALL PHASE 3 ACCEPTANCE TESTS PASSED (13/13)          ");
   console.log("=======================================================");
 }
 

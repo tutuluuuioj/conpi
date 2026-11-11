@@ -53,6 +53,9 @@ export interface KeyCheckResult {
     issuedAtNs: string;
   };
   activateSignatureHex?: string;
+  activationRelayed?: boolean;
+  activationAlreadyActive?: boolean;
+  activationTxHash?: string;
 }
 
 let cachedNearPriceUsd: { price: number; fetchedAt: number } | null = null;

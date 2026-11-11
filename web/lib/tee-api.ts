@@ -39,6 +39,9 @@ export interface KeyCheckApiResponse {
   proxyKey?: string;
   activatePayload?: any;
   activateSignatureHex?: string;
+  activationRelayed?: boolean;
+  activationAlreadyActive?: boolean;
+  activationTxHash?: string;
   error?: string;
 }
 
