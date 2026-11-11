@@ -2,6 +2,7 @@ import { PayloadKind, DefaultReason, SignedPayloadDto, serializeSignedPayload } 
 import { enclaveKeys } from "../crypto/keys.js";
 import { CONFIG } from "../config.js";
 import type { VaultEntry } from "../vault/preflight.js";
+import { foreignVaultManager } from "../chain/foreign-vault.js";
 export { calculateCost, PRICING_TABLE } from "./pricing.js";
 
 export function toBigIntYocto(val: any): bigint {
@@ -29,11 +30,18 @@ export function toBigIntYocto(val: any): bigint {
 export class MeterEngine {
   private lastStageEmitted = new Map<number, number>();
   private nonceMap = new Map<number, bigint>();
+  private evmNonceMap = new Map<number, number>();
 
   public seedNonce(dealId: number, lastAcceptedNonce: bigint | number): void {
     const seed = BigInt(lastAcceptedNonce);
     const current = this.nonceMap.get(dealId) || 0n;
     if (seed > current) this.nonceMap.set(dealId, seed);
+  }
+
+  public seedEvmNonce(dealId: number, lastAcceptedEvmNonce: number): void {
+    const seed = Number(lastAcceptedEvmNonce);
+    const current = this.evmNonceMap.get(dealId) || 0;
+    if (seed > current) this.evmNonceMap.set(dealId, seed);
   }
 
   public seedStage(dealId: number, lastReleasedStage: number): void {
@@ -47,6 +55,12 @@ export class MeterEngine {
     const next = current + 1n;
     this.nonceMap.set(dealId, next);
     return next;
+  }
+
+  public getNextEvmNonce(dealId: number): number {
+    const current = this.evmNonceMap.get(dealId) || 0;
+    this.evmNonceMap.set(dealId, current + 1);
+    return current;
   }
 
   private meteredValue(entry: VaultEntry): bigint {
@@ -67,10 +81,12 @@ export class MeterEngine {
     if (dealId === undefined) {
       this.lastStageEmitted.clear();
       this.nonceMap.clear();
+      this.evmNonceMap.clear();
       return;
     }
     this.lastStageEmitted.delete(dealId);
     this.nonceMap.delete(dealId);
+    this.evmNonceMap.delete(dealId);
   }
 
   public checkAndEmitStages(entry: VaultEntry, termsHashHex: string): Array<{ payload: SignedPayloadDto; signatureHex: string }> {
@@ -92,6 +108,30 @@ export class MeterEngine {
           ? toBigIntYocto(entry.creditAmountYocto)
           : this.meteredValue(entry);
 
+        let foreignTxSighash: Uint8Array | null = null;
+        let foreignTx: { nonce: number; recipient: string; amount: bigint | string; sighashHex: string } | undefined;
+
+        if (entry.foreignDeal) {
+          const currentReached = currentLast;
+          const expectedForeignPayout =
+            ((BigInt(targetStage) * entry.foreignDeal.foreignAmount) / 100n) -
+            ((BigInt(currentReached) * entry.foreignDeal.foreignAmount) / 100n);
+          const evmNonce = this.getNextEvmNonce(entry.dealId);
+          const prepared = foreignVaultManager.buildErc20TransferTx({
+            recipient: entry.foreignDeal.sellerAddress as any,
+            amountAtomic: expectedForeignPayout,
+            nonce: evmNonce,
+            tokenAddress: entry.foreignDeal.tokenAddress as any,
+          });
+          foreignTxSighash = Buffer.from(prepared.sighash.replace(/^0x/, ""), "hex");
+          foreignTx = {
+            nonce: evmNonce,
+            recipient: entry.foreignDeal.sellerAddress,
+            amount: expectedForeignPayout,
+            sighashHex: prepared.sighash,
+          };
+        }
+
         const payload: SignedPayloadDto = {
           domain: "conpi:v1",
           contractId: CONFIG.contractId,
@@ -103,8 +143,13 @@ export class MeterEngine {
           meteredValueYocto: meteredYocto,
           reason: null,
           nonce: this.getNextNonce(entry.dealId),
-          issuedAtNs: BigInt(Date.now()) * 1_000_000n,
+          issuedAtNs: BigInt(Math.floor(Date.now() / 1000)) * 1_000_000_000n,
+          foreignTxSighash,
         };
+
+        if (foreignTx) {
+          (payload as any).foreignTx = foreignTx;
+        }
 
         const payloadBytes = serializeSignedPayload(payload);
         const signature = enclaveKeys.sign(payloadBytes);
@@ -135,7 +180,7 @@ export class MeterEngine {
       meteredValueYocto: this.meteredValue(entry),
       reason: null,
       nonce: this.getNextNonce(entry.dealId),
-      issuedAtNs: BigInt(Date.now()) * 1_000_000n,
+      issuedAtNs: BigInt(Math.floor(Date.now() / 1000)) * 1_000_000_000n,
     };
     const signature = enclaveKeys.sign(serializeSignedPayload(payload));
     return { payload, signatureHex: Buffer.from(signature).toString("hex") };
@@ -145,6 +190,38 @@ export class MeterEngine {
     if (entry.defaultPayload) return entry.defaultPayload;
     entry.active = false;
     const meteredYocto = this.meteredValue(entry);
+
+    let foreignTxSighash: Uint8Array | null = null;
+    let foreignTx: { nonce: number; recipient: string; amount: bigint | string; sighashHex: string } | undefined;
+
+    if (entry.foreignDeal) {
+      const totalCredit = entry.creditAmountYocto ? toBigIntYocto(entry.creditAmountYocto) : 0n;
+      let fractionBps = 0n;
+      if (totalCredit > 0n) {
+        fractionBps = (meteredYocto * 10000n) / totalCredit;
+        if (fractionBps > 10000n) fractionBps = 10000n;
+      }
+      const foreignSellerEarned = (fractionBps * entry.foreignDeal.foreignAmount) / 10000n;
+      const stageReached = BigInt(this.lastStageEmitted.get(entry.dealId) || 0);
+      const foreignAlreadyReleased = (stageReached * entry.foreignDeal.foreignAmount) / 100n;
+      const effectiveTaken = foreignSellerEarned > foreignAlreadyReleased ? foreignSellerEarned : foreignAlreadyReleased;
+      const buyerForeignRefund = entry.foreignDeal.foreignAmount > effectiveTaken ? entry.foreignDeal.foreignAmount - effectiveTaken : 0n;
+
+      const evmNonce = this.getNextEvmNonce(entry.dealId);
+      const prepared = foreignVaultManager.buildErc20TransferTx({
+        recipient: entry.foreignDeal.buyerAddress as any,
+        amountAtomic: buyerForeignRefund,
+        nonce: evmNonce,
+        tokenAddress: entry.foreignDeal.tokenAddress as any,
+      });
+      foreignTxSighash = Buffer.from(prepared.sighash.replace(/^0x/, ""), "hex");
+      foreignTx = {
+        nonce: evmNonce,
+        recipient: entry.foreignDeal.buyerAddress,
+        amount: buyerForeignRefund,
+        sighashHex: prepared.sighash,
+      };
+    }
 
     const payload: SignedPayloadDto = {
       domain: "conpi:v1",
@@ -157,8 +234,13 @@ export class MeterEngine {
       meteredValueYocto: meteredYocto,
       reason,
       nonce: this.getNextNonce(entry.dealId),
-      issuedAtNs: BigInt(Date.now()) * 1_000_000n,
+      issuedAtNs: BigInt(Math.floor(Date.now() / 1000)) * 1_000_000_000n,
+      foreignTxSighash,
     };
+
+    if (foreignTx) {
+      (payload as any).foreignTx = foreignTx;
+    }
 
     const payloadBytes = serializeSignedPayload(payload);
     const signature = enclaveKeys.sign(payloadBytes);

@@ -4,6 +4,7 @@ export enum PayloadKind {
   Stage = 2,
   Checkpoint = 3,
   Default = 4,
+  ForeignDeposit = 5,
 }
 
 export enum DefaultReason {
@@ -28,6 +29,7 @@ export interface SignedPayloadDto {
   reason?: DefaultReason | null;
   nonce: bigint | number;
   issuedAtNs: bigint;
+  foreignTxSighash?: Uint8Array | null;
 }
 
 function writeString(str: string): Buffer {
@@ -79,6 +81,13 @@ export function serializeSignedPayload(payload: SignedPayloadDto): Uint8Array {
 
   chunks.push(writeU64LE(payload.nonce));
   chunks.push(writeU64LE(payload.issuedAtNs));
+
+  if (!payload.foreignTxSighash) {
+    chunks.push(Buffer.from([0])); // Option::None
+  } else {
+    chunks.push(Buffer.from([1])); // Option::Some
+    chunks.push(Buffer.from(payload.foreignTxSighash));
+  }
 
   return Buffer.concat(chunks);
 }

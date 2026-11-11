@@ -216,6 +216,7 @@ async function runTests() {
   negotiationService.submitTerms("ticket-openrouter-free-preflight", "buyer", openRouterTerms);
   negotiationService.submitTerms("ticket-openrouter-free-preflight", "seller", openRouterTerms);
   const savedGetDeal = (nearRelayer as any).getDeal;
+  const savedGetForeignDeal = (nearRelayer as any).getForeignDeal;
   const savedFetch = globalThis.fetch;
   const preflightUrls: string[] = [];
   (nearRelayer as any).getDeal = async (dealId: number) => dealId === 2 ? ({
@@ -228,6 +229,7 @@ async function runTests() {
     stage_reached: 0,
     status: "Funded",
   }) : savedGetDeal(dealId);
+  (nearRelayer as any).getForeignDeal = async () => null;
   globalThis.fetch = (async (url: string | URL | Request) => {
     const value = String(url);
     preflightUrls.push(value);
@@ -255,6 +257,7 @@ async function runTests() {
   );
   globalThis.fetch = savedFetch;
   (nearRelayer as any).getDeal = savedGetDeal;
+  (nearRelayer as any).getForeignDeal = savedGetForeignDeal;
   if (!freePreflight.ok || preflightUrls.length !== 2 || !preflightUrls[0].endsWith("/models") || !preflightUrls[1].endsWith("/key")) {
     throw new Error(`OpenRouter preflight was not free and deterministic: ${freePreflight.error || preflightUrls.join(", ")}`);
   }

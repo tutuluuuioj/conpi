@@ -1,5 +1,6 @@
 import { CONFIG } from "../config.js";
 import { Account, JsonRpcProvider, KeyPairSigner } from "near-api-js";
+import { foreignRelayer } from "./foreign-relayer.js";
 
 export class NearRelayer {
   private rpcUrl: string;
@@ -62,7 +63,7 @@ export class NearRelayer {
     args: Record<string, any>,
     gasYocto: string = "100000000000000",
     attachedDeposit: string = "0"
-  ): Promise<{ transactionHash: string; status: any }> {
+  ): Promise<{ transactionHash: string; status: any; receiptsOutcome?: any[] }> {
     if (!this.relayerAccountId || !this.relayerPrivateKey) {
       throw new Error("Relayer account credentials not configured (RELAYER_ACCOUNT_ID and RELAYER_PRIVATE_KEY)");
     }
@@ -81,7 +82,32 @@ export class NearRelayer {
     return {
       transactionHash: result.transaction.hash,
       status: result.status,
+      receiptsOutcome: result.receipts_outcome,
     };
+  }
+
+  private extractForeignTxSignedEvent(receiptsOutcome?: any[]): any {
+    if (!Array.isArray(receiptsOutcome)) return null;
+    for (const receipt of receiptsOutcome) {
+      const logs = receipt?.outcome?.logs || [];
+      for (const log of logs) {
+        if (typeof log === "string" && log.startsWith("EVENT_JSON:")) {
+          try {
+            const parsed = JSON.parse(log.slice("EVENT_JSON:".length));
+            if (parsed.standard === "conpi" && parsed.event === "foreign_tx_signed" && (parsed.data?.[0] || parsed.data)) {
+              return parsed.data?.[0] || parsed.data;
+            }
+            if (parsed.standard === "foreign_tx_signed" && parsed.event) {
+              return parsed.event;
+            }
+            if (parsed.event === "foreign_tx_signed" && (parsed.data?.[0] || parsed.data)) {
+              return parsed.data?.[0] || parsed.data;
+            }
+          } catch {}
+        }
+      }
+    }
+    return null;
   }
 
   public async submitActivate(dealId: number, payloadDto: any, signatureHex: string) {
@@ -89,6 +115,14 @@ export class NearRelayer {
       Buffer.isBuffer(payloadDto.termsHash) ? payloadDto.termsHash : Buffer.from(payloadDto.termsHashHex, "hex")
     );
     const sigBytes = Array.from(Buffer.from(signatureHex, "hex"));
+
+    const formatSighash = (val: any) => {
+      if (!val) return null;
+      if (Array.isArray(val)) return val;
+      if (typeof val === "string") return Array.from(Buffer.from(val.replace(/^0x/, ""), "hex"));
+      if (Buffer.isBuffer(val) || val instanceof Uint8Array) return Array.from(val);
+      return null;
+    };
 
     const payload = {
       domain: payloadDto.domain,
@@ -102,6 +136,7 @@ export class NearRelayer {
       reason: null,
       nonce: Number(payloadDto.nonce),
       issued_at: Number(payloadDto.issuedAtNs),
+      foreign_tx_sighash: formatSighash(payloadDto.foreignTxSighash || payloadDto.foreign_tx_sighash),
     };
 
     return this.submitFunctionCall("activate", {
@@ -117,6 +152,14 @@ export class NearRelayer {
     );
     const sigBytes = Array.from(Buffer.from(signatureHex, "hex"));
 
+    const formatSighash = (val: any) => {
+      if (!val) return null;
+      if (Array.isArray(val)) return val;
+      if (typeof val === "string") return Array.from(Buffer.from(val.replace(/^0x/, ""), "hex"));
+      if (Buffer.isBuffer(val) || val instanceof Uint8Array) return Array.from(val);
+      return null;
+    };
+
     const payload = {
       domain: payloadDto.domain,
       contract_id: payloadDto.contractId,
@@ -129,6 +172,7 @@ export class NearRelayer {
       reason: null,
       nonce: Number(payloadDto.nonce),
       issued_at: Number(payloadDto.issuedAtNs),
+      foreign_tx_sighash: formatSighash(payloadDto.foreignTxSighash || payloadDto.foreign_tx_sighash),
     };
 
     return this.submitFunctionCall("release_stage", {
@@ -137,6 +181,74 @@ export class NearRelayer {
       payload,
       sig: sigBytes,
     });
+  }
+
+  public async submitReleaseStageForeign(
+    dealId: number,
+    stage: number,
+    payloadDto: any,
+    signatureHex: string,
+    foreignTx: { nonce: number; recipient: string; amount: bigint | string; sighashHex: string }
+  ) {
+    const termsHashBytes = Array.from(
+      Buffer.isBuffer(payloadDto.termsHash) ? payloadDto.termsHash : Buffer.from(payloadDto.termsHashHex, "hex")
+    );
+    const sigBytes = Array.from(Buffer.from(signatureHex, "hex"));
+    const sighashBytes = Array.from(Buffer.from(foreignTx.sighashHex.replace(/^0x/, ""), "hex"));
+
+    const payload = {
+      domain: payloadDto.domain,
+      contract_id: payloadDto.contractId,
+      chain_id: payloadDto.chainId,
+      deal_id: Number(dealId),
+      terms_hash: termsHashBytes,
+      kind: "Stage",
+      stage: Number(stage),
+      metered_value: payloadDto.meteredValueYocto ? payloadDto.meteredValueYocto.toString() : "0",
+      reason: null,
+      nonce: Number(payloadDto.nonce),
+      issued_at: Number(payloadDto.issuedAtNs),
+      foreign_tx_sighash: sighashBytes,
+    };
+
+    const res = await this.submitFunctionCall(
+      "release_stage_foreign",
+      {
+        deal_id: dealId,
+        stage,
+        payload,
+        sig: sigBytes,
+        foreign_tx: {
+          nonce: foreignTx.nonce,
+          recipient: foreignTx.recipient,
+          amount: foreignTx.amount.toString(),
+          sighash: sighashBytes,
+        },
+      },
+      "290000000000000" // 290 Tgas required for NEAR MPC signing promise + callback
+    );
+
+    const ev = this.extractForeignTxSignedEvent(res.receiptsOutcome);
+    if (ev) {
+      try {
+        await foreignRelayer.broadcastSignedPayout({
+          dealId: Number(ev.deal_id),
+          stage: Number(ev.stage),
+          chainId: Number(ev.chain_id),
+          recipient: ev.recipient as any,
+          amountAtomic: BigInt(ev.amount),
+          sighashHex: ev.sighash_hex.startsWith("0x") ? ev.sighash_hex : `0x${ev.sighash_hex}`,
+          rHex: ev.r_hex,
+          sHex: ev.s_hex,
+          recoveryId: Number(ev.recovery_id),
+          nonce: foreignTx.nonce,
+        });
+      } catch (err) {
+        console.warn(`[NearRelayer] Auto-broadcast foreign stage payout warning:`, err);
+      }
+    }
+
+    return res;
   }
 
   public async submitCheckpoint(dealId: number, payloadDto: any, signatureHex: string) {
@@ -157,6 +269,7 @@ export class NearRelayer {
       reason: null,
       nonce: Number(payloadDto.nonce),
       issued_at: Number(payloadDto.issuedAtNs),
+      foreign_tx_sighash: null,
     };
 
     return this.submitFunctionCall("checkpoint", {
@@ -196,6 +309,7 @@ export class NearRelayer {
       reason: reasonStr,
       nonce: Number(payloadDto.nonce),
       issued_at: Number(payloadDto.issuedAtNs),
+      foreign_tx_sighash: null,
     };
 
     return this.submitFunctionCall("settle_default", {
@@ -203,6 +317,143 @@ export class NearRelayer {
       payload,
       sig: sigBytes,
     });
+  }
+
+  public async submitSettleDefaultForeign(
+    dealId: number,
+    payloadDto: any,
+    signatureHex: string,
+    foreignTx: { nonce: number; recipient: string; amount: bigint | string; sighashHex: string }
+  ) {
+    const termsHashBytes = Array.from(
+      Buffer.isBuffer(payloadDto.termsHash) ? payloadDto.termsHash : Buffer.from(payloadDto.termsHashHex, "hex")
+    );
+    const sigBytes = Array.from(Buffer.from(signatureHex, "hex"));
+    const sighashBytes = Array.from(Buffer.from(foreignTx.sighashHex.replace(/^0x/, ""), "hex"));
+
+    const reasonNames: Record<number, string> = {
+      0: "InvalidKey",
+      1: "InsufficientQuota",
+      2: "KeyNotSubmitted",
+      3: "ValidationFailed",
+      4: "ProviderBan",
+      5: "SellerSelfDrain",
+      6: "BuyerBreach",
+    };
+    const reasonStr = typeof payloadDto.reason === "number" ? reasonNames[payloadDto.reason] || "InvalidKey" : payloadDto.reason || "InvalidKey";
+
+    const payload = {
+      domain: payloadDto.domain,
+      contract_id: payloadDto.contractId,
+      chain_id: payloadDto.chainId,
+      deal_id: Number(dealId),
+      terms_hash: termsHashBytes,
+      kind: "Default",
+      stage: Number(payloadDto.stage || 0),
+      metered_value: payloadDto.meteredValueYocto ? payloadDto.meteredValueYocto.toString() : "0",
+      reason: reasonStr,
+      nonce: Number(payloadDto.nonce),
+      issued_at: Number(payloadDto.issuedAtNs),
+      foreign_tx_sighash: sighashBytes,
+    };
+
+    const res = await this.submitFunctionCall(
+      "settle_default_foreign",
+      {
+        deal_id: dealId,
+        payload,
+        sig: sigBytes,
+        foreign_tx: {
+          nonce: foreignTx.nonce,
+          recipient: foreignTx.recipient,
+          amount: foreignTx.amount.toString(),
+          sighash: sighashBytes,
+        },
+      },
+      "290000000000000" // 290 Tgas required for NEAR MPC signing promise + callback
+    );
+
+    const ev = this.extractForeignTxSignedEvent(res.receiptsOutcome);
+    if (ev) {
+      try {
+        await foreignRelayer.broadcastSignedPayout({
+          dealId: Number(ev.deal_id),
+          stage: Number(ev.stage),
+          chainId: Number(ev.chain_id),
+          recipient: ev.recipient as any,
+          amountAtomic: BigInt(ev.amount),
+          sighashHex: ev.sighash_hex.startsWith("0x") ? ev.sighash_hex : `0x${ev.sighash_hex}`,
+          rHex: ev.r_hex,
+          sHex: ev.s_hex,
+          recoveryId: Number(ev.recovery_id),
+          nonce: foreignTx.nonce,
+        });
+      } catch (err) {
+        console.warn(`[NearRelayer] Auto-broadcast foreign default payout warning:`, err);
+      }
+    }
+
+    return res;
+  }
+
+  public async submitForeignDeposit(
+    dealId: number,
+    txHash: string,
+    payloadDto: any,
+    signatureHex: string
+  ) {
+    const termsHashBytes = Array.from(
+      Buffer.isBuffer(payloadDto.termsHash)
+        ? payloadDto.termsHash
+        : Buffer.from(payloadDto.termsHashHex, "hex")
+    );
+    const sigBytes = Array.from(Buffer.from(signatureHex, "hex"));
+
+    const payload = {
+      domain: payloadDto.domain,
+      contract_id: payloadDto.contractId,
+      chain_id: payloadDto.chainId,
+      deal_id: Number(dealId),
+      terms_hash: termsHashBytes,
+      kind: "ForeignDeposit",
+      stage: 0,
+      metered_value: "0",
+      reason: null,
+      nonce: Number(payloadDto.nonce),
+      issued_at: Number(payloadDto.issuedAtNs),
+      foreign_tx_sighash: null,
+    };
+
+    return this.submitFunctionCall("record_foreign_deposit", {
+      deal_id: dealId,
+      tx_hash: txHash,
+      payload,
+      sig: sigBytes,
+    });
+  }
+
+  public async submitRegisterForeignChainDeal(params: {
+    dealId: number;
+    chainId: number;
+    vaultAddress: string;
+    tokenAddress: string;
+    buyerAddress: string;
+    sellerAddress: string;
+    foreignAmount: string;
+  }) {
+    return this.submitFunctionCall("register_foreign_chain_deal", {
+      deal_id: params.dealId,
+      chain_id: params.chainId,
+      vault_address: params.vaultAddress,
+      token_address: params.tokenAddress,
+      buyer_address: params.buyerAddress,
+      seller_address: params.sellerAddress,
+      foreign_amount: params.foreignAmount,
+    });
+  }
+
+  public async getForeignDeal(dealId: number): Promise<any> {
+    return this.callView("get_foreign_deal", { deal_id: dealId });
   }
 
   public async getDeal(dealId: number): Promise<any> {

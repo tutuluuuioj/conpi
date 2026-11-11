@@ -21,9 +21,12 @@ import {
   reconcilePendingUsage,
 } from "./proxy/server.js";
 import { meterEvents } from "./proxy/events.js";
-import { DefaultReason } from "./crypto/borsh.js";
+import { DefaultReason, PayloadKind, serializeSignedPayload, type SignedPayloadDto } from "./crypto/borsh.js";
 import { nearRelayer } from "./chain/relayer.js";
 import { settlementEngine } from "./settlement/engine.js";
+import { foreignVaultManager } from "./chain/foreign-vault.js";
+import { foreignRelayer } from "./chain/foreign-relayer.js";
+import { baseClient, BASE_SEPOLIA_USDC, BASE_SEPOLIA_CHAIN_ID } from "./chain/base-client.js";
 
 export const app = Fastify({ logger: false });
 
@@ -440,6 +443,155 @@ export async function buildApp() {
     return nearRelayer.getDeal(parseInt(id, 10));
   });
 
+  // 7. Multi-Chain Foreign Payments (Base Sepolia / Chain Signatures)
+  app.get("/v1/foreign/vault/:id", async (req, reply) => {
+    const { id } = req.params as { id: string };
+    const dealId = parseInt(id, 10);
+    const vault = foreignVaultManager.deriveVaultAddress(CONFIG.contractId, dealId);
+    const gasCheck = await foreignRelayer.checkVaultGas(vault.address);
+    return {
+      dealId,
+      chainId: BASE_SEPOLIA_CHAIN_ID,
+      vaultAddress: vault.address,
+      uncompressedPubKey: vault.uncompressedPubKey,
+      tokenAddress: BASE_SEPOLIA_USDC,
+      gasBalanceEth: gasCheck.balanceEth.toString(),
+      hasGas: gasCheck.hasGas,
+    };
+  });
+
+  app.post("/v1/foreign/verify-deposit", async (req, reply) => {
+    const body = req.body as {
+      dealId: number;
+      txHash: `0x${string}`;
+      termsHashHex: string;
+      expectedAmountAtomic: string;
+      minConfirmations?: number;
+      autoRelay?: boolean;
+    };
+
+    if (!body?.dealId || !body?.txHash || !body?.termsHashHex) {
+      return reply.status(400).send({ error: "Missing required parameters (dealId, txHash, termsHashHex)" });
+    }
+
+    const vault = foreignVaultManager.deriveVaultAddress(CONFIG.contractId, body.dealId);
+    const verification = await baseClient.verifyDeposit({
+      txHash: body.txHash,
+      expectedVault: vault.address,
+      expectedAmountAtomic: body.expectedAmountAtomic || "1",
+      minConfirmations: body.minConfirmations ? BigInt(body.minConfirmations) : 1n,
+    });
+
+    if (!verification.ok) {
+      return reply.status(400).send({
+        ok: false,
+        error: verification.error,
+        vaultAddress: vault.address,
+      });
+    }
+
+    // Construct enclave ForeignDeposit payload
+    const termsHashBytes = Buffer.from(body.termsHashHex, "hex");
+    const payload: SignedPayloadDto = {
+      domain: "conpi:v1",
+      contractId: CONFIG.contractId,
+      chainId: CONFIG.networkId,
+      dealId: body.dealId,
+      termsHash: new Uint8Array(termsHashBytes),
+      kind: PayloadKind.ForeignDeposit,
+      stage: 0,
+      meteredValueYocto: 0n,
+      reason: null,
+      nonce: 1,
+      issuedAtNs: BigInt(Date.now()) * 1_000_000n,
+    };
+
+    const serialized = serializeSignedPayload(payload);
+    const signature = enclaveKeys.sign(serialized);
+    const signatureHex = Buffer.from(signature).toString("hex");
+
+    let relayResult = null;
+    if (body.autoRelay && nearRelayer.isConfigured()) {
+      try {
+        const foreignDeal = await nearRelayer.getForeignDeal(body.dealId);
+        if (!foreignDeal) {
+          const sender = verification.sender;
+          if (!sender || sender === "0x0000000000000000000000000000000000000000") {
+            throw new Error("Cannot register foreign chain deal with invalid sender address");
+          }
+          const seller = (body as any).sellerAddress && (body as any).sellerAddress !== "0x0000000000000000000000000000000000000000"
+            ? (body as any).sellerAddress
+            : sender;
+          await nearRelayer.submitRegisterForeignChainDeal({
+            dealId: body.dealId,
+            chainId: BASE_SEPOLIA_CHAIN_ID,
+            vaultAddress: vault.address,
+            tokenAddress: BASE_SEPOLIA_USDC,
+            buyerAddress: sender,
+            sellerAddress: seller,
+            foreignAmount: body.expectedAmountAtomic,
+          });
+          await new Promise((r) => setTimeout(r, 1000));
+        }
+        relayResult = await nearRelayer.submitForeignDeposit(
+          body.dealId,
+          body.txHash,
+          payload,
+          signatureHex
+        );
+      } catch (err: any) {
+        relayResult = { error: err?.message || String(err) };
+      }
+    }
+
+    return {
+      ok: true,
+      dealId: body.dealId,
+      txHash: body.txHash,
+      verification,
+      payload: publicSignedPayload({ payload, signatureHex } as any),
+      relayResult,
+    };
+  });
+
+  app.post("/v1/foreign/broadcast-payout", async (req, reply) => {
+    const body = req.body as {
+      dealId: number;
+      stage: number;
+      chainId: number;
+      recipient: `0x${string}`;
+      amountAtomic: string;
+      sighashHex: `0x${string}`;
+      rHex: string;
+      sHex: string;
+      recoveryId: number;
+      nonce?: number;
+    };
+
+    if (!body?.dealId || !body?.recipient || !body?.amountAtomic || !body?.rHex || !body?.sHex) {
+      return reply.status(400).send({ error: "Missing required payout parameters" });
+    }
+
+    const result = await foreignRelayer.broadcastSignedPayout({
+      dealId: body.dealId,
+      stage: body.stage,
+      chainId: body.chainId || BASE_SEPOLIA_CHAIN_ID,
+      recipient: body.recipient,
+      amountAtomic: BigInt(body.amountAtomic),
+      sighashHex: body.sighashHex,
+      rHex: body.rHex,
+      sHex: body.sHex,
+      recoveryId: body.recoveryId,
+      nonce: body.nonce,
+    });
+
+    if (!result.success) {
+      return reply.status(400).send(result);
+    }
+
+    return result;
+  });
+
   settlementEngine.start(() => keyVault.listActive());
   app.addHook("onClose", async () => settlementEngine.stop());
 
@@ -452,6 +604,12 @@ export async function startServer() {
   console.log(`=======================================================`);
   console.log(`  CONPI PHALA TDX TEE PROXY SERVICE RUNNING ON ${CONFIG.host}:${CONFIG.port}`);
   console.log(`  Signer Key: ${CONFIG.contractId}`);
+  const relayerKey = process.env.OPERATOR_EVM_PRIVATE_KEY || process.env.BASE_SEPOLIA_RELAYER_KEY;
+  if (!relayerKey) {
+    console.warn(`  [Diagnostic] OPERATOR_EVM_PRIVATE_KEY not set. Base Sepolia gas sponsorship requires manual funding.`);
+  } else {
+    console.log(`  [Diagnostic] Base Sepolia gas sponsorship operator active.`);
+  }
   console.log(`=======================================================`);
 }
 

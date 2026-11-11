@@ -79,12 +79,24 @@ export class SettlementEngine {
   }
 
   public relayStage(entry: VaultEntry, signed: SignedEnvelope): Promise<RelayReceipt> {
-    return this.enqueue(entry, "stage", signed, () => nearRelayer.submitReleaseStage(
-      entry.dealId,
-      Number(signed.payload.stage),
-      signed.payload,
-      signed.signatureHex
-    ));
+    return this.enqueue(entry, "stage", signed, async () => {
+      const foreignTx = (signed.payload as any).foreignTx;
+      if (foreignTx) {
+        return nearRelayer.submitReleaseStageForeign(
+          entry.dealId,
+          Number(signed.payload.stage),
+          signed.payload,
+          signed.signatureHex,
+          foreignTx
+        );
+      }
+      return nearRelayer.submitReleaseStage(
+        entry.dealId,
+        Number(signed.payload.stage),
+        signed.payload,
+        signed.signatureHex
+      );
+    });
   }
 
   public relayCheckpoint(entry: VaultEntry, signed: SignedEnvelope): Promise<RelayReceipt> {
@@ -96,11 +108,22 @@ export class SettlementEngine {
   }
 
   public relayDefault(entry: VaultEntry, signed: SignedEnvelope): Promise<RelayReceipt> {
-    return this.enqueue(entry, "default", signed, () => nearRelayer.submitSettleDefault(
-      entry.dealId,
-      signed.payload,
-      signed.signatureHex
-    ));
+    return this.enqueue(entry, "default", signed, async () => {
+      const foreignTx = (signed.payload as any).foreignTx;
+      if (foreignTx) {
+        return nearRelayer.submitSettleDefaultForeign(
+          entry.dealId,
+          signed.payload,
+          signed.signatureHex,
+          foreignTx
+        );
+      }
+      return nearRelayer.submitSettleDefault(
+        entry.dealId,
+        signed.payload,
+        signed.signatureHex
+      );
+    });
   }
 
   public async drain(dealId: number): Promise<void> {

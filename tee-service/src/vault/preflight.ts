@@ -102,6 +102,16 @@ export async function fetchLiveNearPriceUsd(): Promise<number> {
   throw new Error("Live NEAR price oracle unavailable (both CoinGecko and Binance unreachable). Silent fallback price is disabled; deal must fail.");
 }
 
+export interface ForeignDealInfo {
+  chainId: number;
+  vaultAddress: string;
+  tokenAddress: string;
+  buyerAddress: string;
+  sellerAddress: string;
+  foreignAmount: bigint;
+  evmNonce: number;
+}
+
 export interface VaultEntry {
   dealId: number;
   provider: string;
@@ -129,6 +139,7 @@ export interface VaultEntry {
   lastCheckpointAt: number;
   relayReceipts: RelayReceipt[];
   onChainStatus?: string;
+  foreignDeal?: ForeignDealInfo | null;
 }
 
 export function hashLockedPricing(pricing: LockedPricingTable): string {
@@ -251,10 +262,24 @@ class KeyVault {
     let derivedPriceUsd = 0;
     let onChainTokenIsNear = false;
 
+    let resolvedForeignDeal: ForeignDealInfo | null = null;
+
     // Strictly resolve creditUsd, priceUsd and creditAmountYocto from on-chain deal state
     try {
       const { nearRelayer } = await import("../chain/relayer.js");
       const deal = await nearRelayer.getDeal(dealId);
+      const foreign = await nearRelayer.getForeignDeal(dealId).catch(() => null);
+      if (foreign && foreign.vault_address) {
+        resolvedForeignDeal = {
+          chainId: Number(foreign.chain_id || 84532),
+          vaultAddress: foreign.vault_address,
+          tokenAddress: foreign.token_address,
+          buyerAddress: foreign.buyer_address,
+          sellerAddress: foreign.seller_address,
+          foreignAmount: BigInt(foreign.foreign_amount),
+          evmNonce: Number(foreign.evm_nonce || 0),
+        };
+      }
       if (deal) {
         const creditBigInt = parseBalance(deal.credit_amount);
         if (creditBigInt === 0n) {
@@ -263,8 +288,14 @@ class KeyVault {
         resolvedCreditYocto = creditBigInt.toString();
         const priceBigInt = parseBalance(deal.price);
         const isNear = (deal.token === null || deal.token === "NEAR");
-        onChainTokenIsNear = isNear;
-        if (isNear) {
+        onChainTokenIsNear = isNear && !resolvedForeignDeal;
+        if (resolvedForeignDeal) {
+          // Foreign Maker Vault deals escrow USDC outside NEAR. Their canonical
+          // USD budget is the registered six-decimal foreign amount, not the
+          // placeholder native values on the coordination contract.
+          derivedCreditUsd = Number(resolvedForeignDeal.foreignAmount) / 1e6;
+          derivedPriceUsd = derivedCreditUsd;
+        } else if (isNear) {
           const nearPrice = await fetchLiveNearPriceUsd();
           derivedCreditUsd = (Number(creditBigInt) / 1e24) * nearPrice;
           derivedPriceUsd = (Number(priceBigInt) / 1e24) * nearPrice;
@@ -371,6 +402,7 @@ class KeyVault {
       lastCheckpointAt: Date.now(),
       relayReceipts: [],
       onChainStatus: resolvedStatus,
+      foreignDeal: resolvedForeignDeal,
     };
 
     this.entries.set(dealId, entry);
@@ -382,10 +414,13 @@ class KeyVault {
     // payload instead of creating replayed signatures.
     meterEngine.seedNonce(dealId, BigInt(resolvedLastNonce));
     meterEngine.seedStage(dealId, resolvedStage);
+    if (resolvedForeignDeal) {
+      meterEngine.seedEvmNonce(dealId, resolvedForeignDeal.evmNonce);
+    }
 
     // Build ACTIVATE SignedPayload
     const termsHashBytes = Buffer.from(resolvedTermsHashHex, "hex");
-    const nowNs = BigInt(Date.now()) * 1_000_000n;
+    const nowNs = BigInt(Math.floor(Date.now() / 1000)) * 1_000_000_000n;
 
     const activatePayload: SignedPayloadDto = {
       domain: "conpi:v1",

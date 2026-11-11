@@ -8,9 +8,10 @@
     "dev": "tsx watch src/index.ts",
     "build": "tsc",
     "start": "node dist/index.js",
-    "test": "tsx test/index.test.ts && tsx test/phase3.test.ts && tsx test/phase4.test.ts",
-    "test:phase3": "tsx test/phase3.test.ts",
-    "test:phase4": "tsx test/phase4.test.ts",
+    "test": "NODE_ENV=test tsx test/index.test.ts && NODE_ENV=test tsx test/phase3.test.ts && NODE_ENV=test tsx test/phase4.test.ts && NODE_ENV=test tsx test/base-client.test.ts && NODE_ENV=test tsx test/foreign-relayer.test.ts",
+    "test:phase3": "NODE_ENV=test tsx test/phase3.test.ts",
+    "test:phase4": "NODE_ENV=test tsx test/phase4.test.ts",
+    "test:multichain": "NODE_ENV=test tsx test/base-client.test.ts && NODE_ENV=test tsx test/foreign-relayer.test.ts",
     "provision:relayer": "node scripts/provision-relayer.mjs"
   },
   "dependencies": {
@@ -27,6 +28,7 @@
     "fastify": "^5.12.8",
     "js-tiktoken": "^1.0.21",
     "near-api-js": "^7.4.0",
+    "viem": "^2.57.16",
     "zod": "^4.6.7"
   },
   "devDependencies": {
