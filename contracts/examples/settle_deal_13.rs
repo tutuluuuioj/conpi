@@ -104,6 +104,7 @@ fn parse_signed_payload(val: &Value) -> Result<SignedPayload, Box<dyn std::error
         stage: val["stage"].as_u64().unwrap_or(0) as u8,
         metered_value: U128(metered_value),
         reason,
+        foreign_tx_sighash: None,
         issued_at,
         nonce,
     })

@@ -33,7 +33,7 @@ import {
   BASE_SEPOLIA_USDC,
   BASE_SEPOLIA_EXPLORER,
 } from "@/lib/chain-signatures";
-import { fetchContractForeignDeal } from "@/lib/contract";
+import { fetchContractDeal, fetchContractForeignDeal } from "@/lib/contract";
 import {
   connectMetaMask,
   isMetaMaskInstalled,
@@ -42,7 +42,6 @@ import {
   getBaseEthBalance,
   seedVaultGas,
 } from "@/lib/evm-wallet";
-import { sendSolanaUsdcDeposit } from "@/lib/solana-wallet";
 import type { DealStep } from "@/lib/types";
 import {
   Badge,
@@ -233,22 +232,6 @@ export function DealView({ id }: { id: string }) {
         const updated = await fetchContractForeignDeal(Number(deal.id));
         if (updated) setForeignInfo(updated);
       }
-      // Also notify Conpi Maker Vault payout dispatcher for asymmetric cross-chain settlement
-      const payoutRail = typeof window !== "undefined" ? (localStorage.getItem(`conpi_seller_payout_rail_${deal.id}`) || "base") : "base";
-      const payoutAddr = typeof window !== "undefined" ? (localStorage.getItem(`conpi_seller_payout_addr_${deal.id}`) || effectiveSellerEvmAddress) : effectiveSellerEvmAddress;
-      if (payoutAddr) {
-        await fetch("/api/vault/payout", {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({
-            dealId: Number(deal.id),
-            recipientAddress: payoutAddr,
-            payoutChain: payoutRail,
-            amountUsdc: deal.priceUsd || deal.price,
-            memo: `Seller final payout Deal #${deal.id}`,
-          }),
-        }).catch(() => {});
-      }
     } finally {
       setIsClaimingForeignPayout(false);
     }
@@ -340,6 +323,9 @@ export function DealView({ id }: { id: string }) {
 
   const isBuyerRole = !isSellerParty;
   const requiredDepositUsdc = isBuyerRole ? requiredBuyerUsdc : requiredSellerUsdc;
+  const activeVaultAddress = selectedPayChain === "base"
+    ? String(foreignInfo?.vault_address || "")
+    : MAKER_VAULT_CONFIG[selectedPayChain].vaultAddress;
 
   const handleMakerVaultPay = async () => {
     if (!deal) return;
@@ -349,50 +335,31 @@ export function DealView({ id }: { id: string }) {
 
     try {
       if (selectedPayChain === "base") {
+        if (!isBuyerRole) {
+          throw new Error("Seller collateral must be deposited through the NEAR escrow contract");
+        }
+        const lockedVault = foreignInfo?.vault_address;
+        if (!lockedVault || Number(foreignInfo?.foreign_amount || 0) <= 0) {
+          throw new Error("The seller must lock the per-deal Base vault and amount on-chain before payment");
+        }
         let evm = app.evmAccount;
         if (!evm) {
           evm = await app.connectEvm();
         }
         const { txHash } = await sendBaseUsdcDeposit({
-          vaultAddress: MAKER_VAULT_CONFIG.base.vaultAddress as any,
+          vaultAddress: lockedVault as any,
           amountUsdc: requiredDepositUsdc.toFixed(2),
         });
-        const res = await app.depositUsdcViaMakerVault(
+        const res = await app.depositForeignBaseUsdc(
           deal.id,
-          "base",
           txHash,
-          requiredDepositUsdc,
-          evm || undefined,
-          sellerPayoutRail,
-          effectiveSellerEvmAddress || undefined
+          evm || "",
+          effectiveSellerEvmAddress || ""
         );
         if (!res.ok) throw new Error(res.body || "Verification failed");
         setDepositSuccess(`Deposit of $${requiredDepositUsdc.toFixed(2)} USDC confirmed on Base Sepolia!`);
       } else if (selectedPayChain === "solana") {
-        let sol = app.solanaAccount;
-        if (!sol) {
-          sol = await app.connectSolana();
-        }
-        let signature = manualTxHash.trim();
-        if (!signature) {
-          const depositRes = await sendSolanaUsdcDeposit({
-            vaultAddress: MAKER_VAULT_CONFIG.solana.vaultAddress,
-            amountUsdc: requiredDepositUsdc,
-          });
-          signature = depositRes.txHash;
-        }
-        const res = await app.depositUsdcViaMakerVault(
-          deal.id,
-          "solana",
-          signature,
-          requiredDepositUsdc,
-          sol || undefined,
-          sellerPayoutRail,
-          effectiveSellerEvmAddress || undefined
-        );
-        if (!res.ok) throw new Error(res.body || "Verification failed");
-        setDepositSuccess(`Deposit of $${requiredDepositUsdc.toFixed(2)} USDC confirmed on Solana Devnet!`);
-        setManualTxHash("");
+        throw new Error("Solana pooled-vault deposits are paused until TEE-signed Solana settlement is available. No funds were sent.");
       } else {
         const res = await app.deposit(deal.id);
         if (!res.ok) throw new Error(res.body || "Deposit failed");
@@ -412,14 +379,15 @@ export function DealView({ id }: { id: string }) {
     setDepositSuccess(null);
 
     try {
-      const res = await app.depositUsdcViaMakerVault(
+      if (selectedPayChain !== "base") {
+        throw new Error("Manual pooled-vault verification is paused. Use the on-chain NEAR escrow or the per-deal Base vault.");
+      }
+      if (!app.evmAccount) throw new Error("Connect the Base buyer wallet that sent the deposit");
+      const res = await app.depositForeignBaseUsdc(
         deal.id,
-        selectedPayChain,
         manualTxHash.trim(),
-        requiredDepositUsdc,
-        selectedPayChain === "base" ? (app.evmAccount || undefined) : selectedPayChain === "solana" ? (app.solanaAccount || undefined) : (app.account || undefined),
-        sellerPayoutRail,
-        effectiveSellerEvmAddress || undefined
+        app.evmAccount,
+        effectiveSellerEvmAddress || ""
       );
       if (!res.ok) throw new Error(res.body || "Deposit verification failed");
       setDepositSuccess(`Deposit of $${requiredDepositUsdc.toFixed(2)} USDC verified on ${selectedPayChain.toUpperCase()}!`);
@@ -490,8 +458,7 @@ export function DealView({ id }: { id: string }) {
 
   const isForeignBuyerDeposited = Boolean(
     deal?.buyerDeposited ||
-    (deal as any)?.vault_buyer_deposited ||
-    (foreignInfo?.foreign_amount && Number(foreignInfo.foreign_amount) > 0 && foreignInfo?.buyer_address && foreignInfo.buyer_address !== "0x0000000000000000000000000000000000000000")
+    (deal as any)?.vault_buyer_deposited
   );
   const isSellerDeposited = Boolean(
     deal?.sellerDeposited ||
@@ -577,17 +544,21 @@ export function DealView({ id }: { id: string }) {
 
   const handleProceedToKey = async () => {
     if (!deal) return;
-    if (deal.status === "Created" && app.confirmForeignDeposit) {
-      setIsConfirmingDeposit(true);
-      try {
-        await app.confirmForeignDeposit(deal.id);
-      } catch (e) {
-        console.warn("Confirm foreign deposit notice:", e);
-      } finally {
-        setIsConfirmingDeposit(false);
+    setIsConfirmingDeposit(true);
+    try {
+      const onChain = await fetchContractDeal(Number(deal.id));
+      if (!onChain || !["Funded", "Active"].includes(String(onChain.status))) {
+        app.pushToast({
+          kind: "error",
+          title: "Escrow is not funded on-chain",
+          body: "Wait for the TEE-signed deposit record and the seller collateral before continuing.",
+        });
+        return;
       }
+      setView("key");
+    } finally {
+      setIsConfirmingDeposit(false);
     }
-    setView("key");
   };
 
   const creditUsd = deal.creditUsd ?? deal.credit;
@@ -896,8 +867,10 @@ export function DealView({ id }: { id: string }) {
                         <div className="flex items-center gap-2">
                           <button
                             type="button"
+                            disabled={!activeVaultAddress}
                             onClick={() => {
-                              app.copy(MAKER_VAULT_CONFIG[selectedPayChain].vaultAddress);
+                              if (!activeVaultAddress) return;
+                              app.copy(activeVaultAddress);
                               setCopiedVault(selectedPayChain);
                               setTimeout(() => setCopiedVault(null), 2000);
                             }}
@@ -911,7 +884,7 @@ export function DealView({ id }: { id: string }) {
                               selectedPayChain === "solana"
                                 ? `${MAKER_VAULT_CONFIG.solana.explorer}/address/${MAKER_VAULT_CONFIG.solana.vaultAddress}?cluster=devnet`
                                 : selectedPayChain === "base"
-                                ? `${MAKER_VAULT_CONFIG.base.explorer}/address/${MAKER_VAULT_CONFIG.base.vaultAddress}`
+                                ? `${MAKER_VAULT_CONFIG.base.explorer}/address/${activeVaultAddress}`
                                 : `${MAKER_VAULT_CONFIG.near.explorer}/address/${MAKER_VAULT_CONFIG.near.vaultAddress}`
                             }
                             target="_blank"
@@ -924,7 +897,7 @@ export function DealView({ id }: { id: string }) {
                         </div>
                       </div>
                       <div className="font-mono text-[11px] break-all bg-surface p-2 rounded border border-line text-ink">
-                        {MAKER_VAULT_CONFIG[selectedPayChain].vaultAddress}
+                        {activeVaultAddress || "Waiting for the seller to lock this deal's Base vault on-chain"}
                       </div>
                     </div>
 
@@ -988,10 +961,10 @@ export function DealView({ id }: { id: string }) {
                         <span className="text-[10px] text-emerald-400 font-medium">100% USDC Release</span>
                       </div>
                       <p className="text-[11px] text-muted">
-                        When milestones are completed, the Conpi Maker Vault releases earned USDC to you on this chain:
+                        The seller-authorized Base Sepolia address is locked on the escrow contract before buyer funding.
                       </p>
-                      <div className="grid grid-cols-3 gap-2 pt-1">
-                        {(["base", "solana", "near"] as VaultChain[]).map((c) => (
+                      <div className="grid grid-cols-1 gap-2 pt-1">
+                        {(["base"] as VaultChain[]).map((c) => (
                           <button
                             key={c}
                             type="button"
@@ -1045,30 +1018,7 @@ export function DealView({ id }: { id: string }) {
                               localStorage.setItem(`conpi_seller_payout_addr_${deal.id}`, addr);
                             } catch {}
 
-                            if (sellerPayoutRail === "base") {
-                              handleUpdateSellerEvmAddress();
-                            } else {
-                              try {
-                                const res = await fetch("/api/vault/payout-destination", {
-                                  method: "POST",
-                                  headers: { "Content-Type": "application/json" },
-                                  body: JSON.stringify({
-                                    dealId: Number(deal.id),
-                                    payoutRail: sellerPayoutRail,
-                                    payoutAddress: addr,
-                                  }),
-                                });
-                                const json = await res.json();
-                                if (!json.ok) throw new Error(json.error || "Failed to save payout destination");
-                                app.pushToast({
-                                  kind: "success",
-                                  title: "Payout Destination Saved",
-                                  body: `USDC payouts routed to ${addr.slice(0, 10)}... on ${sellerPayoutRail.toUpperCase()}`,
-                                });
-                              } catch (err: any) {
-                                app.pushToast({ kind: "error", title: "Save failed", body: err.message });
-                              }
-                            }
+                            if (sellerPayoutRail === "base") handleUpdateSellerEvmAddress();
                           }}
                         >
                           Save

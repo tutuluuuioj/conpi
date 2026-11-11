@@ -47,6 +47,10 @@ async function run() {
   };
   evmAuth.signature = await evm.signMessage({ message: buildSellerKeyAuthorizationMessage(evmRequest) });
   await verifySellerKeyAuthorization(evmRequest, { now: () => now });
+  await expectReject(
+    () => verifySellerKeyAuthorization(evmRequest, { now: () => now }),
+    /already been used/i
+  );
 
   const solanaKeys = ed25519.keygen();
   const solanaAddress = bs58.encode(solanaKeys.publicKey);
@@ -104,7 +108,7 @@ async function run() {
     /expired/i
   );
 
-  console.log("Seller-key authorization tests passed (NEAR, Solana, Base, tamper, expiry)");
+  console.log("Seller-key authorization tests passed (NEAR, Solana, Base, replay, tamper, expiry)");
 }
 
 run().catch((error) => {

@@ -378,18 +378,6 @@ export const teeApi = {
     recoveryId: number;
     nonce?: number;
   }): Promise<any> {
-    try {
-      const localRes = await fetch("/api/foreign/broadcast-payout", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify(params),
-      });
-      if (localRes.ok) {
-        const localData = await localRes.json();
-        return localData;
-      }
-    } catch {}
-
     const res = await fetch(`${TEE_BASE_URL}/v1/foreign/broadcast-payout`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },

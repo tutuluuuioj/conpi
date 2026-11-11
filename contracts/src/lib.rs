@@ -1065,7 +1065,7 @@ impl ConpiEscrow {
     ) {
         let deal = self.get_deal_or_panic(deal_id);
         let caller = env::predecessor_account_id();
-        let is_party = caller == deal.buyer || caller == deal.seller || caller == self.owner;
+        let is_seller_or_owner = caller == deal.seller || caller == self.owner;
         let is_tee_signer = self
             .tee_signers
             .get(&env::signer_account_pk())
@@ -1073,8 +1073,8 @@ impl ConpiEscrow {
             .unwrap_or(false)
             || env::signer_account_pk() == deal.tee_pubkey;
         require!(
-            is_party || is_tee_signer,
-            "Only buyer, seller, owner, or active TEE signer can register foreign chain parameters"
+            is_seller_or_owner || is_tee_signer,
+            "Only seller, owner, or active TEE signer can register foreign chain parameters"
         );
         require!(
             deal.status == DealStatus::Created,
@@ -1093,12 +1093,6 @@ impl ConpiEscrow {
             "Foreign chain deals must not specify NEP-141 token escrow"
         );
         let existing = self.foreign_deals.get(&deal_id);
-        if let Some(ref prev) = existing {
-            require!(
-                prev.foreign_amount.0 == 0 || deal.status == DealStatus::Created,
-                "Foreign chain parameters already locked for this deal"
-            );
-        }
         require!(
             is_valid_evm_address(&vault_address),
             "Valid non-zero hexadecimal vault address is required"
@@ -1112,7 +1106,7 @@ impl ConpiEscrow {
             "Valid non-zero hexadecimal buyer address is required"
         );
         let final_seller = if is_valid_evm_address(&seller_address) {
-            seller_address
+            seller_address.clone()
         } else if let Some(ref prev) = existing {
             if is_valid_evm_address(&prev.seller_address) {
                 prev.seller_address.clone()
@@ -1124,16 +1118,27 @@ impl ConpiEscrow {
         };
 
         let final_buyer = if is_valid_evm_address(&buyer_address) {
-            buyer_address
+            buyer_address.clone()
         } else if let Some(ref prev) = existing {
             if is_valid_evm_address(&prev.buyer_address) {
                 prev.buyer_address.clone()
             } else {
-                buyer_address
+                buyer_address.clone()
             }
         } else {
-            buyer_address
+            buyer_address.clone()
         };
+
+        if let Some(ref prev) = existing {
+            let immutable_parameters_set = prev.foreign_amount.0 > 0 || !prev.vault_address.is_empty();
+            if immutable_parameters_set {
+                require!(prev.chain_id == chain_id, "Foreign chain id is locked");
+                require!(prev.vault_address.eq_ignore_ascii_case(&vault_address), "Foreign vault is locked");
+                require!(prev.token_address.eq_ignore_ascii_case(&token_address), "Foreign token is locked");
+                require!(prev.foreign_amount == foreign_amount, "Foreign amount is locked");
+                require!(prev.seller_address.eq_ignore_ascii_case(&final_seller), "Foreign seller address is locked");
+            }
+        }
 
         let info = ForeignChainInfo {
             chain_id,
@@ -1161,12 +1166,7 @@ impl ConpiEscrow {
             caller == deal.buyer || is_tee_signer,
             "Only the buyer or TEE signer can set the foreign refund address"
         );
-        require!(
-            deal.status == DealStatus::Created
-                || deal.status == DealStatus::Funded
-                || deal.status == DealStatus::Active,
-            "Buyer refund address can only be set before deal is settled"
-        );
+        require!(deal.status == DealStatus::Created, "Buyer refund address can only be set while the deal is Created");
         require!(
             is_valid_evm_address(&buyer_address),
             "Valid non-zero hexadecimal buyer address is required"
@@ -1181,6 +1181,11 @@ impl ConpiEscrow {
             evm_nonce: 0,
             seller_claimed: false,
         });
+        require!(
+            !is_valid_evm_address(&info.buyer_address)
+                || info.buyer_address.eq_ignore_ascii_case(&buyer_address),
+            "Foreign buyer address is locked"
+        );
         info.buyer_address = buyer_address;
         self.foreign_deals.insert(&deal_id, &info);
     }
@@ -1191,12 +1196,7 @@ impl ConpiEscrow {
             env::predecessor_account_id() == deal.seller,
             "Only the seller can set their foreign payout address"
         );
-        require!(
-            deal.status == DealStatus::Created
-                || deal.status == DealStatus::Funded
-                || deal.status == DealStatus::Active,
-            "Seller payout address can only be set before deal is settled"
-        );
+        require!(deal.status == DealStatus::Created, "Seller payout address can only be set while the deal is Created");
         require!(
             is_valid_evm_address(&seller_address),
             "Valid non-zero hexadecimal seller address is required"
@@ -1211,6 +1211,11 @@ impl ConpiEscrow {
             evm_nonce: 0,
             seller_claimed: false,
         });
+        require!(
+            !is_valid_evm_address(&info.seller_address)
+                || info.seller_address.eq_ignore_ascii_case(&seller_address),
+            "Foreign seller address is locked"
+        );
         info.seller_address = seller_address;
         self.foreign_deals.insert(&deal_id, &info);
     }

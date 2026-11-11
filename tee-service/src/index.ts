@@ -29,6 +29,7 @@ import { foreignRelayer } from "./chain/foreign-relayer.js";
 import { baseClient, BASE_SEPOLIA_USDC, BASE_SEPOLIA_CHAIN_ID } from "./chain/base-client.js";
 import {
   verifySellerKeyAuthorization,
+  consumeSellerKeyAuthorizationNonce,
   type SellerKeyAuthorization,
 } from "./auth/seller-key.js";
 
@@ -161,7 +162,7 @@ export async function buildApp() {
         encryptedEnvelope,
         plainApiKey,
         authorization: sellerAuthorization as SellerKeyAuthorization,
-      });
+      }, { consumeNonce: false });
       const requestedDealStatus = String(onChainDeal.status || "").toLowerCase();
       if (requestedDealStatus !== "funded" && requestedDealStatus !== "active") {
         return reply.status(409).send({
@@ -185,6 +186,7 @@ export async function buildApp() {
           error: `Deal #${dealId} is already active; its provider key cannot be replaced`,
         });
       }
+      consumeSellerKeyAuthorizationNonce(sellerAuthorization as SellerKeyAuthorization);
       if (existing) {
         const activation = existing.signedPayloads.find((item) => item.payload.kind === PayloadKind.Activate);
         if (!activation) {
@@ -561,7 +563,7 @@ export async function buildApp() {
       dealId: number;
       txHash: `0x${string}`;
       termsHashHex: string;
-      expectedAmountAtomic: string;
+      expectedAmountAtomic?: string;
       minConfirmations?: number;
       autoRelay?: boolean;
     };
@@ -570,11 +572,37 @@ export async function buildApp() {
       return reply.status(400).send({ error: "Missing required parameters (dealId, txHash, termsHashHex)" });
     }
 
+    const [deal, foreignDeal] = await Promise.all([
+      nearRelayer.getDeal(body.dealId),
+      nearRelayer.getForeignDeal(body.dealId),
+    ]);
+    if (!deal) {
+      return reply.status(404).send({ error: "Deal does not exist on the escrow contract" });
+    }
+    if (!foreignDeal) {
+      return reply.status(409).send({ error: "Foreign deal parameters must be registered by the seller before deposit verification" });
+    }
+
+    const lockedAmountAtomic = String(foreignDeal.foreign_amount || "0");
+    if (BigInt(lockedAmountAtomic) <= 0n) {
+      return reply.status(409).send({ error: "On-chain foreign deposit amount is not locked" });
+    }
+
     const vault = foreignVaultManager.deriveVaultAddress(CONFIG.contractId, body.dealId);
+    if (String(foreignDeal.vault_address || "").toLowerCase() !== vault.address.toLowerCase()) {
+      return reply.status(409).send({ error: "Registered vault does not match the deterministic deal vault" });
+    }
+    if (Number(foreignDeal.chain_id) !== BASE_SEPOLIA_CHAIN_ID) {
+      return reply.status(409).send({ error: "Registered foreign chain is not Base Sepolia" });
+    }
+    if (String(foreignDeal.token_address || "").toLowerCase() !== BASE_SEPOLIA_USDC.toLowerCase()) {
+      return reply.status(409).send({ error: "Registered foreign token is not Base Sepolia USDC" });
+    }
+
     const verification = await baseClient.verifyDeposit({
       txHash: body.txHash,
       expectedVault: vault.address,
-      expectedAmountAtomic: body.expectedAmountAtomic || "1",
+      expectedAmountAtomic: lockedAmountAtomic,
       minConfirmations: body.minConfirmations ? BigInt(body.minConfirmations) : 1n,
     });
 
@@ -587,7 +615,13 @@ export async function buildApp() {
     }
 
     // Construct enclave ForeignDeposit payload
-    const termsHashBytes = Buffer.from(body.termsHashHex, "hex");
+    const termsHashBytes = Array.isArray(deal.terms_hash)
+      ? Buffer.from(deal.terms_hash)
+      : Buffer.from(body.termsHashHex.replace(/^0x/, ""), "hex");
+    const requestedTermsHash = body.termsHashHex.replace(/^0x/, "").toLowerCase();
+    if (termsHashBytes.toString("hex") !== requestedTermsHash) {
+      return reply.status(409).send({ error: "Deposit verification terms hash does not match the on-chain deal" });
+    }
     const payload: SignedPayloadDto = {
       domain: "conpi:v1",
       contractId: CONFIG.contractId,
@@ -598,7 +632,7 @@ export async function buildApp() {
       stage: 0,
       meteredValueYocto: 0n,
       reason: null,
-      nonce: 1,
+      nonce: Number(deal.last_nonce || 0) + 1,
       issuedAtNs: BigInt(Date.now()) * 1_000_000n,
     };
 
@@ -609,25 +643,11 @@ export async function buildApp() {
     let relayResult = null;
     if (body.autoRelay && nearRelayer.isConfigured()) {
       try {
-        const foreignDeal = await nearRelayer.getForeignDeal(body.dealId);
-        if (!foreignDeal) {
-          const sender = verification.sender;
-          if (!sender || sender === "0x0000000000000000000000000000000000000000") {
-            throw new Error("Cannot register foreign chain deal with invalid sender address");
-          }
-          const seller = (body as any).sellerAddress && (body as any).sellerAddress !== "0x0000000000000000000000000000000000000000"
-            ? (body as any).sellerAddress
-            : sender;
-          await nearRelayer.submitRegisterForeignChainDeal({
-            dealId: body.dealId,
-            chainId: BASE_SEPOLIA_CHAIN_ID,
-            vaultAddress: vault.address,
-            tokenAddress: BASE_SEPOLIA_USDC,
-            buyerAddress: sender,
-            sellerAddress: seller,
-            foreignAmount: body.expectedAmountAtomic,
-          });
-          await new Promise((r) => setTimeout(r, 1000));
+        if (
+          !verification.sender ||
+          String(foreignDeal.buyer_address || "").toLowerCase() !== verification.sender.toLowerCase()
+        ) {
+          throw new Error("Verified deposit sender does not match the locked foreign buyer address");
         }
         relayResult = await nearRelayer.submitForeignDeposit(
           body.dealId,

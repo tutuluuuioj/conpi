@@ -71,7 +71,6 @@ import {
   txAcceptAndDepositNear,
   txDepositNear,
   txDepositFt,
-  txFtTransfer,
   txStorageDeposit,
   txActivateDeal,
   txReleaseStage,
@@ -79,7 +78,6 @@ import {
   txSettleDefault,
   txSettleDefaultForeign,
   txRecordForeignDeposit,
-  txConfirmForeignDeposit,
   txClaim,
   txTimeoutRefundForeign,
   txClaimSellerForeignPayout,
@@ -206,7 +204,6 @@ interface Api {
   setForeignBuyerAddress?: (dealId: string, buyerAddress: string) => Promise<SignResult>;
   requestAutoRelease?: (dealId: string) => Promise<SignResult>;
   finalizeAutoRelease?: (dealId: string) => Promise<SignResult>;
-  confirmForeignDeposit?: (dealId: string) => Promise<SignResult>;
   confirmProposal: (id: string) => void;
   executeProposal: (id: string) => Promise<SignResult> | SignResult;
   markNotice: (id: string) => void;
@@ -1498,27 +1495,9 @@ export function Providers({ children }: { children: React.ReactNode }) {
             } catch {}
           }
 
-          if (listing.token === "USDC" || (listing.token as any) === "USDC.base") {
-            try {
-              const vault = deriveForeignVaultAddress(CONTRACT_ID, Number(id));
-              const foreignAmount = Math.round(listing.price * 1e6).toString();
-              const savedSellerEvm = typeof window !== "undefined" ? (localStorage.getItem(`conpi_seller_evm_${id}`) || localStorage.getItem("conpi_last_seller_evm") || "0x0000000000000000000000000000000000000000") : "0x0000000000000000000000000000000000000000";
-              if (savedSellerEvm && savedSellerEvm !== "0x0000000000000000000000000000000000000000") {
-                console.log(`[openTicket] Auto-registering foreign deal #${id} on Base Sepolia... Vault: ${vault.address}`);
-                await txRegisterForeignChainDeal(
-                  Number(id),
-                  BASE_SEPOLIA_CHAIN_ID,
-                  vault.address,
-                  BASE_SEPOLIA_USDC,
-                  buyer.startsWith("0x") ? buyer : "0x0000000000000000000000000000000000000000",
-                  savedSellerEvm,
-                  foreignAmount
-                );
-              }
-            } catch (fErr) {
-              console.warn("[openTicket] Auto-register foreign chain deal notice:", fErr);
-            }
-          }
+          // The buyer cannot register payout parameters. The seller locks the
+          // deterministic vault, token, amount and payout address on-chain
+          // before this deal can accept a foreign deposit.
         } catch (err: any) {
           replaceToast(pendingToast, { kind: "error", title: "Deal creation failed", body: err.message });
           return null;
@@ -1873,55 +1852,30 @@ export function Providers({ children }: { children: React.ReactNode }) {
           await submitPartyTermsToTee(deal, deal.role);
           // 100% USDC deposits on NEAR using official Circle Native USDC:
           const tokenContract = MAKER_VAULT_CONFIG.near.tokenAddress;
-          const vaultAddress = MAKER_VAULT_CONFIG.near.vaultAddress;
           const rawAmount = Math.round(amount * 1e6).toString();
 
-          let txHash = "";
-          try {
-            const outcome: any = await txFtTransfer(
-              tokenContract,
-              vaultAddress,
-              rawAmount,
-              `Conpi Deal #${dealId} Escrow Deposit`
-            );
-            txHash = outcome?.transaction?.hash || outcome?.transaction_outcome?.id || "";
-          } catch (tErr: any) {
-            console.warn("txFtTransfer error, attempting ft_transfer_call fallback:", tErr);
-            const outcome: any = await txDepositFt(tokenContract, Number(dealId), rawAmount);
-            txHash = outcome?.transaction?.hash || outcome?.transaction_outcome?.id || "";
-          }
+          const outcome: any = await txDepositFt(tokenContract, Number(dealId), rawAmount);
+          const txHash = outcome?.transaction?.hash || outcome?.transaction_outcome?.id || "";
 
           if (!txHash) throw new Error("USDC Deposit transaction was not confirmed");
 
-          // Auto-verify and record deposit via Maker Vault API
-          try {
-            await fetch("/api/vault/verify-deposit", {
-              method: "POST",
-              headers: { "Content-Type": "application/json" },
-              body: JSON.stringify({
-                dealId: Number(dealId),
-                chain: "near",
-                txHash,
-                expectedUsdcAmount: amount,
-                buyerAddress: stateRef.current.account || undefined,
-                sellerPayoutChain: deal.seller.startsWith("0x") ? "base" : "solana",
-                sellerPayoutAddress: deal.seller,
-              }),
-            });
-          } catch (vErr) {
-            console.warn("Vault verify-deposit notice:", vErr);
+          await new Promise((resolve) => setTimeout(resolve, 1200));
+          const recordedDeal = await fetchContractDeal(Number(dealId));
+          const required = isBuyer
+            ? BigInt(recordedDeal?.price || "0") + BigInt(recordedDeal?.buyer_collateral || "0")
+            : BigInt(recordedDeal?.seller_collateral || "0");
+          const deposited = BigInt(isBuyer ? recordedDeal?.buyer_deposited || "0" : recordedDeal?.seller_deposited || "0");
+          if (!recordedDeal || required <= BigInt(0) || deposited < required) {
+            throw new Error("The NEAR escrow contract did not record the full deposit");
           }
-
-          try {
-            await txConfirmForeignDeposit(Number(dealId));
-          } catch {}
+          const funded = ["Funded", "Active"].includes(String(recordedDeal.status));
 
           patchDeal(dealId, (item) => ({
             ...item,
             buyerDeposited: isBuyer ? true : item.buyerDeposited,
             sellerDeposited: !isBuyer ? true : item.sellerDeposited,
-            step: "key",
-            status: "Funded",
+            step: funded ? "key" : "deposit",
+            status: funded ? "Funded" : "Created",
             activity: [
               {
                 id: crypto.randomUUID(),
@@ -1972,8 +1926,19 @@ export function Providers({ children }: { children: React.ReactNode }) {
             };
           }
 
-          // 1. If buyerEvmAddress is known and valid, register foreign parameters on-chain upfront
+          // Foreign settlement parameters are seller-locked before a buyer can
+          // deposit. The buyer may only bind their own refund address.
           let onChainForeign = await fetchContractForeignDeal(Number(dealId));
+          if (
+            !onChainForeign ||
+            !onChainForeign.vault_address ||
+            BigInt(onChainForeign.foreign_amount || "0") <= BigInt(0)
+          ) {
+            throw new Error("The seller must lock the foreign vault, payout address, token, and amount before the buyer deposits");
+          }
+          if (BigInt(onChainForeign.foreign_amount) !== BigInt(expectedUsdcAtomic)) {
+            throw new Error("The requested deposit does not match the seller-locked on-chain amount");
+          }
           if (
             onChainForeign?.vault_address &&
             (!onChainForeign.buyer_address || onChainForeign.buyer_address === "0x0000000000000000000000000000000000000000") &&
@@ -1984,23 +1949,8 @@ export function Providers({ children }: { children: React.ReactNode }) {
             await new Promise((r) => setTimeout(r, 800));
             onChainForeign = await fetchContractForeignDeal(Number(dealId));
           }
-          const needsRegistration = !onChainForeign || !onChainForeign.foreign_amount || onChainForeign.foreign_amount === "0" || !onChainForeign.vault_address;
-          if (needsRegistration && buyerEvmAddress && buyerEvmAddress !== "0x0000000000000000000000000000000000000000") {
-            try {
-              const vault = deriveForeignVaultAddress(CONTRACT_ID, Number(dealId)).address;
-              await txRegisterForeignChainDeal(
-                Number(dealId),
-                BASE_SEPOLIA_CHAIN_ID,
-                vault,
-                BASE_SEPOLIA_USDC,
-                buyerEvmAddress,
-                sellerEvmAddress,
-                expectedUsdcAtomic
-              );
-              await new Promise((r) => setTimeout(r, 1200));
-            } catch (regErr) {
-              console.warn("Client registration of foreign deal notice:", regErr);
-            }
+          if (!buyerEvmAddress || buyerEvmAddress === "0x0000000000000000000000000000000000000000") {
+            throw new Error("Connect the Base buyer wallet before verifying the deposit");
           }
 
           const result = await teeApi.verifyForeignDeposit({
@@ -2014,25 +1964,6 @@ export function Providers({ children }: { children: React.ReactNode }) {
 
           if (!result.ok) {
             throw new Error(result.error || "TEE verification of Base Sepolia deposit failed");
-          }
-
-          // Fallback: If foreign deal was not registered yet, register using verified sender from receipt
-          onChainForeign = await fetchContractForeignDeal(Number(dealId));
-          if (!onChainForeign || !onChainForeign.foreign_amount || onChainForeign.foreign_amount === "0" || !onChainForeign.vault_address) {
-            const verifiedSender = result.verification?.sender;
-            if (verifiedSender && verifiedSender !== "0x0000000000000000000000000000000000000000") {
-              const vault = deriveForeignVaultAddress(CONTRACT_ID, Number(dealId)).address;
-              await txRegisterForeignChainDeal(
-                Number(dealId),
-                BASE_SEPOLIA_CHAIN_ID,
-                vault,
-                BASE_SEPOLIA_USDC,
-                verifiedSender,
-                sellerEvmAddress,
-                expectedUsdcAtomic
-              );
-              await new Promise((r) => setTimeout(r, 1000));
-            }
           }
 
           // Fallback to manual on-chain deposit recording if auto-relay failed or was unconfigured
@@ -2049,11 +1980,24 @@ export function Providers({ children }: { children: React.ReactNode }) {
             }
           }
 
+          await new Promise((r) => setTimeout(r, 1200));
+          const fundedDeal = await fetchContractDeal(Number(dealId));
+          const requiredBuyerDeposit = fundedDeal
+            ? BigInt(fundedDeal.price || "0") + BigInt(fundedDeal.buyer_collateral || "0")
+            : BigInt(0);
+          const buyerDepositRecorded = fundedDeal
+            ? BigInt(fundedDeal.buyer_deposited || "0") >= requiredBuyerDeposit && requiredBuyerDeposit > BigInt(0)
+            : false;
+          if (!buyerDepositRecorded) {
+            throw new Error(result.relayResult?.error || "Deposit was verified, but the TEE-signed escrow record has not been confirmed on NEAR");
+          }
+          const funded = ["Funded", "Active"].includes(String(fundedDeal?.status));
+
           patchDeal(dealId, (item) => ({
             ...item,
             buyerDeposited: true,
-            step: item.sellerDeposited ? "key" : item.step,
-            status: item.sellerDeposited ? "Funded" : item.status,
+            step: funded ? "key" : "deposit",
+            status: funded ? "Funded" : "Created",
             activity: [
               {
                 id: crypto.randomUUID(),
@@ -2070,8 +2014,10 @@ export function Providers({ children }: { children: React.ReactNode }) {
 
           return {
             ok: true,
-            title: "Base Sepolia Deposit Verified & Recorded",
-            body: `Transaction confirmed on Base Sepolia and recorded into escrow.`,
+            title: funded ? "Base Sepolia Deposit Funded" : "Base Sepolia Deposit Recorded",
+            body: funded
+              ? "Transaction confirmed on Base Sepolia and the escrow is Funded."
+              : "Buyer deposit is recorded on-chain; the deal remains Created until the seller collateral is deposited.",
             href: `https://sepolia.basescan.org/tx/${evmTxHash}`,
           };
         } catch (err: any) {
@@ -2087,72 +2033,18 @@ export function Providers({ children }: { children: React.ReactNode }) {
         sellerPayoutChain,
         sellerPayoutAddress
       ) => {
-        const deal = stateRef.current.deals.find((item) => item.id === dealId);
-        if (!deal) return { ok: false, title: "Deal not found" };
-
-        try {
-          await submitPartyTermsToTee(deal, deal.role);
-
-          const res = await fetch("/api/vault/verify-deposit", {
-            method: "POST",
-            headers: { "Content-Type": "application/json" },
-            body: JSON.stringify({
-              dealId: Number(dealId),
-              chain,
-              txHash,
-              expectedUsdcAmount: amountUsdc,
-              buyerAddress,
-              sellerPayoutChain: sellerPayoutChain || "base",
-              sellerPayoutAddress: sellerPayoutAddress || undefined,
-            }),
-          });
-
-          const result = await res.json();
-          if (!result.ok) {
-            throw new Error(result.error || `Failed to verify USDC deposit on ${chain.toUpperCase()}`);
-          }
-
-          let coordinationConfirmed = false;
-          try {
-            await txConfirmForeignDeposit(Number(dealId));
-            coordinationConfirmed = true;
-          } catch (cfErr) {
-            console.warn("Auto confirm foreign deposit on NEAR contract notice:", cfErr);
-          }
-
-          patchDeal(dealId, (item) => ({
-            ...item,
-            buyerDeposited: true,
-            step: coordinationConfirmed ? "key" : "deposit",
-            status: coordinationConfirmed ? "Funded" : "Created",
-            activity: [
-              {
-                id: crypto.randomUUID(),
-                title: coordinationConfirmed ? "USDC Escrow Funded" : "USDC Deposit Verified",
-                detail: coordinationConfirmed
-                  ? `$${amountUsdc.toFixed(2)} USDC locked in Conpi Maker Vault (${chain.toUpperCase()}).`
-                  : `Deposit verified on ${chain.toUpperCase()}, but the NEAR coordination contract is still awaiting confirmation.`,
-                tx: txHash,
-                time: "Now",
-              },
-              ...item.activity,
-            ],
-          }));
-
-          setTimeout(loadOnChainData, 2000);
-
-          return {
-            ok: true,
-            title: "USDC Deposit Confirmed",
-            body: `$${amountUsdc.toFixed(2)} USDC locked in Conpi Maker Vault (${chain.toUpperCase()}).`,
-          };
-        } catch (err: any) {
-          return {
-            ok: false,
-            title: "Maker Vault Deposit Failed",
-            body: err?.message || "Verification failed",
-          };
-        }
+        void dealId;
+        void chain;
+        void txHash;
+        void amountUsdc;
+        void buyerAddress;
+        void sellerPayoutChain;
+        void sellerPayoutAddress;
+        return {
+          ok: false,
+          title: "Shared Maker Vault deposits are paused",
+          body: "Use the per-deal Base vault or the on-chain NEAR escrow. A browser-verified pooled deposit cannot mark a deal Funded.",
+        };
       },
       submitSellerKey: async (dealId, plainApiKey) => {
         const deal = stateRef.current.deals.find((item) => item.id === dealId);
@@ -2213,20 +2105,6 @@ export function Providers({ children }: { children: React.ReactNode }) {
               await new Promise((r) => setTimeout(r, 1500));
             } catch (err: any) {
               console.warn("Auto-accept failed, proceeding:", err);
-            }
-          }
-
-          // If foreign deal is in Created status, confirm foreign deposit to transition deal to Funded on NEAR
-          if (onChain && onChain.status === "Created") {
-            try {
-              const foreignInfo = await fetchContractForeignDeal(Number(dealId));
-              if (foreignInfo && foreignInfo.buyer_address && foreignInfo.buyer_address !== "0x0000000000000000000000000000000000000000") {
-                pushToast({ kind: "pending", title: "Confirming Base Sepolia deposit on NEAR..." });
-                await txConfirmForeignDeposit(Number(dealId));
-                await new Promise((r) => setTimeout(r, 1500));
-              }
-            } catch (cfErr: any) {
-              console.warn("Auto confirm_foreign_deposit notice:", cfErr);
             }
           }
 
@@ -2317,90 +2195,6 @@ export function Providers({ children }: { children: React.ReactNode }) {
       releaseStagePayout: async (dealId) => {
         const deal = stateRef.current.deals.find((item) => item.id === dealId);
         if (!deal) return { ok: false, title: "Deal not found" };
-
-        // For active Maker Vault deals
-        if ((deal as any).active_vault_deal || deal.baseUrl?.includes("localhost")) {
-          const currentStage = [100, 75, 50, 25].find((s) => deal.stage >= s) || 0;
-          if (currentStage === 0) {
-            const creditUsd = deal.creditUsd || deal.credit;
-            const target25 = (creditUsd * 0.25).toFixed(4);
-            pushToast({
-              kind: "error",
-              title: "Stage 25% payout not ready",
-              body: `Current usage is $${deal.usedUsd.toFixed(4)}. Payout unlocks once usage reaches 25% ($${target25} USD).`,
-            });
-            return { ok: false, title: "Stage not reached yet" };
-          }
-
-          const unitPrice = deal.priceUsd || deal.price;
-          const milestoneUsdc = Number((unitPrice * 0.25).toFixed(4));
-
-          // Check previous payouts to see if this specific stage is already paid
-          const paidStages = new Set<number>();
-          try {
-            const checkRes = await fetch(`/api/vault/payout?dealId=${dealId}`);
-            if (checkRes.ok) {
-              const checkData = await checkRes.json();
-              const existing = (checkData.payouts || []).filter((p: any) => !p.isRefund);
-              for (const p of existing) {
-                const match = String(p.memo || "").match(/Stage\s*(\d+)%/i);
-                if (match) paidStages.add(Number(match[1]));
-              }
-            }
-          } catch {}
-
-          if (paidStages.has(currentStage)) {
-            pushToast({
-              kind: "info",
-              title: `Stage ${currentStage}% payout already executed`,
-              body: `Stage ${currentStage}% ($${milestoneUsdc} USDC) has already been dispatched. Next release at ${currentStage >= 100 ? "completion" : `${currentStage + 25}%`}.`,
-            });
-            return { ok: true, title: "Already executed" };
-          }
-
-          const payoutRail = (typeof window !== "undefined" && localStorage.getItem(`conpi_seller_payout_rail_${dealId}`)) || "solana";
-          const payoutAddr = (typeof window !== "undefined" && localStorage.getItem(`conpi_seller_payout_addr_${dealId}`)) || "DeEpqiydVZLN7xoFvD6ARyW6bjgum9UUdpK5wWA7UftN";
-
-          pushToast({ kind: "pending", title: `Dispatching Conpi Maker Vault Stage ${currentStage}% payout ($${milestoneUsdc} USDC)...` });
-
-          try {
-            const payoutRes = await fetch("/api/vault/payout", {
-              method: "POST",
-              headers: { "Content-Type": "application/json" },
-              body: JSON.stringify({
-                dealId: Number(dealId),
-                recipientAddress: payoutAddr,
-                payoutChain: payoutRail,
-                amountUsdc: milestoneUsdc,
-                memo: `Stage ${currentStage}% Milestone Payout for Deal #${dealId}`,
-              }),
-            });
-            const payoutData = await payoutRes.json();
-            if (!payoutData.ok) {
-              throw new Error(payoutData.error || "Vault payout dispatch failed");
-            }
-
-            patchDeal(dealId, (item) => ({
-              ...item,
-              releasedUsd: Number(((item.releasedUsd || 0) + milestoneUsdc).toFixed(4)),
-              lastUpdate: `Vault Payout (${new Date().toLocaleTimeString()})`,
-            }));
-
-            pushToast({
-              kind: "success",
-              title: `Stage ${currentStage}% Payout Executed!`,
-              body: `Transferred $${milestoneUsdc.toFixed(4)} USDC to ${payoutRail.toUpperCase()} wallet: ${payoutAddr.slice(0, 8)}... (${payoutData.txHash?.slice(0, 10)}...)`,
-            });
-            return {
-              ok: true,
-              title: `Stage ${currentStage}% Released`,
-              body: `Tx: ${payoutData.txHash}`,
-            };
-          } catch (err: any) {
-            pushToast({ kind: "error", title: "Stage release failed", body: err.message });
-            return { ok: false, title: "Stage release failed", body: err.message };
-          }
-        }
 
         pushToast({ kind: "pending", title: "Querying TEE stage payloads..." });
 
@@ -2724,50 +2518,6 @@ export function Providers({ children }: { children: React.ReactNode }) {
               heartbeat: data.active ? "live" : item.heartbeat,
             };
           });
-
-          // Automatic Milestone Payout Dispatch for Maker Vault deals (25%, 50%, 75%, 100%)
-          const stageVal = Number(data.creditUsd) > 0 ? Math.min(100, Math.floor((Number(data.usedUsd || 0) / Number(data.creditUsd)) * 100)) : deal.stage;
-          if (stageVal >= 25 && ((deal as any).active_vault_deal || deal.baseUrl?.includes("localhost"))) {
-            const maxStagesOwed = Math.floor(stageVal / 25);
-            fetch(`/api/vault/payout?dealId=${dealId}`)
-              .then((r) => r.json())
-              .then(async (pData) => {
-                const paid = (pData.payouts || []).filter((p: any) => !p.isRefund);
-                if (paid.length < maxStagesOwed) {
-                  const targetStage = (paid.length + 1) * 25;
-                  const unitPrice = Number(data.priceUsd) || deal.priceUsd || deal.price || 0.04;
-                  const milestoneUsdc = Number((unitPrice * 0.25).toFixed(4));
-                  const payoutRail = (typeof window !== "undefined" && localStorage.getItem(`conpi_seller_payout_rail_${dealId}`)) || "solana";
-                  const payoutAddr = (typeof window !== "undefined" && localStorage.getItem(`conpi_seller_payout_addr_${dealId}`)) || "DeEpqiydVZLN7xoFvD6ARyW6bjgum9UUdpK5wWA7UftN";
-
-                  const autoRes = await fetch("/api/vault/payout", {
-                    method: "POST",
-                    headers: { "Content-Type": "application/json" },
-                    body: JSON.stringify({
-                      dealId: Number(dealId),
-                      recipientAddress: payoutAddr,
-                      payoutChain: payoutRail,
-                      amountUsdc: milestoneUsdc,
-                      memo: `Stage ${targetStage}% Auto-Release for Deal #${dealId}`,
-                    }),
-                  });
-                  const autoData = await autoRes.json();
-                  if (autoData.ok) {
-                    patchDeal(dealId, (item) => ({
-                      ...item,
-                      releasedUsd: Number(((item.releasedUsd || 0) + milestoneUsdc).toFixed(4)),
-                      lastUpdate: `Auto Payout (${new Date().toLocaleTimeString()})`,
-                    }));
-                    pushToast({
-                      kind: "success",
-                      title: `Stage ${targetStage}% Auto-Released!`,
-                      body: `Transferred $${milestoneUsdc.toFixed(4)} USDC to ${payoutRail.toUpperCase()} wallet: ${payoutAddr.slice(0, 8)}... (${autoData.txHash?.slice(0, 10)}...)`,
-                    });
-                  }
-                }
-              })
-              .catch(() => {});
-          }
 
           if (!silent) {
             pushToast({
@@ -3152,14 +2902,14 @@ export function Providers({ children }: { children: React.ReactNode }) {
               localStorage.setItem(`conpi_seller_evm_${dealId}`, sellerAddress);
             } catch {}
           }
+          const deal = stateRef.current.deals.find((d) => d.id === dealId);
+          if (!deal) throw new Error("Deal not found");
+          const existing = await fetchContractForeignDeal(Number(dealId));
           let outcome: any;
-          try {
-            outcome = await txSetForeignSellerAddress(Number(dealId), sellerAddress);
-          } catch (err: any) {
-            // Fallback: If foreign parameters not registered yet on contract, register them
+          if (!existing || !existing.vault_address || BigInt(existing.foreign_amount || "0") === BigInt(0)) {
             const vault = deriveForeignVaultAddress(CONTRACT_ID, Number(dealId)).address;
-            const deal = stateRef.current.deals.find((d) => d.id === dealId);
-            const expectedAmount = deal?.priceUsd ? Math.round(deal.priceUsd * 1_000_000).toString() : "40000";
+            const priceUsd = deal.priceUsd && deal.priceUsd > 0 ? deal.priceUsd : deal.price;
+            const expectedAmount = Math.round(priceUsd * 1_000_000).toString();
             outcome = await txRegisterForeignChainDeal(
               Number(dealId),
               BASE_SEPOLIA_CHAIN_ID,
@@ -3169,6 +2919,8 @@ export function Providers({ children }: { children: React.ReactNode }) {
               sellerAddress,
               expectedAmount
             );
+          } else {
+            outcome = await txSetForeignSellerAddress(Number(dealId), sellerAddress);
           }
           const txHash = outcome?.transaction?.hash || outcome?.transaction_outcome?.id;
           if (!txHash) throw new Error("Set foreign seller address transaction failed");
@@ -3272,24 +3024,6 @@ export function Providers({ children }: { children: React.ReactNode }) {
           return { ok: true, title: "Deal auto-released and completed", href: `https://testnet.nearblocks.io/txns/${txHash}`, body: `Deal #${dealId} finalized.` };
         } catch (err: any) {
           return { ok: false, title: "Auto release failed", body: err.message };
-        }
-      },
-      confirmForeignDeposit: async (dealId) => {
-        pushToast({ kind: "pending", title: "Confirming Base Sepolia deposit on NEAR..." });
-        try {
-          const outcome: any = await txConfirmForeignDeposit(Number(dealId));
-          const txHash = outcome?.transaction?.hash || outcome?.transaction_outcome?.id;
-          pushToast({
-            kind: "success",
-            title: "Deposit Confirmed on NEAR!",
-            body: "Escrow is 100% funded. Proceeding to Key Activation.",
-            href: txHash ? `https://testnet.nearblocks.io/txns/${txHash}` : undefined,
-          });
-          setTimeout(loadOnChainData, 1500);
-          return { ok: true, title: "Deposit Confirmed", dealId };
-        } catch (err: any) {
-          pushToast({ kind: "error", title: "Confirm deposit failed", body: err.message });
-          return { ok: false, title: "Confirm Failed", body: err.message };
         }
       },
       confirmProposal: (id) => {

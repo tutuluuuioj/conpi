@@ -26,6 +26,12 @@ jobs:
           sudo mv cargo-near-x86_64-unknown-linux-gnu/cargo-near /usr/local/bin/
           cargo near --version
 
+      - name: Run contract tests and compile examples
+        run: |
+          cd contracts
+          cargo test
+          cargo check --examples
+
       - name: Run Reproducible Build
         run: |
           cd contracts

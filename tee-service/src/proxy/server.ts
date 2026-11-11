@@ -208,6 +208,8 @@ async function finalizeProviderUsage(
   };
 }
 
+const billingQueueWaiters = new Map<number, number>();
+
 async function acquireBillingLock(entry: VaultEntry, reply: FastifyReply): Promise<boolean> {
   if (entry.defaultPayload) {
     reply.status(502).send({
@@ -216,14 +218,37 @@ async function acquireBillingLock(entry: VaultEntry, reply: FastifyReply): Promi
     });
     return false;
   }
-  while (entry.requestInFlight) {
-    await new Promise((resolve) => setTimeout(resolve, 10));
-    if (entry.defaultPayload) {
-      reply.status(502).send({
-        error: { message: "Provider credentials or quota failed; deterministic default settlement payload created", code: "seller_self_drain" },
-        defaultPayload: publicSignedPayload(entry.defaultPayload),
+  if (entry.requestInFlight) {
+    const queued = billingQueueWaiters.get(entry.dealId) || 0;
+    if (queued >= CONFIG.billingQueueMaxWaiters) {
+      reply.status(429).send({
+        error: { message: "Per-deal billing queue is full", code: "billing_queue_full" },
       });
       return false;
+    }
+    billingQueueWaiters.set(entry.dealId, queued + 1);
+    const deadline = Date.now() + CONFIG.billingQueueTimeoutMs;
+    try {
+      while (entry.requestInFlight) {
+        if (Date.now() >= deadline) {
+          reply.status(503).send({
+            error: { message: "Timed out waiting for the per-deal billing queue", code: "billing_queue_timeout" },
+          });
+          return false;
+        }
+        await new Promise((resolve) => setTimeout(resolve, 10));
+        if (entry.defaultPayload) {
+          reply.status(502).send({
+            error: { message: "Provider credentials or quota failed; deterministic default settlement payload created", code: "seller_self_drain" },
+            defaultPayload: publicSignedPayload(entry.defaultPayload),
+          });
+          return false;
+        }
+      }
+    } finally {
+      const remaining = (billingQueueWaiters.get(entry.dealId) || 1) - 1;
+      if (remaining > 0) billingQueueWaiters.set(entry.dealId, remaining);
+      else billingQueueWaiters.delete(entry.dealId);
     }
   }
   entry.requestInFlight = true;

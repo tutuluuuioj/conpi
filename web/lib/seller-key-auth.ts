@@ -1,7 +1,7 @@
 import { Buffer } from "buffer";
 import { createWalletClient, custom, type Address, type Hex } from "viem";
 import { baseSepolia } from "viem/chains";
-import { CONTRACT_ID } from "./chain";
+import { CONTRACT_ID, NETWORK } from "./chain";
 import { getEvmProvider } from "./evm-wallet";
 import { getSolanaProvider } from "./solana-wallet";
 import { getWalletSelector } from "./wallet";
@@ -61,6 +61,8 @@ async function buildMessage(
     models: Array.from(new Set(input.models.map((item) => item.trim()).filter(Boolean))).sort(),
     termsHashHex: input.termsHashHex.replace(/^0x/, "").toLowerCase(),
     keyCommitment: await sha256Hex(stableStringify(input.encryptedEnvelope)),
+    chainId: NETWORK,
+    contractId: CONTRACT_ID,
     wallet: unsigned,
   });
 }

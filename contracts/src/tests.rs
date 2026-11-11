@@ -42,6 +42,29 @@ mod tests {
         signing_key.sign(&message).to_bytes().to_vec()
     }
 
+    fn register_foreign_chain_deal_as_seller(
+        contract: &mut ConpiEscrow,
+        deal_id: u64,
+        chain_id: u64,
+        vault_address: String,
+        token_address: String,
+        buyer_address: String,
+        seller_address: String,
+        foreign_amount: U128,
+    ) {
+        let seller = contract.get_deal(deal_id).expect("deal exists").seller;
+        testing_env!(get_context(seller, NearToken::from_yoctonear(0)).build());
+        contract.register_foreign_chain_deal(
+            deal_id,
+            chain_id,
+            vault_address,
+            token_address,
+            buyer_address,
+            seller_address,
+            foreign_amount,
+        );
+    }
+
     // -------------------------------------------------------------------------
     // 1. Initialisation, Pause, and Timelocked Governance
     // -------------------------------------------------------------------------
@@ -1887,16 +1910,16 @@ mod tests {
         let vault_addr = "0x0aA750e83Dae45e4bA17EbAd07A2Fb800988155f".to_string();
         let token_addr = "0x036CbD53842c5426634e7929541eC2318f3dCF7e".to_string();
         let buyer_addr = "0x1111111111111111111111111111111111111111".to_string();
-        let seller_addr = "0x2222222222222222222222222222222222222222".to_string();
+        let seller_custom_addr = "0x3333333333333333333333333333333333333333".to_string();
         let foreign_amount = U128(5_000_000); // 5 USDC
 
-        contract.register_foreign_chain_deal(
+        register_foreign_chain_deal_as_seller(&mut contract,
             deal_id,
             84532,
             vault_addr.clone(),
             token_addr.clone(),
             buyer_addr.clone(),
-            seller_addr.clone(),
+            seller_custom_addr.clone(),
             foreign_amount,
         );
 
@@ -1974,7 +1997,7 @@ mod tests {
         let seller_addr = "0x2222222222222222222222222222222222222222".to_string();
         let foreign_amount = U128(5_000_000);
 
-        contract.register_foreign_chain_deal(
+        register_foreign_chain_deal_as_seller(&mut contract,
             deal_id,
             84532,
             vault_addr.clone(),
@@ -2134,7 +2157,7 @@ mod tests {
         let seller_addr = "0x2222222222222222222222222222222222222222".to_string();
         let foreign_amount = U128(5_000_000);
 
-        contract.register_foreign_chain_deal(
+        register_foreign_chain_deal_as_seller(&mut contract,
             deal_id,
             84532,
             vault_addr.clone(),
@@ -2260,7 +2283,7 @@ mod tests {
         let seller_addr = "0x2222222222222222222222222222222222222222".to_string();
         let foreign_amount = U128(5_000_000);
 
-        contract.register_foreign_chain_deal(
+        register_foreign_chain_deal_as_seller(&mut contract,
             deal_id,
             84532,
             vault_addr.clone(),
@@ -2381,7 +2404,7 @@ mod tests {
         let seller_addr = "0x2222222222222222222222222222222222222222".to_string();
         let foreign_amount = U128(5_000_000);
 
-        contract.register_foreign_chain_deal(
+        register_foreign_chain_deal_as_seller(&mut contract,
             deal_id,
             84532,
             vault_addr.clone(),
@@ -2525,7 +2548,7 @@ mod tests {
             slash_bps_buyer_breach: 1000,
         });
 
-        contract.register_foreign_chain_deal(
+        register_foreign_chain_deal_as_seller(&mut contract,
             deal_id,
             84532,
             "0x0aA750e83Dae45e4bA17EbAd07A2Fb800988155f".to_string(),
@@ -2579,23 +2602,20 @@ mod tests {
         let vault_addr = "0x0aA750e83Dae45e4bA17EbAd07A2Fb800988155f".to_string();
         let token_addr = "0x036CbD53842c5426634e7929541eC2318f3dCF7e".to_string();
         let buyer_addr = "0x1111111111111111111111111111111111111111".to_string();
-        let seller_addr = "0x2222222222222222222222222222222222222222".to_string();
+        let seller_custom_addr = "0x3333333333333333333333333333333333333333".to_string();
         let foreign_amount = U128(5_000_000);
 
-        contract.register_foreign_chain_deal(
+        register_foreign_chain_deal_as_seller(&mut contract,
             deal_id,
             84532,
             vault_addr.clone(),
             token_addr.clone(),
             buyer_addr.clone(),
-            seller_addr.clone(),
+            seller_custom_addr.clone(),
             foreign_amount,
         );
 
-        // Seller sets their verified payout address
-        testing_env!(get_context(seller.clone(), NearToken::from_yoctonear(0)).build());
-        let seller_custom_addr = "0x3333333333333333333333333333333333333333".to_string();
-        contract.set_foreign_seller_address(deal_id, seller_custom_addr.clone());
+        // Seller payout address is fixed when the foreign deal is registered.
         let info = contract.get_foreign_deal(deal_id).unwrap();
         assert_eq!(info.seller_address, seller_custom_addr);
 
@@ -2767,7 +2787,7 @@ mod tests {
         let seller_addr = "0x2222222222222222222222222222222222222222".to_string();
         let foreign_amount = U128(5_000_000);
 
-        contract.register_foreign_chain_deal(
+        register_foreign_chain_deal_as_seller(&mut contract,
             deal_id,
             84532,
             vault_addr.clone(),
@@ -2874,7 +2894,8 @@ mod tests {
     }
 
     #[test]
-    fn test_seller_foreign_address_update_in_active_status() {
+    #[should_panic(expected = "Seller payout address can only be set while the deal is Created")]
+    fn test_seller_foreign_address_update_in_active_status_is_rejected() {
         let (_signing_key, tee_pk) = generate_tee_keypair();
         let owner: AccountId = "owner.testnet".parse().unwrap();
         let buyer: AccountId = "buyer.testnet".parse().unwrap();
@@ -2908,12 +2929,12 @@ mod tests {
         });
 
         testing_env!(get_context(seller.clone(), NearToken::from_yoctonear(0)).build());
-        contract.register_foreign_chain_deal(
+        register_foreign_chain_deal_as_seller(&mut contract,
             deal_id,
             84532,
             "0x1111111111111111111111111111111111111111".to_string(),
             "0x2222222222222222222222222222222222222222".to_string(),
-            "0x3333333333333333333333333333333333333333".to_string(),
+            "0x0000000000000000000000000000000000000000".to_string(),
             "0x4444444444444444444444444444444444444444".to_string(),
             U128(10_000_000),
         );
@@ -2923,10 +2944,8 @@ mod tests {
         deal.status = DealStatus::Active;
         contract.deals.insert(&deal_id, &deal);
 
-        // Seller corrects EVM payout address while Active!
+        // Payout destinations are immutable after funding/activation.
         contract.set_foreign_seller_address(deal_id, "0x9999999999999999999999999999999999999999".to_string());
-        let info = contract.get_foreign_deal(deal_id).unwrap();
-        assert_eq!(info.seller_address, "0x9999999999999999999999999999999999999999");
     }
 
     #[test]
@@ -2963,7 +2982,7 @@ mod tests {
             slash_bps_buyer_breach: 1000,
         });
 
-        contract.register_foreign_chain_deal(
+        register_foreign_chain_deal_as_seller(&mut contract,
             deal_id,
             84532,
             "0x1111111111111111111111111111111111111111".to_string(),
@@ -3020,7 +3039,7 @@ mod tests {
             slash_bps_buyer_breach: 1000,
         });
 
-        contract.register_foreign_chain_deal(
+        register_foreign_chain_deal_as_seller(&mut contract,
             deal_id,
             84532,
             "0x1111111111111111111111111111111111111111".to_string(),
@@ -3094,17 +3113,18 @@ mod tests {
             slash_bps_buyer_breach: 1000,
         });
 
-        contract.register_foreign_chain_deal(
+        register_foreign_chain_deal_as_seller(&mut contract,
             deal_id,
             84532,
             "0x1111111111111111111111111111111111111111".to_string(),
             "0x2222222222222222222222222222222222222222".to_string(),
-            "0x3333333333333333333333333333333333333333".to_string(),
+            "0x0000000000000000000000000000000000000000".to_string(),
             "0x4444444444444444444444444444444444444444".to_string(),
             U128(10_000_000),
         );
 
-        // Buyer updates their refund address
+        // Buyer fills their refund address once, before the deposit is recorded.
+        testing_env!(get_context(buyer.clone(), NearToken::from_yoctonear(0)).build());
         contract.set_foreign_buyer_address(deal_id, "0x5555555555555555555555555555555555555555".to_string());
         let info = contract.get_foreign_deal(deal_id).unwrap();
         assert_eq!(info.buyer_address, "0x5555555555555555555555555555555555555555");
@@ -3147,7 +3167,7 @@ mod tests {
         let seller_addr = "0x4444444444444444444444444444444444444444".to_string();
         let token_addr = "0x2222222222222222222222222222222222222222".to_string();
 
-        contract.register_foreign_chain_deal(
+        register_foreign_chain_deal_as_seller(&mut contract,
             deal_id,
             84532,
             "0x1111111111111111111111111111111111111111".to_string(),
@@ -3258,7 +3278,7 @@ mod tests {
             slash_bps_buyer_breach: 1000,
         });
 
-        contract.register_foreign_chain_deal(
+        register_foreign_chain_deal_as_seller(&mut contract,
             deal_id,
             84532,
             "0x1111111111111111111111111111111111111111".to_string(),
@@ -3308,7 +3328,7 @@ mod tests {
             slash_bps_buyer_breach: 1000,
         });
 
-        contract.register_foreign_chain_deal(
+        register_foreign_chain_deal_as_seller(&mut contract,
             deal_id,
             84532,
             "0x1111111111111111111111111111111111111111".to_string(),
@@ -3355,7 +3375,7 @@ mod tests {
         });
 
         // Non-hex character 'Z' must panic at validation time
-        contract.register_foreign_chain_deal(
+        register_foreign_chain_deal_as_seller(&mut contract,
             deal_id,
             84532,
             "0x1111111111111111111111111111111111111111".to_string(),
@@ -3401,7 +3421,7 @@ mod tests {
             slash_bps_buyer_breach: 1000,
         });
 
-        contract.register_foreign_chain_deal(
+        register_foreign_chain_deal_as_seller(&mut contract,
             deal_id,
             84532,
             "0x1111111111111111111111111111111111111111".to_string(),
@@ -3450,7 +3470,7 @@ mod tests {
             slash_bps_buyer_breach: 1000,
         });
 
-        contract.register_foreign_chain_deal(
+        register_foreign_chain_deal_as_seller(&mut contract,
             deal_id,
             84532,
             "0x1111111111111111111111111111111111111111".to_string(),
@@ -3535,7 +3555,7 @@ mod tests {
         assert_eq!(deal.buyer_deposited, 1_000_000_000_000_000_000_000_000);
 
         // Caller attempts to register foreign chain parameters after native deposit was made
-        contract.register_foreign_chain_deal(
+        register_foreign_chain_deal_as_seller(&mut contract,
             deal_id,
             84532,
             "0x1111111111111111111111111111111111111111".to_string(),
@@ -3636,7 +3656,7 @@ mod tests {
 
         // 2. Later, when buyer/relayer registers foreign deal parameters, it must succeed without panic and preserve seller address
         testing_env!(get_context(buyer.clone(), NearToken::from_yoctonear(0)).build());
-        contract.register_foreign_chain_deal(
+        register_foreign_chain_deal_as_seller(&mut contract,
             deal_id,
             84532,
             "0x3be5DaDC60292F724D9f9a7203F833816077927F".to_string(),
@@ -3650,6 +3670,107 @@ mod tests {
         assert_eq!(updated_info.vault_address, "0x3be5DaDC60292F724D9f9a7203F833816077927F");
         assert_eq!(updated_info.seller_address, seller_evm);
         assert_eq!(updated_info.foreign_amount, U128(40_000));
+    }
+
+    #[test]
+    #[should_panic(expected = "Only seller, owner, or active TEE signer can register foreign chain parameters")]
+    fn test_buyer_cannot_register_or_rewrite_foreign_settlement_parameters() {
+        let (_signing_key, tee_pk) = generate_tee_keypair();
+        let owner: AccountId = "owner.testnet".parse().unwrap();
+        let buyer: AccountId = "buyer.testnet".parse().unwrap();
+        let seller: AccountId = "seller.testnet".parse().unwrap();
+        testing_env!(get_context(owner.clone(), STORAGE_DEPOSIT).build());
+        let mut contract = ConpiEscrow::new(
+            owner,
+            Some("testnet".to_string()),
+            None,
+            Some((tee_pk.clone(), REAL_CVM_MEASUREMENT.to_string())),
+            None,
+        );
+        testing_env!(get_context(buyer.clone(), STORAGE_DEPOSIT).build());
+        let deal_id = contract.create_deal(CreateDealParams {
+            buyer: buyer.clone(),
+            seller,
+            token: None,
+            price: U128(10_000),
+            credit_amount: U128(10_000),
+            buyer_collateral: U128(0),
+            seller_collateral: U128(0),
+            tee_pubkey: tee_pk,
+            deposit_duration_sec: 3600,
+            key_duration_sec: 3600,
+            tee_liveness_timeout_sec: 3600,
+            slash_bps_provider_ban: 5000,
+            slash_bps_revoke: 8000,
+            slash_bps_buyer_breach: 5000,
+        });
+        contract.register_foreign_chain_deal(
+            deal_id,
+            84532,
+            "0x1111111111111111111111111111111111111111".to_string(),
+            "0x2222222222222222222222222222222222222222".to_string(),
+            "0x3333333333333333333333333333333333333333".to_string(),
+            "0x4444444444444444444444444444444444444444".to_string(),
+            U128(10_000),
+        );
+    }
+
+    #[test]
+    #[should_panic(expected = "Foreign amount is locked")]
+    fn test_registered_foreign_amount_cannot_be_rewritten() {
+        let (_signing_key, tee_pk) = generate_tee_keypair();
+        let owner: AccountId = "owner.testnet".parse().unwrap();
+        let buyer: AccountId = "buyer.testnet".parse().unwrap();
+        let seller: AccountId = "seller.testnet".parse().unwrap();
+        testing_env!(get_context(owner.clone(), STORAGE_DEPOSIT).build());
+        let mut contract = ConpiEscrow::new(
+            owner,
+            Some("testnet".to_string()),
+            None,
+            Some((tee_pk.clone(), REAL_CVM_MEASUREMENT.to_string())),
+            None,
+        );
+        testing_env!(get_context(buyer.clone(), STORAGE_DEPOSIT).build());
+        let deal_id = contract.create_deal(CreateDealParams {
+            buyer,
+            seller,
+            token: None,
+            price: U128(10_000),
+            credit_amount: U128(10_000),
+            buyer_collateral: U128(0),
+            seller_collateral: U128(0),
+            tee_pubkey: tee_pk,
+            deposit_duration_sec: 3600,
+            key_duration_sec: 3600,
+            tee_liveness_timeout_sec: 3600,
+            slash_bps_provider_ban: 5000,
+            slash_bps_revoke: 8000,
+            slash_bps_buyer_breach: 5000,
+        });
+        let vault = "0x1111111111111111111111111111111111111111".to_string();
+        let token = "0x2222222222222222222222222222222222222222".to_string();
+        let buyer_address = "0x3333333333333333333333333333333333333333".to_string();
+        let seller_address = "0x4444444444444444444444444444444444444444".to_string();
+        register_foreign_chain_deal_as_seller(
+            &mut contract,
+            deal_id,
+            84532,
+            vault.clone(),
+            token.clone(),
+            buyer_address.clone(),
+            seller_address.clone(),
+            U128(10_000),
+        );
+        register_foreign_chain_deal_as_seller(
+            &mut contract,
+            deal_id,
+            84532,
+            vault,
+            token,
+            buyer_address,
+            seller_address,
+            U128(1),
+        );
     }
 
     #[test]

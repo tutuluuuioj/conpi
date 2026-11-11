@@ -7,10 +7,37 @@ import { basePublicClient } from "@/lib/evm-wallet";
 import { BASE_SEPOLIA_USDC, deriveForeignVaultAddress } from "@/lib/chain-signatures";
 import { CONTRACT_ID } from "@/lib/chain";
 
+async function getLockedForeignDeal(dealId: number): Promise<any | null> {
+  const argsBase64 = Buffer.from(JSON.stringify({ deal_id: dealId })).toString("base64");
+  const response = await fetch(process.env.NEAR_NODE_URL || "https://rpc.testnet.near.org", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    cache: "no-store",
+    body: JSON.stringify({
+      jsonrpc: "2.0",
+      id: `foreign-deal-${dealId}`,
+      method: "query",
+      params: {
+        request_type: "call_function",
+        finality: "final",
+        account_id: CONTRACT_ID,
+        method_name: "get_foreign_deal",
+        args_base64: argsBase64,
+      },
+    }),
+  });
+  if (!response.ok) throw new Error(`NEAR RPC returned ${response.status}`);
+  const rpc = await response.json();
+  if (rpc.error) throw new Error(rpc.error?.data || rpc.error?.message || "NEAR RPC query failed");
+  const bytes = rpc.result?.result;
+  if (!Array.isArray(bytes)) return null;
+  return JSON.parse(Buffer.from(bytes).toString("utf8"));
+}
+
 export async function POST(req: NextRequest) {
   try {
     const body = await req.json();
-    const { dealId, txHash, expectedAmountAtomic } = body;
+    const { dealId, txHash } = body;
 
     if (!dealId || !txHash) {
       return NextResponse.json(
@@ -19,7 +46,21 @@ export async function POST(req: NextRequest) {
       );
     }
 
+    const foreignDeal = await getLockedForeignDeal(Number(dealId));
+    if (!foreignDeal || BigInt(foreignDeal.foreign_amount || "0") <= BigInt(0)) {
+      return NextResponse.json(
+        { ok: false, error: "On-chain foreign deal amount is not registered" },
+        { status: 409 }
+      );
+    }
+
     const vault = deriveForeignVaultAddress(CONTRACT_ID, Number(dealId));
+    if (String(foreignDeal.vault_address || "").toLowerCase() !== vault.address.toLowerCase()) {
+      return NextResponse.json(
+        { ok: false, error: "Registered vault does not match the deterministic deal vault" },
+        { status: 409 }
+      );
+    }
     const receipt = await basePublicClient.getTransactionReceipt({ hash: txHash as Hash });
     if (!receipt || receipt.status !== "success") {
       return NextResponse.json(
@@ -55,7 +96,7 @@ export async function POST(req: NextRequest) {
       }
     }
 
-    const minAmount = expectedAmountAtomic ? BigInt(expectedAmountAtomic) : BigInt(1);
+    const minAmount = BigInt(foreignDeal.foreign_amount);
     if (!foundTransfer || transferAmount < minAmount) {
       return NextResponse.json(
         {

@@ -5,6 +5,7 @@ import { JsonRpcProvider } from "near-api-js";
 import { verifyMessage as verifyNearMessage } from "near-api-js/nep413";
 import { verifyMessage as verifyEvmMessage, type Address, type Hex } from "viem";
 import { CONFIG } from "../config.js";
+import { sellerAuthorizationNonceStore } from "./seller-nonce-store.js";
 
 export type SellerWalletChain = "near" | "solana" | "base";
 
@@ -67,6 +68,8 @@ export function buildSellerKeyAuthorizationMessage(request: SellerKeyAuthorizati
     models: normalizedModels,
     termsHashHex: request.termsHashHex.replace(/^0x/, "").toLowerCase(),
     keyCommitment,
+    chainId: CONFIG.networkId,
+    contractId: CONFIG.contractId,
     wallet: {
       chain: request.authorization.chain,
       address: request.authorization.address.trim(),
@@ -91,6 +94,11 @@ export function canonicalSellerAccount(chain: SellerWalletChain, address: string
 export interface SellerAuthorizationDependencies {
   now?: () => number;
   verifyNear?: typeof verifyNearMessage;
+  consumeNonce?: boolean;
+}
+
+export function consumeSellerKeyAuthorizationNonce(auth: SellerKeyAuthorization, nowMs = Date.now()): void {
+  sellerAuthorizationNonceStore.consume(auth, nowMs);
 }
 
 export async function verifySellerKeyAuthorization(
@@ -131,6 +139,7 @@ export async function verifySellerKeyAuthorization(
       signature: Buffer.from(auth.signature, "base64"),
       provider: new JsonRpcProvider({ url: CONFIG.nodeUrl }),
     });
+    if (dependencies.consumeNonce !== false) consumeSellerKeyAuthorizationNonce(auth, now);
     return;
   }
 
@@ -141,6 +150,7 @@ export async function verifySellerKeyAuthorization(
       bs58.decode(auth.address)
     );
     if (!valid) throw new Error("Invalid Solana seller signature");
+    if (dependencies.consumeNonce !== false) consumeSellerKeyAuthorizationNonce(auth, now);
     return;
   }
 
@@ -150,4 +160,5 @@ export async function verifySellerKeyAuthorization(
     signature: auth.signature as Hex,
   });
   if (!valid) throw new Error("Invalid Base seller signature");
+  if (dependencies.consumeNonce !== false) consumeSellerKeyAuthorizationNonce(auth, now);
 }

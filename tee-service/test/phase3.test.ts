@@ -25,6 +25,7 @@ import { enclaveKeys } from "../src/crypto/keys.js";
 import { privateKeyToAccount } from "viem/accounts";
 import { buildSellerKeyAuthorizationMessage, canonicalSellerAccount } from "../src/auth/seller-key.js";
 import { meteringStateStore } from "../src/state/metering-store.js";
+import { CONFIG } from "../src/config.js";
 
 function assert(condition: unknown, message: string): asserts condition {
   if (!condition) throw new Error(message);
@@ -32,6 +33,9 @@ function assert(condition: unknown, message: string): asserts condition {
 
 async function runPhase3Tests() {
   console.log("=== RUNNING CONPI PHASE 3 ACCEPTANCE TESTS ===");
+  assert(CONFIG.upstreamFetchTimeoutMs === 60_000, `Expected 60000ms upstream timeout, got ${CONFIG.upstreamFetchTimeoutMs}`);
+  assert(CONFIG.websocketAuthTimeoutMs === 10_000, `Expected 10000ms websocket timeout, got ${CONFIG.websocketAuthTimeoutMs}`);
+  assert(CONFIG.checkpointIntervalMs === 300_000, `Expected 300000ms checkpoint interval, got ${CONFIG.checkpointIntervalMs}`);
 
   (nearRelayer as any).getDeal = async () => ({
     id: 3001,
@@ -397,6 +401,8 @@ async function runPhase3Tests() {
   assert(nativeAnthropic.statusCode === 200 && JSON.parse(nativeAnthropic.body).type === "message", `Native Anthropic request failed: ${nativeAnthropic.body}`);
   const anthropicReceipt = anthropicEntry.usageReceipts.at(-1);
   assert(anthropicReceipt?.inputTokens === 14 && anthropicReceipt.cachedTokens === 3 && anthropicReceipt.cacheWriteTokens === 2, "Direct Anthropic cache tokens were not billed by category");
+  const expectedAnthropicCost = (9 * 3 + 3 * 0.3 + 2 * 3.75 + 4 * 15) / 1_000_000;
+  assert(Math.abs((anthropicReceipt?.costUsd || 0) - expectedAnthropicCost) < 1e-12, "Anthropic cache writes were not billed at the 1.25x creation rate");
   const adaptedAnthropic = await app.inject({
     method: "POST",
     url: "/v1/chat/completions",

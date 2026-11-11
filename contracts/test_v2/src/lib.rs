@@ -82,12 +82,36 @@ pub struct TeeSigner {
 
 #[near(serializers = [json, borsh])]
 #[derive(Clone, Debug, PartialEq)]
+pub struct ForeignChainInfo {
+    pub chain_id: u64,
+    pub vault_address: String,
+    pub token_address: String,
+    pub buyer_address: String,
+    pub seller_address: String,
+    pub foreign_amount: U128,
+    pub evm_nonce: u64,
+    pub seller_claimed: bool,
+}
+
+#[near(serializers = [json, borsh])]
+#[derive(Clone, Debug, PartialEq)]
 pub enum AdminAction {
-    TransferOwnership { new_owner: AccountId },
-    UpdateConfig { config: Config },
-    AddTeeSigner { public_key: PublicKey, measurement: String },
-    RevokeTeeSigner { public_key: PublicKey },
-    Upgrade { code_hash: [u8; 32] },
+    TransferOwnership {
+        new_owner: AccountId,
+    },
+    UpdateConfig {
+        config: Config,
+    },
+    AddTeeSigner {
+        public_key: PublicKey,
+        measurement: String,
+    },
+    RevokeTeeSigner {
+        public_key: PublicKey,
+    },
+    Upgrade {
+        code_hash: [u8; 32],
+    },
     Unpause,
 }
 
@@ -115,6 +139,8 @@ pub struct ConpiEscrowCurrent {
     pub state_version: u32,
     pub approved_measurement: Option<String>,
     pub staged_upgrade_code: Option<Vec<u8>>,
+    pub foreign_deals: LookupMap<DealId, ForeignChainInfo>,
+    pub mpc_signer_contract: Option<AccountId>,
 }
 
 #[near(serializers = [borsh])]
@@ -178,16 +204,71 @@ impl ConpiEscrowV2 {
     pub fn migrate() -> Self {
         use near_sdk::borsh::BorshDeserialize;
         let state_bytes = env::storage_read(b"STATE").expect("Contract state not found");
-        let (owner, chain_id, paused, tee_signers, deals, deal_creators, pending_payouts, next_deal_id, config, next_proposal_id, staged_proposals, timelock_duration, state_version) =
-            if let Ok(cur) = ConpiEscrowCurrent::try_from_slice(&state_bytes) {
-                (cur.owner, cur.chain_id, cur.paused, cur.tee_signers, cur.deals, cur.deal_creators, cur.pending_payouts, cur.next_deal_id, cur.config, cur.next_proposal_id, cur.staged_proposals, cur.timelock_duration, cur.state_version)
-            } else if let Ok(v2) = ConpiEscrowV2State::try_from_slice(&state_bytes) {
-                (v2.owner, v2.chain_id, v2.paused, v2.tee_signers, v2.deals, v2.deal_creators, v2.pending_payouts, v2.next_deal_id, v2.config, v2.next_proposal_id, v2.staged_proposals, v2.timelock_duration, v2.state_version)
-            } else if let Ok(v1) = ConpiEscrowV1::try_from_slice(&state_bytes) {
-                (v1.owner, v1.chain_id, v1.paused, v1.tee_signers, v1.deals, v1.deal_creators, v1.pending_payouts, v1.next_deal_id, v1.config, v1.next_proposal_id, v1.staged_proposals, v1.timelock_duration, v1.state_version)
-            } else {
-                env::panic_str("Failed to deserialize old contract state in V2 migrate");
-            };
+        let (
+            owner,
+            chain_id,
+            paused,
+            tee_signers,
+            deals,
+            deal_creators,
+            pending_payouts,
+            next_deal_id,
+            config,
+            next_proposal_id,
+            staged_proposals,
+            timelock_duration,
+            state_version,
+        ) = if let Ok(cur) = ConpiEscrowCurrent::try_from_slice(&state_bytes) {
+            (
+                cur.owner,
+                cur.chain_id,
+                cur.paused,
+                cur.tee_signers,
+                cur.deals,
+                cur.deal_creators,
+                cur.pending_payouts,
+                cur.next_deal_id,
+                cur.config,
+                cur.next_proposal_id,
+                cur.staged_proposals,
+                cur.timelock_duration,
+                cur.state_version,
+            )
+        } else if let Ok(v2) = ConpiEscrowV2State::try_from_slice(&state_bytes) {
+            (
+                v2.owner,
+                v2.chain_id,
+                v2.paused,
+                v2.tee_signers,
+                v2.deals,
+                v2.deal_creators,
+                v2.pending_payouts,
+                v2.next_deal_id,
+                v2.config,
+                v2.next_proposal_id,
+                v2.staged_proposals,
+                v2.timelock_duration,
+                v2.state_version,
+            )
+        } else if let Ok(v1) = ConpiEscrowV1::try_from_slice(&state_bytes) {
+            (
+                v1.owner,
+                v1.chain_id,
+                v1.paused,
+                v1.tee_signers,
+                v1.deals,
+                v1.deal_creators,
+                v1.pending_payouts,
+                v1.next_deal_id,
+                v1.config,
+                v1.next_proposal_id,
+                v1.staged_proposals,
+                v1.timelock_duration,
+                v1.state_version,
+            )
+        } else {
+            env::panic_str("Failed to deserialize old contract state in V2 migrate");
+        };
 
         require!(
             state_version >= 1,
@@ -229,7 +310,11 @@ impl ConpiEscrowV2 {
     }
 
     pub fn get_pending_payout(&self, account_id: AccountId, token_id: Option<AccountId>) -> U128 {
-        U128(self.pending_payouts.get(&(account_id, token_id)).unwrap_or(0))
+        U128(
+            self.pending_payouts
+                .get(&(account_id, token_id))
+                .unwrap_or(0),
+        )
     }
 
     pub fn get_config(&self) -> Config {
