@@ -37,6 +37,7 @@ pub enum PayloadKind {
     Stage,
     Checkpoint,
     Default,
+    ForeignDeposit,
 }
 
 #[near(serializers = [json, borsh])]
@@ -53,6 +54,7 @@ pub struct SignedPayload {
     pub reason: Option<DefaultReason>,
     pub nonce: u64,
     pub issued_at: u64,
+    pub foreign_tx_sighash: Option<[u8; 32]>,
 }
 
 #[near(serializers = [json, borsh])]
@@ -169,4 +171,75 @@ pub enum AdminAction {
 pub struct StagedAction {
     pub action: AdminAction,
     pub ready_at: Timestamp,
+}
+
+#[near(serializers = [json, borsh])]
+#[derive(Clone, Debug, PartialEq)]
+pub struct ForeignChainInfo {
+    pub chain_id: u64,
+    pub vault_address: String,
+    pub token_address: String,
+    pub buyer_address: String,
+    pub seller_address: String,
+    pub foreign_amount: U128,
+    pub evm_nonce: u64,
+    pub seller_claimed: bool,
+}
+
+#[near(serializers = [json, borsh])]
+#[derive(Clone, Debug, PartialEq)]
+pub enum MpcCallbackAction {
+    Stage { stage: u8 },
+    Default {
+        seller_slashed: U128,
+        buyer_slashed: U128,
+        seller_collateral_remaining: U128,
+    },
+    Timeout { status: DealStatus, seller_payout: U128 },
+    SellerClaim,
+}
+
+#[near(serializers = [json, borsh])]
+#[derive(Clone, Debug, PartialEq)]
+pub struct ForeignTxRequest {
+    pub sighash: [u8; 32],
+    pub recipient: String,
+    pub amount: U128,
+    pub nonce: u64,
+}
+
+#[near(serializers = [json, borsh])]
+#[derive(Clone, Debug)]
+pub struct SignRequest {
+    pub payload_v2: PayloadV2,
+    pub path: String,
+    pub domain_id: u32,
+}
+
+#[near(serializers = [json, borsh])]
+#[derive(Clone, Debug)]
+pub enum PayloadV2 {
+    Ecdsa(String),
+    Eddsa(String),
+}
+
+#[near(serializers = [json, borsh])]
+#[derive(Clone, Debug)]
+pub struct AffinePoint {
+    pub affine_point: String,
+}
+
+#[near(serializers = [json, borsh])]
+#[derive(Clone, Debug)]
+pub struct Scalar {
+    pub scalar: String,
+}
+
+#[near(serializers = [json, borsh])]
+#[derive(Clone, Debug)]
+pub struct SignatureResponse {
+    pub scheme: String,
+    pub big_r: AffinePoint,
+    pub s: Scalar,
+    pub recovery_id: u8,
 }

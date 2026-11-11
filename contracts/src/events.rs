@@ -4,8 +4,7 @@ use near_sdk::{env, AccountId, Timestamp};
 
 #[derive(Serialize, Debug)]
 #[serde(crate = "near_sdk::serde")]
-#[serde(tag = "standard", content = "event")]
-#[serde(rename = "nep297")]
+#[serde(untagged)]
 pub enum ConpiEvent<'a> {
     #[serde(rename = "deal_created")]
     DealCreated {
@@ -110,11 +109,69 @@ pub enum ConpiEvent<'a> {
     GovernanceActionCancelled {
         proposal_id: u64,
     },
+    #[serde(rename = "foreign_deposit_recorded")]
+    ForeignDepositRecorded {
+        deal_id: u64,
+        chain_id: u64,
+        tx_hash: &'a str,
+        amount: U128,
+    },
+    #[serde(rename = "foreign_tx_signed")]
+    ForeignTxSigned {
+        deal_id: u64,
+        stage: u8,
+        chain_id: u64,
+        recipient: &'a str,
+        amount: U128,
+        sighash_hex: &'a str,
+        r_hex: &'a str,
+        s_hex: &'a str,
+        recovery_id: u8,
+    },
     #[serde(rename = "contract_migrated")]
     ContractMigrated,
 }
 
+#[derive(Serialize, Debug)]
+#[serde(crate = "near_sdk::serde")]
+pub struct Nep297Event<'a> {
+    pub standard: &'static str,
+    pub version: &'static str,
+    pub event: &'static str,
+    pub data: [&'a ConpiEvent<'a>; 1],
+}
+
 pub fn emit_event(event: ConpiEvent) {
-    let json = near_sdk::serde_json::to_string(&event).expect("Failed to serialize event");
+    let event_name = match &event {
+        ConpiEvent::DealCreated { .. } => "deal_created",
+        ConpiEvent::DealAccepted { .. } => "deal_accepted",
+        ConpiEvent::TermsRegistered { .. } => "terms_registered",
+        ConpiEvent::DepositReceived { .. } => "deposit_received",
+        ConpiEvent::DealFunded { .. } => "deal_funded",
+        ConpiEvent::DealActivated { .. } => "deal_activated",
+        ConpiEvent::StageReleased { .. } => "stage_released",
+        ConpiEvent::CheckpointRecorded { .. } => "checkpoint_recorded",
+        ConpiEvent::AutoReleaseNotice { .. } => "auto_release_notice",
+        ConpiEvent::DealDefaulted { .. } => "deal_defaulted",
+        ConpiEvent::DealCompleted { .. } => "deal_completed",
+        ConpiEvent::DealCancelled { .. } => "deal_cancelled",
+        ConpiEvent::DealSettledTimeout { .. } => "deal_settled_timeout",
+        ConpiEvent::PendingPayoutClaimed { .. } => "pending_payout_claimed",
+        ConpiEvent::TransferFailedCredited { .. } => "transfer_failed_credited",
+        ConpiEvent::GovernanceActionProposed { .. } => "governance_action_proposed",
+        ConpiEvent::GovernanceActionExecuted { .. } => "governance_action_executed",
+        ConpiEvent::GovernanceActionCancelled { .. } => "governance_action_cancelled",
+        ConpiEvent::ForeignDepositRecorded { .. } => "foreign_deposit_recorded",
+        ConpiEvent::ForeignTxSigned { .. } => "foreign_tx_signed",
+        ConpiEvent::ContractMigrated => "contract_migrated",
+    };
+
+    let nep297 = Nep297Event {
+        standard: "conpi",
+        version: "1.0.0",
+        event: event_name,
+        data: [&event],
+    };
+    let json = near_sdk::serde_json::to_string(&nep297).expect("Failed to serialize event");
     env::log_str(&format!("EVENT_JSON:{}", json));
 }

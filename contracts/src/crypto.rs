@@ -163,7 +163,11 @@ impl CryptoHelper {
         let raw_pk = Self::extract_ed25519_bytes(expected_tee_pk);
 
         // 5. Verify Ed25519 signature using near_sdk host function
-        let is_valid = env::ed25519_verify(&sig_arr, &message, &raw_pk);
+        let mut is_valid = env::ed25519_verify(&sig_arr, &message, &raw_pk);
+        if !is_valid && message.len() > 1 && payload.foreign_tx_sighash.is_none() {
+            // Backward compatibility with CVM enclaves built prior to foreign_tx_sighash
+            is_valid = env::ed25519_verify(&sig_arr, &message[..message.len() - 1], &raw_pk);
+        }
         assert!(is_valid, "Invalid TEE signature on payload");
     }
 

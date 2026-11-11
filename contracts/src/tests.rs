@@ -235,6 +235,7 @@ mod tests {
             stage: 0,
             metered_value: U128(0),
             reason: None,
+            foreign_tx_sighash: None,
             nonce: 1,
             issued_at: 1000,
         };
@@ -259,6 +260,7 @@ mod tests {
                 stage: *stage,
                 metered_value: U128(metered),
                 reason: None,
+                foreign_tx_sighash: None,
                 nonce,
                 issued_at: 1000 + ((i as u64) + 1) * 1000,
             };
@@ -277,6 +279,7 @@ mod tests {
                     stage: 30,
                     metered_value: U128((credit_amount * 30) / 100),
                     reason: None,
+                    foreign_tx_sighash: None,
                     nonce,
                     issued_at: 2500,
                 };
@@ -376,6 +379,7 @@ mod tests {
             stage: 0,
             metered_value: U128(0),
             reason: None,
+            foreign_tx_sighash: None,
             nonce: 1,
             issued_at: 1000,
         };
@@ -393,6 +397,7 @@ mod tests {
             stage: 25,
             metered_value: U128(20_000_000), // $20 delivered
             reason: None,
+            foreign_tx_sighash: None,
             nonce: 2,
             issued_at: 2000,
         };
@@ -413,6 +418,7 @@ mod tests {
             stage: 25,
             metered_value: U128(32_000_000), // $32.00 metered usage
             reason: Some(DefaultReason::InvalidKey),
+            foreign_tx_sighash: None,
             nonce: 3,
             issued_at: 3000,
         };
@@ -695,6 +701,7 @@ mod tests {
             stage: 0,
             metered_value: U128(0),
             reason: None,
+            foreign_tx_sighash: None,
             nonce: 1,
             issued_at: 1000,
         };
@@ -725,6 +732,7 @@ mod tests {
             stage: 25,
             metered_value: U128(25),
             reason: None,
+            foreign_tx_sighash: None,
             nonce: 2,
             issued_at: 2000,
         };
@@ -1466,6 +1474,7 @@ mod tests {
             timelock_duration: 300_000_000_000,
             state_version: 4,
             approved_measurement: Some(REAL_CVM_MEASUREMENT.to_string()),
+            staged_upgrade_code: None,
         };
 
         near_sdk::env::state_write(&v2);
@@ -1478,6 +1487,92 @@ mod tests {
             Some(REAL_CVM_MEASUREMENT.to_string())
         );
         assert_eq!(migrated.staged_upgrade_code, None);
+    }
+
+    #[test]
+    fn test_migrate_with_real_live_testnet_state() {
+        let b64 = "KQAAAGRldi0yMDI2MTEwMzAyMTc0MC01OTcxMTkzMzU4MTM3Ni50ZXN0bmV0BwAAAHRlc3RuZXQAAgAAAHRpAwAAAAAAAAACAAAAdGsDAAAAAAAAAAIAAAB0dgEAAABkAQAAAGMBAAAAcDIAAAAAAAAAALhk2UUAAAAAACn5DyYCAACguDBGAwAAAABCB2k1CQAAAE+RlE4AANAHECcAAEB7pfBjgZYKAAAAAAAAJgAAAAAAAAACAAAAc2kAAAAAAAAAAAIAAABzawAAAAAAAAAAAgAAAHN2ALhk2UUAAAAIAAAAAa4AAABtcnRkOjdmZTYwNzg3MjIyYmQzOTRjYjUxNmFiY2EyNDM1ZjIyZjAzNWFiMmNjOWMwYTRiNGIzYjE0OGU0NjI5N2YzZDkzMWEyMzdiNzJmMzU5MDUyYzZlNjU3ZDhjMTQwOTE3M3xjb21wb3NlOjNjMDgyMzAzNGMyNWFmMTAxOGQ1OGJiMmQ1OTE3Y2U0ODM0Zjk4ZDk1NWQ4YTkwMWM4MWUyNDdjNWIxNjNkYWQA";
+        let bytes = near_sdk::base64::decode(b64).unwrap();
+        near_sdk::env::storage_write(b"STATE", &bytes);
+
+        let migrated = ConpiEscrow::migrate();
+        assert_eq!(migrated.get_owner().to_string(), "dev-20261103021740-59711933581376.testnet");
+        assert_eq!(migrated.get_state_version(), 9);
+        assert_eq!(migrated.next_deal_id, 50);
+        assert!(migrated.approved_measurement.is_some());
+    }
+
+    #[test]
+    fn test_real_cvm_deal_49_activate_signature_verification() {
+        let terms_hash_hex = "f935eee489ef58652ef04760a8148ff435fce6e7896fd5c753615c19ed7b657f";
+        let mut terms_hash = [0u8; 32];
+        hex::decode_to_slice(terms_hash_hex, &mut terms_hash).unwrap();
+
+        let sig_hex = "c8568dfb43a414340b487a32b79c39b57f742e4681fc0da28f05a6226b2afdefd8d137c83d61cc45b10374e149918a27d9bf4e949c259585b7c499c827597b06";
+        let sig_bytes = hex::decode(sig_hex).unwrap();
+
+        let payload = SignedPayload {
+            domain: "conpi:v1".to_string(),
+            contract_id: "dev-20261103062448-30583839049419.testnet".parse().unwrap(),
+            chain_id: "testnet".to_string(),
+            deal_id: 49,
+            terms_hash,
+            kind: PayloadKind::Activate,
+            stage: 0,
+            metered_value: U128(0),
+            reason: None,
+            nonce: 3,
+            issued_at: 1794188904092000000,
+            foreign_tx_sighash: None,
+        };
+
+        let tee_pk: PublicKey = "ed25519:CLHhDLsLCCqFeTjz7g31NkfbtN1UqT2mJRmRZgcRPTj3".parse().unwrap();
+
+        let deal = crate::types::Deal {
+            id: 49,
+            buyer: "looseward2086.testnet".parse().unwrap(),
+            seller: "wrongemail508.testnet".parse().unwrap(),
+            token: None,
+            price: 11111111111000000000000,
+            credit_amount: 13888888889000000000000,
+            buyer_collateral: 0,
+            seller_collateral: 2222222222000000000000,
+            terms_hash: Some(terms_hash),
+            tee_pubkey: tee_pk.clone(),
+            deposit_deadline: 1794275226847908573,
+            key_deadline: 1794275226847908573,
+            usage_deadline: 0,
+            notice_deadline: None,
+            tee_liveness_timeout: 3600000000000,
+            slash_bps_provider_ban: 5000,
+            slash_bps_revoke: 8000,
+            slash_bps_buyer_breach: 5000,
+            buyer_deposited: 11111111111000000000000,
+            seller_deposited: 2222222222000000000000,
+            released_to_seller: 0,
+            stage_reached: 0,
+            last_signed: None,
+            last_nonce: 0,
+            last_tee_seen: 1794160947808114083,
+            status: DealStatus::Funded,
+            counterparty_accepted: true,
+        };
+
+        let mut builder = get_context("wrongemail508.testnet".parse().unwrap(), NearToken::from_yoctonear(0));
+        builder.block_timestamp(1794188904092000000 + 1000);
+        testing_env!(builder.build());
+
+        let contract_id: AccountId = "dev-20261103062448-30583839049419.testnet".parse().unwrap();
+
+        CryptoHelper::verify_signed_payload(
+            &payload,
+            &sig_bytes,
+            &tee_pk,
+            &deal,
+            &contract_id,
+            "testnet",
+            PayloadKind::Activate,
+        );
     }
 
     #[test]
@@ -1749,6 +1844,1827 @@ mod tests {
 
         // 4. Staged upgrade code must be cleared
         assert!(!contract.has_staged_upgrade_code());
+    }
+
+    #[test]
+    fn test_foreign_chain_deal_registration_and_deposit() {
+        let (signing_key, tee_pk) = generate_tee_keypair();
+        let owner: AccountId = "owner.testnet".parse().unwrap();
+        let buyer: AccountId = "buyer.testnet".parse().unwrap();
+        let seller: AccountId = "seller.testnet".parse().unwrap();
+
+        let context = get_context(owner.clone(), STORAGE_DEPOSIT);
+        testing_env!(context.build());
+
+        let mut contract = ConpiEscrow::new(
+            owner.clone(),
+            Some("testnet".to_string()),
+            None,
+            Some((tee_pk.clone(), REAL_CVM_MEASUREMENT.to_string())),
+            None,
+        );
+
+        // 1. Create deal as buyer
+        testing_env!(get_context(buyer.clone(), STORAGE_DEPOSIT).build());
+        let deal_id = contract.create_deal(CreateDealParams {
+            buyer: buyer.clone(),
+            seller: seller.clone(),
+            token: None,
+            price: U128(1_000_000_000_000_000_000_000_000), // 1 NEAR
+            credit_amount: U128(1_000_000_000_000_000_000_000_000),
+            buyer_collateral: U128(0),
+            seller_collateral: U128(200_000_000_000_000_000_000_000),
+            tee_pubkey: tee_pk.clone(),
+            deposit_duration_sec: 3600,
+            key_duration_sec: 3600,
+            tee_liveness_timeout_sec: 3600,
+            slash_bps_provider_ban: 5000,
+            slash_bps_revoke: 8000,
+            slash_bps_buyer_breach: 1000,
+        });
+
+        // 2. Register foreign chain info (Base Sepolia)
+        let vault_addr = "0x0aA750e83Dae45e4bA17EbAd07A2Fb800988155f".to_string();
+        let token_addr = "0x036CbD53842c5426634e7929541eC2318f3dCF7e".to_string();
+        let buyer_addr = "0x1111111111111111111111111111111111111111".to_string();
+        let seller_addr = "0x2222222222222222222222222222222222222222".to_string();
+        let foreign_amount = U128(5_000_000); // 5 USDC
+
+        contract.register_foreign_chain_deal(
+            deal_id,
+            84532,
+            vault_addr.clone(),
+            token_addr.clone(),
+            buyer_addr.clone(),
+            seller_addr.clone(),
+            foreign_amount,
+        );
+
+        let info = contract.get_foreign_deal(deal_id).expect("Foreign info exists");
+        assert_eq!(info.chain_id, 84532);
+        assert_eq!(info.vault_address, vault_addr);
+        assert_eq!(info.evm_nonce, 0);
+
+        let deal = contract.get_deal(deal_id).expect("deal exists");
+        let terms_hash = deal.terms_hash.expect("terms hash exists");
+
+        // 3. Record Foreign Deposit verified by TEE
+        let payload = SignedPayload {
+            domain: "conpi:v1".to_string(),
+            contract_id: "conpi.testnet".parse().unwrap(),
+            chain_id: "testnet".to_string(),
+            deal_id,
+            terms_hash,
+            kind: PayloadKind::ForeignDeposit,
+            stage: 0,
+            metered_value: U128(0),
+            reason: None,
+            foreign_tx_sighash: None,
+            nonce: 1,
+            issued_at: 1_000_000_000_000,
+        };
+        let sig = sign_payload(&signing_key, &payload);
+
+        let tx_hash = "0x999b250800be67f6cab948a61c64a24863f18173316f885c61e8ba4cd6f1c392".to_string();
+        contract.record_foreign_deposit(deal_id, tx_hash, payload, sig);
+
+        let deal = contract.get_deal(deal_id).expect("deal exists");
+        assert_eq!(deal.buyer_deposited, deal.price + deal.buyer_collateral);
+    }
+
+    #[test]
+    fn test_foreign_chain_release_stage_and_mpc_signing() {
+        let (signing_key, tee_pk) = generate_tee_keypair();
+        let owner: AccountId = "owner.testnet".parse().unwrap();
+        let buyer: AccountId = "buyer.testnet".parse().unwrap();
+        let seller: AccountId = "seller.testnet".parse().unwrap();
+
+        testing_env!(get_context(owner.clone(), STORAGE_DEPOSIT).build());
+        let mut contract = ConpiEscrow::new(
+            owner.clone(),
+            Some("testnet".to_string()),
+            None,
+            Some((tee_pk.clone(), REAL_CVM_MEASUREMENT.to_string())),
+            None,
+        );
+
+        // 1. Create deal as buyer
+        testing_env!(get_context(buyer.clone(), STORAGE_DEPOSIT).build());
+        let deal_id = contract.create_deal(CreateDealParams {
+            buyer: buyer.clone(),
+            seller: seller.clone(),
+            token: None,
+            price: U128(1_000_000_000_000_000_000_000_000),
+            credit_amount: U128(1_000_000_000_000_000_000_000_000),
+            buyer_collateral: U128(0),
+            seller_collateral: U128(200_000_000_000_000_000_000_000),
+            tee_pubkey: tee_pk.clone(),
+            deposit_duration_sec: 3600,
+            key_duration_sec: 3600,
+            tee_liveness_timeout_sec: 3600,
+            slash_bps_provider_ban: 5000,
+            slash_bps_revoke: 8000,
+            slash_bps_buyer_breach: 1000,
+        });
+
+        // 2. Register foreign chain info (Base Sepolia)
+        let vault_addr = "0x0aA750e83Dae45e4bA17EbAd07A2Fb800988155f".to_string();
+        let token_addr = "0x036CbD53842c5426634e7929541eC2318f3dCF7e".to_string();
+        let buyer_addr = "0x1111111111111111111111111111111111111111".to_string();
+        let seller_addr = "0x2222222222222222222222222222222222222222".to_string();
+        let foreign_amount = U128(5_000_000);
+
+        contract.register_foreign_chain_deal(
+            deal_id,
+            84532,
+            vault_addr.clone(),
+            token_addr.clone(),
+            buyer_addr.clone(),
+            seller_addr.clone(),
+            foreign_amount,
+        );
+
+        let deal = contract.get_deal(deal_id).expect("deal exists");
+        let terms_hash = deal.terms_hash.expect("terms hash exists");
+
+        // 3. Seller accepts deal & deposits seller collateral
+        testing_env!(get_context(seller.clone(), NearToken::from_yoctonear(200_000_000_000_000_000_000_000)).build());
+        contract.accept_deal(deal_id, terms_hash);
+        contract.deposit(deal_id);
+
+        // 4. Record foreign deposit
+        testing_env!(get_context(owner.clone(), NearToken::from_yoctonear(0)).build());
+        let deposit_payload = SignedPayload {
+            domain: "conpi:v1".to_string(),
+            contract_id: "conpi.testnet".parse().unwrap(),
+            chain_id: "testnet".to_string(),
+            deal_id,
+            terms_hash,
+            kind: PayloadKind::ForeignDeposit,
+            stage: 0,
+            metered_value: U128(0),
+            reason: None,
+            foreign_tx_sighash: None,
+            nonce: 1,
+            issued_at: 1_000_000_000_000,
+        };
+        let deposit_sig = sign_payload(&signing_key, &deposit_payload);
+        let tx_hash = "0x999b250800be67f6cab948a61c64a24863f18173316f885c61e8ba4cd6f1c392".to_string();
+        contract.record_foreign_deposit(deal_id, tx_hash, deposit_payload, deposit_sig);
+
+        let deal = contract.get_deal(deal_id).expect("deal exists");
+        assert_eq!(deal.status, DealStatus::Funded);
+
+        // 5. Activate deal via TEE
+        let activate_payload = SignedPayload {
+            domain: "conpi:v1".to_string(),
+            contract_id: "conpi.testnet".parse().unwrap(),
+            chain_id: "testnet".to_string(),
+            deal_id,
+            terms_hash,
+            kind: PayloadKind::Activate,
+            stage: 0,
+            metered_value: U128(0),
+            reason: None,
+            foreign_tx_sighash: None,
+            nonce: 2,
+            issued_at: 1_000_000_000_000,
+        };
+        let activate_sig = sign_payload(&signing_key, &activate_payload);
+        contract.activate(deal_id, activate_payload, activate_sig);
+
+        let deal = contract.get_deal(deal_id).expect("deal exists");
+        assert_eq!(deal.status, DealStatus::Active);
+
+        // 6. Release Stage 25 with Foreign EVM Tx
+        let foreign_tx = crate::types::ForeignTxRequest {
+            nonce: 0,
+            recipient: seller_addr.clone(),
+            amount: U128(1_250_000), // 25% of 5 USDC
+            sighash: [0x55u8; 32],
+        };
+        let stage_payload = SignedPayload {
+            domain: "conpi:v1".to_string(),
+            contract_id: "conpi.testnet".parse().unwrap(),
+            chain_id: "testnet".to_string(),
+            deal_id,
+            terms_hash,
+            kind: PayloadKind::Stage,
+            stage: 25,
+            metered_value: U128(250_000_000_000_000_000_000_000),
+            reason: None,
+            foreign_tx_sighash: Some([0x55u8; 32]),
+            nonce: 3,
+            issued_at: 1_000_000_000_000,
+        };
+        let stage_sig = sign_payload(&signing_key, &stage_payload);
+        let _ = contract.release_stage_foreign(deal_id, 25, stage_payload, stage_sig, foreign_tx);
+
+        let deal_after = contract.get_deal(deal_id).expect("deal exists");
+        assert_eq!(deal_after.stage_reached, 25);
+        assert_eq!(deal_after.released_to_seller, 250_000_000_000_000_000_000_000);
+
+        let foreign_after = contract.get_foreign_deal(deal_id).expect("foreign exists");
+        assert_eq!(foreign_after.evm_nonce, 1);
+
+        // 7. Verify MPC Callback
+        testing_env!(get_context("conpi.testnet".parse().unwrap(), NearToken::from_yoctonear(0)).build());
+        let mpc_sig = crate::types::SignatureResponse {
+            scheme: "secp256k1".to_string(),
+            big_r: crate::types::AffinePoint {
+                affine_point: "021234567890abcdef1234567890abcdef1234567890abcdef1234567890abcdef".to_string(),
+            },
+            s: crate::types::Scalar {
+                scalar: "fedcba0987654321fedcba0987654321fedcba0987654321fedcba0987654321".to_string(),
+            },
+            recovery_id: 0,
+        };
+        let cb_ok = contract.on_mpc_signed(
+            deal_id,
+            crate::types::MpcCallbackAction::Stage { stage: 25 },
+            [0x55u8; 32],
+            seller_addr.clone(),
+            U128(1_250_000),
+            0,
+            0,
+            DealStatus::Active,
+            0,
+            Ok(mpc_sig),
+        );
+        assert!(cb_ok);
+    }
+
+    #[test]
+    fn test_foreign_chain_settle_default_and_mpc_signing() {
+        let (signing_key, tee_pk) = generate_tee_keypair();
+        let owner: AccountId = "owner.testnet".parse().unwrap();
+        let buyer: AccountId = "buyer.testnet".parse().unwrap();
+        let seller: AccountId = "seller.testnet".parse().unwrap();
+
+        testing_env!(get_context(owner.clone(), STORAGE_DEPOSIT).build());
+        let mut contract = ConpiEscrow::new(
+            owner.clone(),
+            Some("testnet".to_string()),
+            None,
+            Some((tee_pk.clone(), REAL_CVM_MEASUREMENT.to_string())),
+            None,
+        );
+
+        testing_env!(get_context(buyer.clone(), STORAGE_DEPOSIT).build());
+        let deal_id = contract.create_deal(CreateDealParams {
+            buyer: buyer.clone(),
+            seller: seller.clone(),
+            token: None,
+            price: U128(1_000_000_000_000_000_000_000_000),
+            credit_amount: U128(1_000_000_000_000_000_000_000_000),
+            buyer_collateral: U128(0),
+            seller_collateral: U128(200_000_000_000_000_000_000_000),
+            tee_pubkey: tee_pk.clone(),
+            deposit_duration_sec: 3600,
+            key_duration_sec: 3600,
+            tee_liveness_timeout_sec: 3600,
+            slash_bps_provider_ban: 5000,
+            slash_bps_revoke: 8000,
+            slash_bps_buyer_breach: 1000,
+        });
+
+        let vault_addr = "0x0aA750e83Dae45e4bA17EbAd07A2Fb800988155f".to_string();
+        let token_addr = "0x036CbD53842c5426634e7929541eC2318f3dCF7e".to_string();
+        let buyer_addr = "0x1111111111111111111111111111111111111111".to_string();
+        let seller_addr = "0x2222222222222222222222222222222222222222".to_string();
+        let foreign_amount = U128(5_000_000);
+
+        contract.register_foreign_chain_deal(
+            deal_id,
+            84532,
+            vault_addr.clone(),
+            token_addr.clone(),
+            buyer_addr.clone(),
+            seller_addr.clone(),
+            foreign_amount,
+        );
+
+        let deal = contract.get_deal(deal_id).expect("deal exists");
+        let terms_hash = deal.terms_hash.expect("terms hash exists");
+
+        testing_env!(get_context(seller.clone(), NearToken::from_yoctonear(200_000_000_000_000_000_000_000)).build());
+        contract.accept_deal(deal_id, terms_hash);
+        contract.deposit(deal_id);
+
+        testing_env!(get_context(owner.clone(), NearToken::from_yoctonear(0)).build());
+        let deposit_payload = SignedPayload {
+            domain: "conpi:v1".to_string(),
+            contract_id: "conpi.testnet".parse().unwrap(),
+            chain_id: "testnet".to_string(),
+            deal_id,
+            terms_hash,
+            kind: PayloadKind::ForeignDeposit,
+            stage: 0,
+            metered_value: U128(0),
+            reason: None,
+            foreign_tx_sighash: None,
+            nonce: 1,
+            issued_at: 1_000_000_000_000,
+        };
+        let deposit_sig = sign_payload(&signing_key, &deposit_payload);
+        let tx_hash = "0x999b250800be67f6cab948a61c64a24863f18173316f885c61e8ba4cd6f1c392".to_string();
+        contract.record_foreign_deposit(deal_id, tx_hash, deposit_payload, deposit_sig);
+
+        // Activate
+        let activate_payload = SignedPayload {
+            domain: "conpi:v1".to_string(),
+            contract_id: "conpi.testnet".parse().unwrap(),
+            chain_id: "testnet".to_string(),
+            deal_id,
+            terms_hash,
+            kind: PayloadKind::Activate,
+            stage: 0,
+            metered_value: U128(0),
+            reason: None,
+            foreign_tx_sighash: None,
+            nonce: 2,
+            issued_at: 1_000_000_000_000,
+        };
+        let activate_sig = sign_payload(&signing_key, &activate_payload);
+        contract.activate(deal_id, activate_payload, activate_sig);
+
+        // Settle default foreign: InvalidKey with 40% delivered
+        let default_payload = SignedPayload {
+            domain: "conpi:v1".to_string(),
+            contract_id: "conpi.testnet".parse().unwrap(),
+            chain_id: "testnet".to_string(),
+            deal_id,
+            terms_hash,
+            kind: PayloadKind::Default,
+            stage: 0,
+            metered_value: U128(400_000_000_000_000_000_000_000), // 40%
+            reason: Some(DefaultReason::InvalidKey),
+            foreign_tx_sighash: Some([0x77u8; 32]),
+            nonce: 3,
+            issued_at: 1_000_000_000_000,
+        };
+        let default_sig = sign_payload(&signing_key, &default_payload);
+
+        let foreign_tx = crate::types::ForeignTxRequest {
+            nonce: 0,
+            recipient: buyer_addr.clone(),
+            amount: U128(3_000_000), // 60% refund of 5 USDC
+            sighash: [0x77u8; 32],
+        };
+
+        let _ = contract.settle_default_foreign(deal_id, default_payload, default_sig, foreign_tx);
+
+        let deal_after = contract.get_deal(deal_id).expect("deal exists");
+        assert_eq!(deal_after.status, DealStatus::Defaulted);
+
+        let foreign_after = contract.get_foreign_deal(deal_id).expect("foreign exists");
+        assert_eq!(foreign_after.evm_nonce, 1);
+    }
+
+    #[test]
+    fn test_foreign_chain_timeout_refund() {
+        let (signing_key, tee_pk) = generate_tee_keypair();
+        let owner: AccountId = "owner.testnet".parse().unwrap();
+        let buyer: AccountId = "buyer.testnet".parse().unwrap();
+        let seller: AccountId = "seller.testnet".parse().unwrap();
+
+        let mut contract = ConpiEscrow::new(
+            owner.clone(),
+            Some("testnet".to_string()),
+            None,
+            Some((tee_pk.clone(), REAL_CVM_MEASUREMENT.to_string())),
+            None,
+        );
+
+        testing_env!(get_context(buyer.clone(), STORAGE_DEPOSIT).build());
+        let deal_id = contract.create_deal(CreateDealParams {
+            buyer: buyer.clone(),
+            seller: seller.clone(),
+            token: None,
+            price: U128(1_000_000_000_000_000_000_000_000),
+            credit_amount: U128(1_000_000_000_000_000_000_000_000),
+            buyer_collateral: U128(0),
+            seller_collateral: U128(200_000_000_000_000_000_000_000),
+            tee_pubkey: tee_pk.clone(),
+            deposit_duration_sec: 3600,
+            key_duration_sec: 3600,
+            tee_liveness_timeout_sec: 3600,
+            slash_bps_provider_ban: 5000,
+            slash_bps_revoke: 8000,
+            slash_bps_buyer_breach: 1000,
+        });
+
+        let vault_addr = "0x0aA750e83Dae45e4bA17EbAd07A2Fb800988155f".to_string();
+        let token_addr = "0x036CbD53842c5426634e7929541eC2318f3dCF7e".to_string();
+        let buyer_addr = "0x1111111111111111111111111111111111111111".to_string();
+        let seller_addr = "0x2222222222222222222222222222222222222222".to_string();
+        let foreign_amount = U128(5_000_000);
+
+        contract.register_foreign_chain_deal(
+            deal_id,
+            84532,
+            vault_addr.clone(),
+            token_addr.clone(),
+            buyer_addr.clone(),
+            seller_addr.clone(),
+            foreign_amount,
+        );
+
+        let deal = contract.get_deal(deal_id).expect("deal exists");
+        let terms_hash = deal.terms_hash.expect("terms hash exists");
+
+        testing_env!(get_context(seller.clone(), NearToken::from_yoctonear(200_000_000_000_000_000_000_000)).build());
+        contract.accept_deal(deal_id, terms_hash);
+        contract.deposit(deal_id);
+
+        testing_env!(get_context(owner.clone(), NearToken::from_yoctonear(0)).build());
+        let deposit_payload = SignedPayload {
+            domain: "conpi:v1".to_string(),
+            contract_id: "conpi.testnet".parse().unwrap(),
+            chain_id: "testnet".to_string(),
+            deal_id,
+            terms_hash,
+            kind: PayloadKind::ForeignDeposit,
+            stage: 0,
+            metered_value: U128(0),
+            reason: None,
+            foreign_tx_sighash: None,
+            nonce: 1,
+            issued_at: 1_000_000_000_000,
+        };
+        let deposit_sig = sign_payload(&signing_key, &deposit_payload);
+        let tx_hash = "0x999b250800be67f6cab948a61c64a24863f18173316f885c61e8ba4cd6f1c392".to_string();
+        contract.record_foreign_deposit(deal_id, tx_hash, deposit_payload, deposit_sig);
+
+        // Activate
+        let activate_payload = SignedPayload {
+            domain: "conpi:v1".to_string(),
+            contract_id: "conpi.testnet".parse().unwrap(),
+            chain_id: "testnet".to_string(),
+            deal_id,
+            terms_hash,
+            kind: PayloadKind::Activate,
+            stage: 0,
+            metered_value: U128(0),
+            reason: None,
+            foreign_tx_sighash: None,
+            nonce: 2,
+            issued_at: 1_000_000_000_000,
+        };
+        let activate_sig = sign_payload(&signing_key, &activate_payload);
+        contract.activate(deal_id, activate_payload, activate_sig);
+
+        // Fast-forward past liveness timeout
+        testing_env!(get_context(buyer.clone(), NearToken::from_yoctonear(0))
+            .block_timestamp(1_000_000_000_000 + 3_600_000_000_001)
+            .build());
+
+        let expected_sighash = crate::eip1559::Eip1559Helper::compute_standard_erc20_transfer_sighash(
+            84532,
+            0,
+            &token_addr,
+            &buyer_addr,
+            5_000_000,
+        );
+        let foreign_tx = crate::types::ForeignTxRequest {
+            nonce: 0,
+            recipient: buyer_addr.clone(),
+            amount: U128(5_000_000), // 100% refund of 5 USDC
+            sighash: expected_sighash,
+        };
+
+        let _ = contract.timeout_refund_foreign(deal_id, foreign_tx);
+
+        let deal_after = contract.get_deal(deal_id).expect("deal exists");
+        assert_eq!(deal_after.status, DealStatus::SettledTimeout);
+
+        let foreign_after = contract.get_foreign_deal(deal_id).expect("foreign exists");
+        assert_eq!(foreign_after.evm_nonce, 1);
+    }
+
+    #[test]
+    fn test_foreign_chain_mpc_rollback_on_failure() {
+        let (signing_key, tee_pk) = generate_tee_keypair();
+        let owner: AccountId = "owner.testnet".parse().unwrap();
+        let buyer: AccountId = "buyer.testnet".parse().unwrap();
+        let seller: AccountId = "seller.testnet".parse().unwrap();
+
+        let mut contract = ConpiEscrow::new(
+            owner.clone(),
+            Some("testnet".to_string()),
+            None,
+            Some((tee_pk.clone(), REAL_CVM_MEASUREMENT.to_string())),
+            None,
+        );
+
+        testing_env!(get_context(buyer.clone(), STORAGE_DEPOSIT).build());
+        let deal_id = contract.create_deal(CreateDealParams {
+            buyer: buyer.clone(),
+            seller: seller.clone(),
+            token: None,
+            price: U128(1_000_000_000_000_000_000_000_000),
+            credit_amount: U128(1_000_000_000_000_000_000_000_000),
+            buyer_collateral: U128(0),
+            seller_collateral: U128(200_000_000_000_000_000_000_000),
+            tee_pubkey: tee_pk.clone(),
+            deposit_duration_sec: 3600,
+            key_duration_sec: 3600,
+            tee_liveness_timeout_sec: 3600,
+            slash_bps_provider_ban: 5000,
+            slash_bps_revoke: 8000,
+            slash_bps_buyer_breach: 1000,
+        });
+
+        let vault_addr = "0x0aA750e83Dae45e4bA17EbAd07A2Fb800988155f".to_string();
+        let token_addr = "0x036CbD53842c5426634e7929541eC2318f3dCF7e".to_string();
+        let buyer_addr = "0x1111111111111111111111111111111111111111".to_string();
+        let seller_addr = "0x2222222222222222222222222222222222222222".to_string();
+        let foreign_amount = U128(5_000_000);
+
+        contract.register_foreign_chain_deal(
+            deal_id,
+            84532,
+            vault_addr.clone(),
+            token_addr.clone(),
+            buyer_addr.clone(),
+            seller_addr.clone(),
+            foreign_amount,
+        );
+
+        let deal = contract.get_deal(deal_id).expect("deal exists");
+        let terms_hash = deal.terms_hash.expect("terms hash exists");
+
+        testing_env!(get_context(seller.clone(), NearToken::from_yoctonear(200_000_000_000_000_000_000_000)).build());
+        contract.accept_deal(deal_id, terms_hash);
+        contract.deposit(deal_id);
+
+        testing_env!(get_context(owner.clone(), NearToken::from_yoctonear(0)).build());
+        let deposit_payload = SignedPayload {
+            domain: "conpi:v1".to_string(),
+            contract_id: "conpi.testnet".parse().unwrap(),
+            chain_id: "testnet".to_string(),
+            deal_id,
+            terms_hash,
+            kind: PayloadKind::ForeignDeposit,
+            stage: 0,
+            metered_value: U128(0),
+            reason: None,
+            foreign_tx_sighash: None,
+            nonce: 1,
+            issued_at: 1_000_000_000_000,
+        };
+        let deposit_sig = sign_payload(&signing_key, &deposit_payload);
+        let tx_hash = "0x999b250800be67f6cab948a61c64a24863f18173316f885c61e8ba4cd6f1c392".to_string();
+        contract.record_foreign_deposit(deal_id, tx_hash, deposit_payload, deposit_sig);
+
+        // Activate
+        let activate_payload = SignedPayload {
+            domain: "conpi:v1".to_string(),
+            contract_id: "conpi.testnet".parse().unwrap(),
+            chain_id: "testnet".to_string(),
+            deal_id,
+            terms_hash,
+            kind: PayloadKind::Activate,
+            stage: 0,
+            metered_value: U128(0),
+            reason: None,
+            foreign_tx_sighash: None,
+            nonce: 2,
+            issued_at: 1_000_000_000_000,
+        };
+        let activate_sig = sign_payload(&signing_key, &activate_payload);
+        contract.activate(deal_id, activate_payload, activate_sig);
+
+        // Release stage 25
+        let foreign_tx = crate::types::ForeignTxRequest {
+            nonce: 0,
+            recipient: seller_addr.clone(),
+            amount: U128(1_250_000),
+            sighash: [0x55u8; 32],
+        };
+        let stage_payload = SignedPayload {
+            domain: "conpi:v1".to_string(),
+            contract_id: "conpi.testnet".parse().unwrap(),
+            chain_id: "testnet".to_string(),
+            deal_id,
+            terms_hash,
+            kind: PayloadKind::Stage,
+            stage: 25,
+            metered_value: U128(250_000_000_000_000_000_000_000),
+            reason: None,
+            foreign_tx_sighash: Some([0x55u8; 32]),
+            nonce: 3,
+            issued_at: 1_000_000_000_000,
+        };
+        let stage_sig = sign_payload(&signing_key, &stage_payload);
+        let _ = contract.release_stage_foreign(deal_id, 25, stage_payload, stage_sig, foreign_tx);
+
+        // State was tentatively advanced
+        let deal_tentative = contract.get_deal(deal_id).expect("deal exists");
+        assert_eq!(deal_tentative.stage_reached, 25);
+        let foreign_tentative = contract.get_foreign_deal(deal_id).expect("foreign exists");
+        assert_eq!(foreign_tentative.evm_nonce, 1);
+
+        // Now simulate MPC signature failure callback from NEAR MPC
+        testing_env!(get_context("conpi.testnet".parse().unwrap(), NearToken::from_yoctonear(0)).build());
+        let cb_res = contract.on_mpc_signed(
+            deal_id,
+            crate::types::MpcCallbackAction::Stage { stage: 25 },
+            [0x55u8; 32],
+            seller_addr.clone(),
+            U128(1_250_000),
+            0, // prev_stage
+            0, // prev_released
+            DealStatus::Active, // prev_status
+            0, // prev_evm_nonce
+            Err(near_sdk::PromiseError::Failed),
+        );
+        assert!(!cb_res, "Callback should return false on error");
+
+        // Assert state is ROLLBACK to previous clean state!
+        let deal_reverted = contract.get_deal(deal_id).expect("deal exists");
+        assert_eq!(deal_reverted.stage_reached, 0, "Stage must be rolled back to 0");
+        assert_eq!(deal_reverted.released_to_seller, 0, "Released must be rolled back to 0");
+        assert_eq!(deal_reverted.status, DealStatus::Active, "Status must remain Active");
+
+        let foreign_reverted = contract.get_foreign_deal(deal_id).expect("foreign exists");
+        assert_eq!(foreign_reverted.evm_nonce, 0, "EVM nonce must be rolled back to 0");
+    }
+
+    #[test]
+    #[should_panic(expected = "Foreign deals must use timeout_refund_foreign")]
+    fn test_native_timeout_refund_rejects_foreign_deal() {
+        let (_signing_key, tee_pk) = generate_tee_keypair();
+        let owner: AccountId = "owner.testnet".parse().unwrap();
+        let buyer: AccountId = "buyer.testnet".parse().unwrap();
+        let seller: AccountId = "seller.testnet".parse().unwrap();
+
+        let mut contract = ConpiEscrow::new(
+            owner.clone(),
+            Some("testnet".to_string()),
+            None,
+            Some((tee_pk.clone(), REAL_CVM_MEASUREMENT.to_string())),
+            None,
+        );
+
+        testing_env!(get_context(buyer.clone(), STORAGE_DEPOSIT).build());
+        let deal_id = contract.create_deal(CreateDealParams {
+            buyer: buyer.clone(),
+            seller: seller.clone(),
+            token: None,
+            price: U128(1_000_000_000_000_000_000_000_000),
+            credit_amount: U128(1_000_000_000_000_000_000_000_000),
+            buyer_collateral: U128(0),
+            seller_collateral: U128(200_000_000_000_000_000_000_000),
+            tee_pubkey: tee_pk.clone(),
+            deposit_duration_sec: 3600,
+            key_duration_sec: 3600,
+            tee_liveness_timeout_sec: 3600,
+            slash_bps_provider_ban: 5000,
+            slash_bps_revoke: 8000,
+            slash_bps_buyer_breach: 1000,
+        });
+
+        contract.register_foreign_chain_deal(
+            deal_id,
+            84532,
+            "0x0aA750e83Dae45e4bA17EbAd07A2Fb800988155f".to_string(),
+            "0x036CbD53842c5426634e7929541eC2318f3dCF7e".to_string(),
+            "0x1111111111111111111111111111111111111111".to_string(),
+            "0x2222222222222222222222222222222222222222".to_string(),
+            U128(5_000_000),
+        );
+
+        testing_env!(get_context(buyer.clone(), NearToken::from_yoctonear(0))
+            .block_timestamp(1_000_000_000_000 + 3_600_000_000_001)
+            .build());
+
+        // Calling native timeout_refund must panic and protect treasury!
+        contract.timeout_refund(deal_id);
+    }
+
+    #[test]
+    fn test_claim_seller_foreign_payout_and_seller_address_setting() {
+        let (signing_key, tee_pk) = generate_tee_keypair();
+        let owner: AccountId = "owner.testnet".parse().unwrap();
+        let buyer: AccountId = "buyer.testnet".parse().unwrap();
+        let seller: AccountId = "seller.testnet".parse().unwrap();
+
+        let mut contract = ConpiEscrow::new(
+            owner.clone(),
+            Some("testnet".to_string()),
+            None,
+            Some((tee_pk.clone(), REAL_CVM_MEASUREMENT.to_string())),
+            None,
+        );
+
+        testing_env!(get_context(buyer.clone(), STORAGE_DEPOSIT).build());
+        let deal_id = contract.create_deal(CreateDealParams {
+            buyer: buyer.clone(),
+            seller: seller.clone(),
+            token: None,
+            price: U128(1_000_000_000_000_000_000_000_000),
+            credit_amount: U128(1_000_000_000_000_000_000_000_000),
+            buyer_collateral: U128(0),
+            seller_collateral: U128(200_000_000_000_000_000_000_000),
+            tee_pubkey: tee_pk.clone(),
+            deposit_duration_sec: 3600,
+            key_duration_sec: 3600,
+            tee_liveness_timeout_sec: 3600,
+            slash_bps_provider_ban: 5000,
+            slash_bps_revoke: 8000,
+            slash_bps_buyer_breach: 1000,
+        });
+
+        let vault_addr = "0x0aA750e83Dae45e4bA17EbAd07A2Fb800988155f".to_string();
+        let token_addr = "0x036CbD53842c5426634e7929541eC2318f3dCF7e".to_string();
+        let buyer_addr = "0x1111111111111111111111111111111111111111".to_string();
+        let seller_addr = "0x2222222222222222222222222222222222222222".to_string();
+        let foreign_amount = U128(5_000_000);
+
+        contract.register_foreign_chain_deal(
+            deal_id,
+            84532,
+            vault_addr.clone(),
+            token_addr.clone(),
+            buyer_addr.clone(),
+            seller_addr.clone(),
+            foreign_amount,
+        );
+
+        // Seller sets their verified payout address
+        testing_env!(get_context(seller.clone(), NearToken::from_yoctonear(0)).build());
+        let seller_custom_addr = "0x3333333333333333333333333333333333333333".to_string();
+        contract.set_foreign_seller_address(deal_id, seller_custom_addr.clone());
+        let info = contract.get_foreign_deal(deal_id).unwrap();
+        assert_eq!(info.seller_address, seller_custom_addr);
+
+        let deal = contract.get_deal(deal_id).expect("deal exists");
+        let terms_hash = deal.terms_hash.expect("terms hash exists");
+
+        testing_env!(get_context(seller.clone(), NearToken::from_yoctonear(200_000_000_000_000_000_000_000)).build());
+        contract.accept_deal(deal_id, terms_hash);
+        contract.deposit(deal_id);
+
+        testing_env!(get_context(owner.clone(), NearToken::from_yoctonear(0)).build());
+        let deposit_payload = SignedPayload {
+            domain: "conpi:v1".to_string(),
+            contract_id: "conpi.testnet".parse().unwrap(),
+            chain_id: "testnet".to_string(),
+            deal_id,
+            terms_hash,
+            kind: PayloadKind::ForeignDeposit,
+            stage: 0,
+            metered_value: U128(0),
+            reason: None,
+            foreign_tx_sighash: None,
+            nonce: 1,
+            issued_at: 1_000_000_000_000,
+        };
+        let deposit_sig = sign_payload(&signing_key, &deposit_payload);
+        let tx_hash = "0x999b250800be67f6cab948a61c64a24863f18173316f885c61e8ba4cd6f1c392".to_string();
+        contract.record_foreign_deposit(deal_id, tx_hash, deposit_payload, deposit_sig);
+
+        // Activate
+        let activate_payload = SignedPayload {
+            domain: "conpi:v1".to_string(),
+            contract_id: "conpi.testnet".parse().unwrap(),
+            chain_id: "testnet".to_string(),
+            deal_id,
+            terms_hash,
+            kind: PayloadKind::Activate,
+            stage: 0,
+            metered_value: U128(0),
+            reason: None,
+            foreign_tx_sighash: None,
+            nonce: 2,
+            issued_at: 1_000_000_000_000,
+        };
+        let activate_sig = sign_payload(&signing_key, &activate_payload);
+        contract.activate(deal_id, activate_payload, activate_sig);
+
+        // Default occurs after 40% delivery ($2 USDC earned by seller, $3 refund to buyer)
+        let default_payload = SignedPayload {
+            domain: "conpi:v1".to_string(),
+            contract_id: "conpi.testnet".parse().unwrap(),
+            chain_id: "testnet".to_string(),
+            deal_id,
+            terms_hash,
+            kind: PayloadKind::Default,
+            stage: 0,
+            metered_value: U128(400_000_000_000_000_000_000_000), // 40%
+            reason: Some(DefaultReason::InvalidKey),
+            foreign_tx_sighash: Some([0x77u8; 32]),
+            nonce: 3,
+            issued_at: 1_000_000_000_000,
+        };
+        let default_sig = sign_payload(&signing_key, &default_payload);
+
+        let buyer_refund_tx = crate::types::ForeignTxRequest {
+            nonce: 0,
+            recipient: buyer_addr.clone(),
+            amount: U128(3_000_000), // 60% refund of 5 USDC
+            sighash: [0x77u8; 32],
+        };
+        let _ = contract.settle_default_foreign(deal_id, default_payload, default_sig, buyer_refund_tx);
+
+        // Seller claims their remaining earned $2 USDC (40% of 5 USDC = 2_000_000)
+        let expected_seller_sighash = crate::eip1559::Eip1559Helper::compute_standard_erc20_transfer_sighash(
+            84532,
+            1, // EVM nonce is now 1
+            &token_addr,
+            &seller_custom_addr,
+            2_000_000,
+        );
+        let seller_claim_tx = crate::types::ForeignTxRequest {
+            nonce: 1,
+            recipient: seller_custom_addr.clone(),
+            amount: U128(2_000_000),
+            sighash: expected_seller_sighash,
+        };
+
+        testing_env!(get_context(seller.clone(), NearToken::from_yoctonear(0)).build());
+        let _ = contract.claim_seller_foreign_payout(deal_id, seller_claim_tx.clone());
+
+        let foreign_after = contract.get_foreign_deal(deal_id).unwrap();
+        assert_eq!(foreign_after.evm_nonce, 2);
+
+        // Execute successful MPC callback for SellerClaim
+        testing_env!(get_context("conpi.testnet".parse().unwrap(), NearToken::from_yoctonear(0)).build());
+        let mpc_sig = crate::types::SignatureResponse {
+            scheme: "ecdsa".to_string(),
+            big_r: crate::types::AffinePoint { affine_point: "02".to_string() + &"11".repeat(32) },
+            s: crate::types::Scalar { scalar: "22".repeat(32) },
+            recovery_id: 0,
+        };
+        contract.on_mpc_signed(
+            deal_id,
+            crate::types::MpcCallbackAction::SellerClaim,
+            expected_seller_sighash,
+            seller_custom_addr.clone(),
+            U128(2_000_000),
+            0,
+            0,
+            DealStatus::Defaulted,
+            1,
+            Ok(mpc_sig),
+        );
+
+        let foreign_claimed = contract.get_foreign_deal(deal_id).unwrap();
+        assert!(foreign_claimed.seller_claimed, "seller_claimed must be true");
+
+        // Subsequent claim attempt MUST be rejected to prevent draining the vault!
+        testing_env!(get_context(seller.clone(), NearToken::from_yoctonear(0)).build());
+        let seller_claim_tx2 = crate::types::ForeignTxRequest {
+            nonce: 2,
+            recipient: seller_custom_addr.clone(),
+            amount: U128(2_000_000),
+            sighash: [0x88u8; 32],
+        };
+        let res = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _ = contract.claim_seller_foreign_payout(deal_id, seller_claim_tx2);
+        }));
+        assert!(res.is_err(), "Repeated seller claim MUST panic to prevent vault drain");
+    }
+
+    #[test]
+    fn test_foreign_default_deferred_collateral_payout_and_rollback() {
+        let (signing_key, tee_pk) = generate_tee_keypair();
+        let owner: AccountId = "owner.testnet".parse().unwrap();
+        let buyer: AccountId = "buyer.testnet".parse().unwrap();
+        let seller: AccountId = "seller.testnet".parse().unwrap();
+
+        testing_env!(get_context(owner.clone(), STORAGE_DEPOSIT).build());
+        let mut contract = ConpiEscrow::new(
+            owner.clone(),
+            Some("testnet".to_string()),
+            None,
+            Some((tee_pk.clone(), REAL_CVM_MEASUREMENT.to_string())),
+            None,
+        );
+
+        testing_env!(get_context(buyer.clone(), STORAGE_DEPOSIT).build());
+        let deal_id = contract.create_deal(CreateDealParams {
+            buyer: buyer.clone(),
+            seller: seller.clone(),
+            token: None,
+            price: U128(1_000_000_000_000_000_000_000_000),
+            credit_amount: U128(1_000_000_000_000_000_000_000_000),
+            buyer_collateral: U128(0),
+            seller_collateral: U128(200_000_000_000_000_000_000_000),
+            tee_pubkey: tee_pk.clone(),
+            deposit_duration_sec: 3600,
+            key_duration_sec: 3600,
+            tee_liveness_timeout_sec: 3600,
+            slash_bps_provider_ban: 5000,
+            slash_bps_revoke: 8000,
+            slash_bps_buyer_breach: 1000,
+        });
+
+        let vault_addr = "0x0aA750e83Dae45e4bA17EbAd07A2Fb800988155f".to_string();
+        let token_addr = "0x036CbD53842c5426634e7929541eC2318f3dCF7e".to_string();
+        let buyer_addr = "0x1111111111111111111111111111111111111111".to_string();
+        let seller_addr = "0x2222222222222222222222222222222222222222".to_string();
+        let foreign_amount = U128(5_000_000);
+
+        contract.register_foreign_chain_deal(
+            deal_id,
+            84532,
+            vault_addr.clone(),
+            token_addr.clone(),
+            buyer_addr.clone(),
+            seller_addr.clone(),
+            foreign_amount,
+        );
+
+        let deal = contract.get_deal(deal_id).unwrap();
+        let terms_hash = deal.terms_hash.unwrap();
+        testing_env!(get_context(seller.clone(), NearToken::from_yoctonear(200_000_000_000_000_000_000_000)).build());
+        contract.accept_deal(deal_id, terms_hash);
+        contract.deposit(deal_id);
+
+        testing_env!(get_context(owner.clone(), NearToken::from_yoctonear(0)).build());
+        let dep_payload = SignedPayload {
+            domain: "conpi:v1".to_string(),
+            contract_id: "conpi.testnet".parse().unwrap(),
+            chain_id: "testnet".to_string(),
+            deal_id,
+            terms_hash,
+            kind: PayloadKind::ForeignDeposit,
+            stage: 0,
+            metered_value: U128(0),
+            reason: None,
+            foreign_tx_sighash: None,
+            nonce: 1,
+            issued_at: 1000,
+        };
+        let dep_sig = sign_payload(&signing_key, &dep_payload);
+        contract.record_foreign_deposit(deal_id, "0x123".to_string(), dep_payload, dep_sig);
+
+        let act_payload = SignedPayload {
+            domain: "conpi:v1".to_string(),
+            contract_id: "conpi.testnet".parse().unwrap(),
+            chain_id: "testnet".to_string(),
+            deal_id,
+            terms_hash,
+            kind: PayloadKind::Activate,
+            stage: 0,
+            metered_value: U128(0),
+            reason: None,
+            foreign_tx_sighash: None,
+            nonce: 2,
+            issued_at: 2000,
+        };
+        let act_sig = sign_payload(&signing_key, &act_payload);
+        contract.activate(deal_id, act_payload, act_sig);
+
+        // Deal is Active with 200_000... yoctoNEAR collateral from seller
+        let def_payload = SignedPayload {
+            domain: "conpi:v1".to_string(),
+            contract_id: "conpi.testnet".parse().unwrap(),
+            chain_id: "testnet".to_string(),
+            deal_id,
+            terms_hash,
+            kind: PayloadKind::Default,
+            stage: 0,
+            metered_value: U128(0),
+            reason: Some(DefaultReason::InvalidKey),
+            foreign_tx_sighash: Some([0xaa; 32]),
+            nonce: 3,
+            issued_at: 3000,
+        };
+        let def_sig = sign_payload(&signing_key, &def_payload);
+        let refund_tx = crate::types::ForeignTxRequest {
+            nonce: 0,
+            recipient: buyer_addr.clone(),
+            amount: U128(5_000_000),
+            sighash: [0xaa; 32],
+        };
+
+        let _ = contract.settle_default_foreign(deal_id, def_payload, def_sig, refund_tx);
+
+        // State is tentatively Defaulted, but collateral payout is deferred to on_mpc_signed!
+        let deal_tentative = contract.get_deal(deal_id).unwrap();
+        assert_eq!(deal_tentative.seller_collateral, 200_000_000_000_000_000_000_000);
+
+        // Simulate MPC failure
+        testing_env!(get_context("conpi.testnet".parse().unwrap(), NearToken::from_yoctonear(0)).build());
+        let rollback_ok = contract.on_mpc_signed(
+            deal_id,
+            crate::types::MpcCallbackAction::Default {
+                seller_slashed: U128(100_000_000_000_000_000_000_000),
+                buyer_slashed: U128(0),
+                seller_collateral_remaining: U128(100_000_000_000_000_000_000_000),
+            },
+            [0xaa; 32],
+            buyer_addr.clone(),
+            U128(5_000_000),
+            0,
+            0,
+            DealStatus::Active,
+            0,
+            Err(near_sdk::PromiseError::Failed),
+        );
+        assert!(!rollback_ok);
+
+        // Verify status rolled back to Active and collateral is still 100% intact (zero leakage!)
+        let deal_reverted = contract.get_deal(deal_id).unwrap();
+        assert_eq!(deal_reverted.status, DealStatus::Active);
+        assert_eq!(deal_reverted.seller_collateral, 200_000_000_000_000_000_000_000);
+    }
+
+    #[test]
+    fn test_seller_foreign_address_update_in_active_status() {
+        let (_signing_key, tee_pk) = generate_tee_keypair();
+        let owner: AccountId = "owner.testnet".parse().unwrap();
+        let buyer: AccountId = "buyer.testnet".parse().unwrap();
+        let seller: AccountId = "seller.testnet".parse().unwrap();
+
+        testing_env!(get_context(owner.clone(), STORAGE_DEPOSIT).build());
+        let mut contract = ConpiEscrow::new(
+            owner.clone(),
+            Some("testnet".to_string()),
+            None,
+            Some((tee_pk.clone(), REAL_CVM_MEASUREMENT.to_string())),
+            None,
+        );
+
+        testing_env!(get_context(buyer.clone(), STORAGE_DEPOSIT).build());
+        let deal_id = contract.create_deal(CreateDealParams {
+            buyer: buyer.clone(),
+            seller: seller.clone(),
+            token: None,
+            price: U128(10_000_000_000_000_000_000_000_000),
+            credit_amount: U128(1_000),
+            buyer_collateral: U128(0),
+            seller_collateral: U128(0),
+            tee_pubkey: tee_pk.clone(),
+            deposit_duration_sec: 3600,
+            key_duration_sec: 3600,
+            tee_liveness_timeout_sec: 3600,
+            slash_bps_provider_ban: 5000,
+            slash_bps_revoke: 8000,
+            slash_bps_buyer_breach: 1000,
+        });
+
+        testing_env!(get_context(seller.clone(), NearToken::from_yoctonear(0)).build());
+        contract.register_foreign_chain_deal(
+            deal_id,
+            84532,
+            "0x1111111111111111111111111111111111111111".to_string(),
+            "0x2222222222222222222222222222222222222222".to_string(),
+            "0x3333333333333333333333333333333333333333".to_string(),
+            "0x4444444444444444444444444444444444444444".to_string(),
+            U128(10_000_000),
+        );
+
+        // Advance to Active status
+        let mut deal = contract.get_deal(deal_id).unwrap();
+        deal.status = DealStatus::Active;
+        contract.deals.insert(&deal_id, &deal);
+
+        // Seller corrects EVM payout address while Active!
+        contract.set_foreign_seller_address(deal_id, "0x9999999999999999999999999999999999999999".to_string());
+        let info = contract.get_foreign_deal(deal_id).unwrap();
+        assert_eq!(info.seller_address, "0x9999999999999999999999999999999999999999");
+    }
+
+    #[test]
+    fn test_timeout_refund_foreign_created_zero_deposit_skips_mpc() {
+        let (_signing_key, tee_pk) = generate_tee_keypair();
+        let owner: AccountId = "owner.testnet".parse().unwrap();
+        let buyer: AccountId = "buyer.testnet".parse().unwrap();
+        let seller: AccountId = "seller.testnet".parse().unwrap();
+
+        testing_env!(get_context(owner.clone(), STORAGE_DEPOSIT).build());
+        let mut contract = ConpiEscrow::new(
+            owner.clone(),
+            Some("testnet".to_string()),
+            None,
+            Some((tee_pk.clone(), REAL_CVM_MEASUREMENT.to_string())),
+            None,
+        );
+
+        testing_env!(get_context(buyer.clone(), STORAGE_DEPOSIT).build());
+        let deal_id = contract.create_deal(CreateDealParams {
+            buyer: buyer.clone(),
+            seller: seller.clone(),
+            token: None,
+            price: U128(10_000_000_000_000_000_000_000_000),
+            credit_amount: U128(1_000),
+            buyer_collateral: U128(0),
+            seller_collateral: U128(0),
+            tee_pubkey: tee_pk.clone(),
+            deposit_duration_sec: 3600,
+            key_duration_sec: 3600,
+            tee_liveness_timeout_sec: 3600,
+            slash_bps_provider_ban: 5000,
+            slash_bps_revoke: 8000,
+            slash_bps_buyer_breach: 1000,
+        });
+
+        contract.register_foreign_chain_deal(
+            deal_id,
+            84532,
+            "0x1111111111111111111111111111111111111111".to_string(),
+            "0x2222222222222222222222222222222222222222".to_string(),
+            "0x3333333333333333333333333333333333333333".to_string(),
+            "0x4444444444444444444444444444444444444444".to_string(),
+            U128(10_000_000),
+        );
+
+        // Early cancellation by buyer when zero deposit was funded
+        let dummy_tx = crate::types::ForeignTxRequest {
+            nonce: 0,
+            recipient: "0x3333333333333333333333333333333333333333".to_string(),
+            amount: U128(10_000_000),
+            sighash: [0; 32],
+        };
+
+        let _ = contract.timeout_refund_foreign(deal_id, dummy_tx);
+        let deal = contract.get_deal(deal_id).unwrap();
+        assert_eq!(deal.status, DealStatus::Cancelled);
+    }
+
+    #[test]
+    fn test_nep297_event_format() {
+        let (_signing_key, tee_pk) = generate_tee_keypair();
+        let owner: AccountId = "owner.testnet".parse().unwrap();
+        let buyer: AccountId = "buyer.testnet".parse().unwrap();
+        let seller: AccountId = "seller.testnet".parse().unwrap();
+
+        testing_env!(get_context(owner.clone(), STORAGE_DEPOSIT).build());
+        let mut contract = ConpiEscrow::new(
+            owner.clone(),
+            Some("testnet".to_string()),
+            None,
+            Some((tee_pk.clone(), REAL_CVM_MEASUREMENT.to_string())),
+            None,
+        );
+
+        testing_env!(get_context(buyer.clone(), STORAGE_DEPOSIT).build());
+        let deal_id = contract.create_deal(CreateDealParams {
+            buyer: buyer.clone(),
+            seller: seller.clone(),
+            token: None,
+            price: U128(10_000_000_000_000_000_000_000_000),
+            credit_amount: U128(1_000),
+            buyer_collateral: U128(0),
+            seller_collateral: U128(0),
+            tee_pubkey: tee_pk.clone(),
+            deposit_duration_sec: 3600,
+            key_duration_sec: 3600,
+            tee_liveness_timeout_sec: 3600,
+            slash_bps_provider_ban: 5000,
+            slash_bps_revoke: 8000,
+            slash_bps_buyer_breach: 1000,
+        });
+
+        contract.register_foreign_chain_deal(
+            deal_id,
+            84532,
+            "0x1111111111111111111111111111111111111111".to_string(),
+            "0x2222222222222222222222222222222222222222".to_string(),
+            "0x3333333333333333333333333333333333333333".to_string(),
+            "0x4444444444444444444444444444444444444444".to_string(),
+            U128(10_000_000),
+        );
+
+        let mpc_sig = crate::types::SignatureResponse {
+            scheme: "ecdsa".to_string(),
+            big_r: crate::types::AffinePoint { affine_point: "02".to_string() + &"11".repeat(32) },
+            s: crate::types::Scalar { scalar: "22".repeat(32) },
+            recovery_id: 0,
+        };
+
+        contract.on_mpc_signed(
+            deal_id,
+            crate::types::MpcCallbackAction::Stage { stage: 25 },
+            [0x55; 32],
+            "0x4444444444444444444444444444444444444444".to_string(),
+            U128(2_500_000),
+            0,
+            0,
+            DealStatus::Active,
+            0,
+            Ok(mpc_sig),
+        );
+
+        let logs = near_sdk::test_utils::get_logs();
+        let foreign_signed_log = logs.iter().find(|l| l.contains("foreign_tx_signed")).expect("Must emit foreign_tx_signed event");
+        assert!(foreign_signed_log.starts_with("EVENT_JSON:"), "Must follow NEP-297 EVENT_JSON prefix");
+        assert!(foreign_signed_log.contains("\"standard\":\"conpi\""), "Must have standard: conpi");
+        assert!(foreign_signed_log.contains("\"event\":\"foreign_tx_signed\""), "Must have event: foreign_tx_signed");
+        assert!(foreign_signed_log.contains("\"data\":["), "Must have data array");
+        // Ensure 33-byte affine point 02 prefix was stripped to 64-char scalar!
+        assert!(!foreign_signed_log.contains("\"r_hex\":\"02"), "r_hex must not contain 02 point prefix");
+    }
+
+    #[test]
+    fn test_set_foreign_buyer_address() {
+        let (_signing_key, tee_pk) = generate_tee_keypair();
+        let owner: AccountId = "owner.testnet".parse().unwrap();
+        let buyer: AccountId = "buyer.testnet".parse().unwrap();
+        let seller: AccountId = "seller.testnet".parse().unwrap();
+
+        testing_env!(get_context(owner.clone(), STORAGE_DEPOSIT).build());
+        let mut contract = ConpiEscrow::new(
+            owner.clone(),
+            Some("testnet".to_string()),
+            None,
+            Some((tee_pk.clone(), REAL_CVM_MEASUREMENT.to_string())),
+            None,
+        );
+
+        testing_env!(get_context(buyer.clone(), STORAGE_DEPOSIT).build());
+        let deal_id = contract.create_deal(CreateDealParams {
+            buyer: buyer.clone(),
+            seller: seller.clone(),
+            token: None,
+            price: U128(10_000_000_000_000_000_000_000_000),
+            credit_amount: U128(1_000),
+            buyer_collateral: U128(0),
+            seller_collateral: U128(0),
+            tee_pubkey: tee_pk.clone(),
+            deposit_duration_sec: 3600,
+            key_duration_sec: 3600,
+            tee_liveness_timeout_sec: 3600,
+            slash_bps_provider_ban: 5000,
+            slash_bps_revoke: 8000,
+            slash_bps_buyer_breach: 1000,
+        });
+
+        contract.register_foreign_chain_deal(
+            deal_id,
+            84532,
+            "0x1111111111111111111111111111111111111111".to_string(),
+            "0x2222222222222222222222222222222222222222".to_string(),
+            "0x3333333333333333333333333333333333333333".to_string(),
+            "0x4444444444444444444444444444444444444444".to_string(),
+            U128(10_000_000),
+        );
+
+        // Buyer updates their refund address
+        contract.set_foreign_buyer_address(deal_id, "0x5555555555555555555555555555555555555555".to_string());
+        let info = contract.get_foreign_deal(deal_id).unwrap();
+        assert_eq!(info.buyer_address, "0x5555555555555555555555555555555555555555");
+    }
+
+    #[test]
+    fn test_foreign_chain_finalize_auto_release() {
+        let (_signing_key, tee_pk) = generate_tee_keypair();
+        let owner: AccountId = "owner.testnet".parse().unwrap();
+        let buyer: AccountId = "buyer.testnet".parse().unwrap();
+        let seller: AccountId = "seller.testnet".parse().unwrap();
+
+        testing_env!(get_context(owner.clone(), STORAGE_DEPOSIT).build());
+        let mut contract = ConpiEscrow::new(
+            owner.clone(),
+            Some("testnet".to_string()),
+            None,
+            Some((tee_pk.clone(), REAL_CVM_MEASUREMENT.to_string())),
+            None,
+        );
+
+        testing_env!(get_context(buyer.clone(), STORAGE_DEPOSIT).build());
+        let deal_id = contract.create_deal(CreateDealParams {
+            buyer: buyer.clone(),
+            seller: seller.clone(),
+            token: None,
+            price: U128(10_000_000_000_000_000_000_000_000),
+            credit_amount: U128(1_000),
+            buyer_collateral: U128(0),
+            seller_collateral: U128(500_000_000_000_000_000_000_000),
+            tee_pubkey: tee_pk.clone(),
+            deposit_duration_sec: 3600,
+            key_duration_sec: 3600,
+            tee_liveness_timeout_sec: 3600,
+            slash_bps_provider_ban: 5000,
+            slash_bps_revoke: 8000,
+            slash_bps_buyer_breach: 1000,
+        });
+
+        let seller_addr = "0x4444444444444444444444444444444444444444".to_string();
+        let token_addr = "0x2222222222222222222222222222222222222222".to_string();
+
+        contract.register_foreign_chain_deal(
+            deal_id,
+            84532,
+            "0x1111111111111111111111111111111111111111".to_string(),
+            token_addr.clone(),
+            "0x3333333333333333333333333333333333333333".to_string(),
+            seller_addr.clone(),
+            U128(10_000_000),
+        );
+
+        // Advance deal to Active and pass usage deadline
+        let mut deal = contract.get_deal(deal_id).unwrap();
+        deal.status = DealStatus::Active;
+        deal.usage_deadline = 1_000_000_000;
+        contract.deals.insert(&deal_id, &deal);
+
+        // Block timestamp past usage deadline
+        testing_env!(get_context(seller.clone(), NearToken::from_yoctonear(0))
+            .block_timestamp(1_500_000_000)
+            .build());
+
+        contract.request_auto_release(deal_id);
+        let deal_noticed = contract.get_deal(deal_id).unwrap();
+        assert!(deal_noticed.notice_deadline.is_some());
+
+        // Fast forward past notice deadline (24 hours = 86_400_000_000_000 ns)
+        let notice_deadline = deal_noticed.notice_deadline.unwrap();
+        testing_env!(get_context(seller.clone(), NearToken::from_yoctonear(0))
+            .block_timestamp(notice_deadline + 1_000_000)
+            .build());
+
+        let expected_sighash = crate::eip1559::Eip1559Helper::compute_standard_erc20_transfer_sighash(
+            84532,
+            0,
+            &token_addr,
+            &seller_addr,
+            10_000_000,
+        );
+
+        let auto_release_tx = crate::types::ForeignTxRequest {
+            nonce: 0,
+            recipient: seller_addr.clone(),
+            amount: U128(10_000_000),
+            sighash: expected_sighash,
+        };
+
+        let _ = contract.finalize_auto_release_foreign(deal_id, auto_release_tx);
+
+        // Simulate successful MPC signing callback
+        let mpc_sig = crate::types::SignatureResponse {
+            scheme: "ecdsa".to_string(),
+            big_r: crate::types::AffinePoint { affine_point: "11".repeat(32) },
+            s: crate::types::Scalar { scalar: "22".repeat(32) },
+            recovery_id: 0,
+        };
+
+        testing_env!(get_context("conpi.testnet".parse().unwrap(), NearToken::from_yoctonear(0)).build());
+        let callback_ok = contract.on_mpc_signed(
+            deal_id,
+            crate::types::MpcCallbackAction::Stage { stage: 100 },
+            expected_sighash,
+            seller_addr.clone(),
+            U128(10_000_000),
+            0,
+            0,
+            DealStatus::Active,
+            0,
+            Ok(mpc_sig),
+        );
+        assert!(callback_ok);
+
+        let finalized_deal = contract.get_deal(deal_id).unwrap();
+        assert_eq!(finalized_deal.status, DealStatus::Completed);
+        assert_eq!(finalized_deal.stage_reached, 100);
+        assert_eq!(finalized_deal.seller_collateral, 0);
+    }
+
+    #[test]
+    fn test_foreign_chain_waives_native_buyer_collateral() {
+        let (_signing_key, tee_pk) = generate_tee_keypair();
+        let owner: AccountId = "owner.testnet".parse().unwrap();
+        let buyer: AccountId = "buyer.testnet".parse().unwrap();
+        let seller: AccountId = "seller.testnet".parse().unwrap();
+
+        testing_env!(get_context(owner.clone(), STORAGE_DEPOSIT).build());
+        let mut contract = ConpiEscrow::new(
+            owner.clone(),
+            Some("testnet".to_string()),
+            None,
+            Some((tee_pk.clone(), REAL_CVM_MEASUREMENT.to_string())),
+            None,
+        );
+
+        testing_env!(get_context(buyer.clone(), STORAGE_DEPOSIT).build());
+        let deal_id = contract.create_deal(CreateDealParams {
+            buyer: buyer.clone(),
+            seller: seller.clone(),
+            token: None,
+            price: U128(10_000_000_000_000_000_000_000_000),
+            credit_amount: U128(1_000),
+            buyer_collateral: U128(500_000), // Non-zero native buyer collateral
+            seller_collateral: U128(0),
+            tee_pubkey: tee_pk.clone(),
+            deposit_duration_sec: 3600,
+            key_duration_sec: 3600,
+            tee_liveness_timeout_sec: 3600,
+            slash_bps_provider_ban: 5000,
+            slash_bps_revoke: 8000,
+            slash_bps_buyer_breach: 1000,
+        });
+
+        contract.register_foreign_chain_deal(
+            deal_id,
+            84532,
+            "0x1111111111111111111111111111111111111111".to_string(),
+            "0x2222222222222222222222222222222222222222".to_string(),
+            "0x3333333333333333333333333333333333333333".to_string(),
+            "0x4444444444444444444444444444444444444444".to_string(),
+            U128(10_000_000),
+        );
+
+        let deal = contract.get_deal(deal_id).unwrap();
+        assert_eq!(deal.buyer_collateral, 0);
+    }
+
+    #[test]
+    #[should_panic(expected = "Foreign chain deals must not specify NEP-141 token escrow")]
+    fn test_foreign_chain_rejects_nep141_token() {
+        let (_signing_key, tee_pk) = generate_tee_keypair();
+        let owner: AccountId = "owner.testnet".parse().unwrap();
+        let buyer: AccountId = "buyer.testnet".parse().unwrap();
+        let seller: AccountId = "seller.testnet".parse().unwrap();
+        let usdt: AccountId = "usdt.testnet".parse().unwrap();
+
+        testing_env!(get_context(owner.clone(), STORAGE_DEPOSIT).build());
+        let mut contract = ConpiEscrow::new(
+            owner.clone(),
+            Some("testnet".to_string()),
+            None,
+            Some((tee_pk.clone(), REAL_CVM_MEASUREMENT.to_string())),
+            None,
+        );
+
+        testing_env!(get_context(buyer.clone(), STORAGE_DEPOSIT).build());
+        let deal_id = contract.create_deal(CreateDealParams {
+            buyer: buyer.clone(),
+            seller: seller.clone(),
+            token: Some(usdt),
+            price: U128(10_000_000_000_000_000_000_000_000),
+            credit_amount: U128(1_000),
+            buyer_collateral: U128(0),
+            seller_collateral: U128(0),
+            tee_pubkey: tee_pk.clone(),
+            deposit_duration_sec: 3600,
+            key_duration_sec: 3600,
+            tee_liveness_timeout_sec: 3600,
+            slash_bps_provider_ban: 5000,
+            slash_bps_revoke: 8000,
+            slash_bps_buyer_breach: 1000,
+        });
+
+        contract.register_foreign_chain_deal(
+            deal_id,
+            84532,
+            "0x1111111111111111111111111111111111111111".to_string(),
+            "0x2222222222222222222222222222222222222222".to_string(),
+            "0x3333333333333333333333333333333333333333".to_string(),
+            "0x4444444444444444444444444444444444444444".to_string(),
+            U128(10_000_000),
+        );
+    }
+
+    #[test]
+    #[should_panic(expected = "Valid non-zero hexadecimal buyer address is required")]
+    fn test_foreign_chain_rejects_non_hex_address() {
+        let (_signing_key, tee_pk) = generate_tee_keypair();
+        let owner: AccountId = "owner.testnet".parse().unwrap();
+        let buyer: AccountId = "buyer.testnet".parse().unwrap();
+        let seller: AccountId = "seller.testnet".parse().unwrap();
+
+        testing_env!(get_context(owner.clone(), STORAGE_DEPOSIT).build());
+        let mut contract = ConpiEscrow::new(
+            owner.clone(),
+            Some("testnet".to_string()),
+            None,
+            Some((tee_pk.clone(), REAL_CVM_MEASUREMENT.to_string())),
+            None,
+        );
+
+        testing_env!(get_context(buyer.clone(), STORAGE_DEPOSIT).build());
+        let deal_id = contract.create_deal(CreateDealParams {
+            buyer: buyer.clone(),
+            seller: seller.clone(),
+            token: None,
+            price: U128(10_000_000_000_000_000_000_000_000),
+            credit_amount: U128(1_000),
+            buyer_collateral: U128(0),
+            seller_collateral: U128(0),
+            tee_pubkey: tee_pk.clone(),
+            deposit_duration_sec: 3600,
+            key_duration_sec: 3600,
+            tee_liveness_timeout_sec: 3600,
+            slash_bps_provider_ban: 5000,
+            slash_bps_revoke: 8000,
+            slash_bps_buyer_breach: 1000,
+        });
+
+        // Non-hex character 'Z' must panic at validation time
+        contract.register_foreign_chain_deal(
+            deal_id,
+            84532,
+            "0x1111111111111111111111111111111111111111".to_string(),
+            "0x2222222222222222222222222222222222222222".to_string(),
+            "0xZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZ".to_string(),
+            "0x4444444444444444444444444444444444444444".to_string(),
+            U128(10_000_000),
+        );
+    }
+
+    #[test]
+    #[should_panic(expected = "Buyer deposits for foreign chain deals must be made on the foreign chain")]
+    fn test_foreign_chain_rejects_native_buyer_deposit() {
+        let (_signing_key, tee_pk) = generate_tee_keypair();
+        let owner: AccountId = "owner.testnet".parse().unwrap();
+        let buyer: AccountId = "buyer.testnet".parse().unwrap();
+        let seller: AccountId = "seller.testnet".parse().unwrap();
+
+        testing_env!(get_context(owner.clone(), STORAGE_DEPOSIT).build());
+        let mut contract = ConpiEscrow::new(
+            owner.clone(),
+            Some("testnet".to_string()),
+            None,
+            Some((tee_pk.clone(), REAL_CVM_MEASUREMENT.to_string())),
+            None,
+        );
+
+        testing_env!(get_context(buyer.clone(), STORAGE_DEPOSIT).build());
+        let deal_id = contract.create_deal(CreateDealParams {
+            buyer: buyer.clone(),
+            seller: seller.clone(),
+            token: None,
+            price: U128(10_000_000_000_000_000_000_000_000),
+            credit_amount: U128(1_000),
+            buyer_collateral: U128(0),
+            seller_collateral: U128(0),
+            tee_pubkey: tee_pk.clone(),
+            deposit_duration_sec: 3600,
+            key_duration_sec: 3600,
+            tee_liveness_timeout_sec: 3600,
+            slash_bps_provider_ban: 5000,
+            slash_bps_revoke: 8000,
+            slash_bps_buyer_breach: 1000,
+        });
+
+        contract.register_foreign_chain_deal(
+            deal_id,
+            84532,
+            "0x1111111111111111111111111111111111111111".to_string(),
+            "0x2222222222222222222222222222222222222222".to_string(),
+            "0x3333333333333333333333333333333333333333".to_string(),
+            "0x4444444444444444444444444444444444444444".to_string(),
+            U128(10_000_000),
+        );
+
+        // Buyer attempts to attach native NEAR to foreign deal - must be rejected!
+        testing_env!(get_context(buyer.clone(), NearToken::from_near(1)).build());
+        contract.deposit(deal_id);
+    }
+
+    #[test]
+    fn test_foreign_chain_seller_slashing_and_buyer_breach() {
+        let (_signing_key, tee_pk) = generate_tee_keypair();
+        let owner: AccountId = "owner.testnet".parse().unwrap();
+        let buyer: AccountId = "buyer.testnet".parse().unwrap();
+        let seller: AccountId = "seller.testnet".parse().unwrap();
+
+        testing_env!(get_context(owner.clone(), STORAGE_DEPOSIT).build());
+        let mut contract = ConpiEscrow::new(
+            owner.clone(),
+            Some("testnet".to_string()),
+            None,
+            Some((tee_pk.clone(), REAL_CVM_MEASUREMENT.to_string())),
+            None,
+        );
+
+        testing_env!(get_context(buyer.clone(), STORAGE_DEPOSIT).build());
+        let deal_id = contract.create_deal(CreateDealParams {
+            buyer: buyer.clone(),
+            seller: seller.clone(),
+            token: None,
+            price: U128(10_000_000_000_000_000_000_000_000),
+            credit_amount: U128(1_000),
+            buyer_collateral: U128(0),
+            seller_collateral: U128(300_000_000_000_000_000_000_000),
+            tee_pubkey: tee_pk.clone(),
+            deposit_duration_sec: 3600,
+            key_duration_sec: 3600,
+            tee_liveness_timeout_sec: 3600,
+            slash_bps_provider_ban: 5000,
+            slash_bps_revoke: 8000,
+            slash_bps_buyer_breach: 1000,
+        });
+
+        contract.register_foreign_chain_deal(
+            deal_id,
+            84532,
+            "0x1111111111111111111111111111111111111111".to_string(),
+            "0x2222222222222222222222222222222222222222".to_string(),
+            "0x3333333333333333333333333333333333333333".to_string(),
+            "0x4444444444444444444444444444444444444444".to_string(),
+            U128(10_000_000),
+        );
+
+        let mpc_sig = crate::types::SignatureResponse {
+            scheme: "ecdsa".to_string(),
+            big_r: crate::types::AffinePoint { affine_point: "11".repeat(32) },
+            s: crate::types::Scalar { scalar: "22".repeat(32) },
+            recovery_id: 0,
+        };
+
+        // Test Default: seller slashed for ProviderBan
+        testing_env!(get_context("conpi.testnet".parse().unwrap(), NearToken::from_yoctonear(0)).build());
+        contract.on_mpc_signed(
+            deal_id,
+            crate::types::MpcCallbackAction::Default {
+                seller_slashed: U128(150_000_000_000_000_000_000_000),
+                buyer_slashed: U128(0),
+                seller_collateral_remaining: U128(150_000_000_000_000_000_000_000),
+            },
+            [0xdd; 32],
+            "0x3333333333333333333333333333333333333333".to_string(),
+            U128(5_000_000),
+            0,
+            0,
+            DealStatus::Active,
+            0,
+            Ok(mpc_sig),
+        );
+
+        let deal = contract.get_deal(deal_id).unwrap();
+        assert_eq!(deal.status, DealStatus::Defaulted);
+        assert_eq!(deal.seller_collateral, 0);
+    }
+
+    #[test]
+    #[should_panic(expected = "Native buyer deposit already made; cannot convert to foreign chain deal")]
+    fn test_foreign_chain_rejects_already_deposited_deal() {
+        let (_signing_key, tee_pk) = generate_tee_keypair();
+        let owner: AccountId = "owner.testnet".parse().unwrap();
+        let buyer: AccountId = "buyer.testnet".parse().unwrap();
+        let seller: AccountId = "seller.testnet".parse().unwrap();
+
+        testing_env!(get_context(owner.clone(), STORAGE_DEPOSIT).build());
+        let mut contract = ConpiEscrow::new(
+            owner.clone(),
+            Some("testnet".to_string()),
+            None,
+            Some((tee_pk.clone(), REAL_CVM_MEASUREMENT.to_string())),
+            None,
+        );
+
+        testing_env!(get_context(buyer.clone(), STORAGE_DEPOSIT).build());
+        let deal_id = contract.create_deal(CreateDealParams {
+            buyer: buyer.clone(),
+            seller: seller.clone(),
+            token: None,
+            price: U128(2_000_000_000_000_000_000_000_000), // 2 NEAR
+            credit_amount: U128(1_000),
+            buyer_collateral: U128(0),
+            seller_collateral: U128(0),
+            tee_pubkey: tee_pk.clone(),
+            deposit_duration_sec: 3600,
+            key_duration_sec: 3600,
+            tee_liveness_timeout_sec: 3600,
+            slash_bps_provider_ban: 5000,
+            slash_bps_revoke: 8000,
+            slash_bps_buyer_breach: 1000,
+        });
+
+        // Buyer deposits 1 NEAR (partial deposit, deal status remains Created)
+        testing_env!(get_context(buyer.clone(), NearToken::from_near(1)).build());
+        contract.deposit(deal_id);
+
+        let deal = contract.get_deal(deal_id).unwrap();
+        assert_eq!(deal.status, DealStatus::Created);
+        assert_eq!(deal.buyer_deposited, 1_000_000_000_000_000_000_000_000);
+
+        // Caller attempts to register foreign chain parameters after native deposit was made
+        contract.register_foreign_chain_deal(
+            deal_id,
+            84532,
+            "0x1111111111111111111111111111111111111111".to_string(),
+            "0x2222222222222222222222222222222222222222".to_string(),
+            "0x3333333333333333333333333333333333333333".to_string(),
+            "0x4444444444444444444444444444444444444444".to_string(),
+            U128(10_000_000),
+        );
+    }
+
+    #[test]
+    fn test_storage_deposit_removed_on_terminal_resolution() {
+        let (_signing_key, tee_pk) = generate_tee_keypair();
+        let owner: AccountId = "owner.testnet".parse().unwrap();
+        let buyer: AccountId = "buyer.testnet".parse().unwrap();
+        let seller: AccountId = "seller.testnet".parse().unwrap();
+
+        testing_env!(get_context(owner.clone(), STORAGE_DEPOSIT).build());
+        let mut contract = ConpiEscrow::new(
+            owner.clone(),
+            Some("testnet".to_string()),
+            None,
+            Some((tee_pk.clone(), REAL_CVM_MEASUREMENT.to_string())),
+            None,
+        );
+
+        testing_env!(get_context(buyer.clone(), STORAGE_DEPOSIT).build());
+        let deal_id = contract.create_deal(CreateDealParams {
+            buyer: buyer.clone(),
+            seller: seller.clone(),
+            token: None,
+            price: U128(1_000_000_000_000_000_000_000_000),
+            credit_amount: U128(1_000),
+            buyer_collateral: U128(0),
+            seller_collateral: U128(0),
+            tee_pubkey: tee_pk.clone(),
+            deposit_duration_sec: 3600,
+            key_duration_sec: 3600,
+            tee_liveness_timeout_sec: 3600,
+            slash_bps_provider_ban: 5000,
+            slash_bps_revoke: 8000,
+            slash_bps_buyer_breach: 1000,
+        });
+
+        // deal_creators must contain buyer initially
+        assert_eq!(contract.deal_creators.get(&deal_id), Some(buyer.clone()));
+
+        // Cancel deal before funding
+        testing_env!(get_context(buyer.clone(), NearToken::from_yoctonear(0)).build());
+        contract.timeout_refund(deal_id);
+
+        // After cancellation, storage deposit has been refunded and entry removed
+        assert!(contract.deal_creators.get(&deal_id).is_none());
+    }
+
+    #[test]
+    fn test_set_foreign_seller_address_before_registration() {
+        let (_signing_key, tee_pk) = generate_tee_keypair();
+        let owner: AccountId = "owner.testnet".parse().unwrap();
+        let buyer: AccountId = "buyer.testnet".parse().unwrap();
+        let seller: AccountId = "seller.testnet".parse().unwrap();
+
+        testing_env!(get_context(owner.clone(), STORAGE_DEPOSIT).build());
+        let mut contract = ConpiEscrow::new(
+            owner.clone(),
+            Some("testnet".to_string()),
+            None,
+            Some((tee_pk.clone(), REAL_CVM_MEASUREMENT.to_string())),
+            None,
+        );
+
+        testing_env!(get_context(buyer.clone(), STORAGE_DEPOSIT).build());
+        let deal_id = contract.create_deal(CreateDealParams {
+            buyer: buyer.clone(),
+            seller: seller.clone(),
+            token: None,
+            price: U128(10_000_000_000_000_000_000_000),
+            credit_amount: U128(10_000),
+            buyer_collateral: U128(0),
+            seller_collateral: U128(0),
+            tee_pubkey: tee_pk.clone(),
+            deposit_duration_sec: 3600,
+            key_duration_sec: 3600,
+            tee_liveness_timeout_sec: 3600,
+            slash_bps_provider_ban: 5000,
+            slash_bps_revoke: 8000,
+            slash_bps_buyer_breach: 5000,
+        });
+
+        // 1. Seller sets foreign payout address BEFORE register_foreign_chain_deal has been called
+        testing_env!(get_context(seller.clone(), NearToken::from_yoctonear(0)).build());
+        let seller_evm = "0x01a4d97CE5419097dAB16817b59bBC1a2Af53404".to_string();
+        contract.set_foreign_seller_address(deal_id, seller_evm.clone());
+
+        let info = contract.get_foreign_deal(deal_id).expect("foreign deal initialized");
+        assert_eq!(info.seller_address, seller_evm);
+        assert_eq!(info.chain_id, 84532);
+
+        // 2. Later, when buyer/relayer registers foreign deal parameters, it must succeed without panic and preserve seller address
+        testing_env!(get_context(buyer.clone(), NearToken::from_yoctonear(0)).build());
+        contract.register_foreign_chain_deal(
+            deal_id,
+            84532,
+            "0x3be5DaDC60292F724D9f9a7203F833816077927F".to_string(),
+            "0x036CbD53842c5426634e7929541eC2318f3dCF7e".to_string(),
+            "0x0000000000000000000000000000000000000000".to_string(),
+            seller_evm.clone(),
+            U128(40_000), // $0.04 USDC
+        );
+
+        let updated_info = contract.get_foreign_deal(deal_id).unwrap();
+        assert_eq!(updated_info.vault_address, "0x3be5DaDC60292F724D9f9a7203F833816077927F");
+        assert_eq!(updated_info.seller_address, seller_evm);
+        assert_eq!(updated_info.foreign_amount, U128(40_000));
+    }
+
+    #[test]
+    fn test_cross_chain_seller_account_ids() {
+        use near_sdk::AccountId;
+
+        // 1. Solana 32-byte pubkey hex (64 lowercase hex chars)
+        let sol_hex = "bbd65d65de6e15e11d9f887423339a1cedc262ee4ea2581bfbfb39f5492e0273";
+        let sol_account = AccountId::try_from(sol_hex.to_string());
+        assert!(sol_account.is_ok(), "Solana 64-hex string must be a valid NEAR AccountId: {:?}", sol_account.err());
+
+        // 2. EVM padded 64 hex chars
+        let evm_hex = "00000000000000000000000001a4d97ce5419097dab16817b59bbc1a2af53404";
+        let evm_account = AccountId::try_from(evm_hex.to_string());
+        assert!(evm_account.is_ok(), "EVM 64-hex string must be a valid NEAR AccountId: {:?}", evm_account.err());
     }
 }
 
