@@ -27,8 +27,8 @@ export const CONFIG = {
 };
 
 export const MARKET_SNAPSHOT = {
-  openEscrow: 12480,
-  settled: 214,
+  openEscrow: 0,
+  settled: 0,
 };
 
 export const MEMBERS = [

@@ -16,7 +16,7 @@ export function ReceiptView({ id }: { id: string }) {
   const escrow = escrowOf(deal);
   const locked = (deal.buyerDeposited ? escrow.buyerDeposit : 0) + (deal.sellerDeposited ? escrow.sellerDeposit : 0) || escrow.total;
   const moves = deal.split ? cashMoves(deal.split) : 0;
-  const amount = (value: number) => deal.token === "NEAR" ? assetAmount(value, "NEAR") : usd(value);
+  const amount = (value: number) => usd(value);
   const payload = {
     deal: deal.id,
     buyer: deal.buyer,

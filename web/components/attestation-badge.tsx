@@ -6,8 +6,23 @@ import { ShieldCheck, ShieldAlert, Loader2 } from "lucide-react";
 import { verifyLiveAttestation, AttestationVerificationResult } from "@/lib/attestation-verifier";
 
 export function AttestationBadge({ showLink = true }: { showLink?: boolean }) {
-  const [result, setResult] = useState<AttestationVerificationResult | null>(null);
-  const [loading, setLoading] = useState(true);
+  const [result, setResult] = useState<AttestationVerificationResult | null>(() => {
+    if (typeof window !== "undefined") {
+      try {
+        const cached = sessionStorage.getItem("conpi:attestation_badge");
+        if (cached) return JSON.parse(cached);
+      } catch {}
+    }
+    return null;
+  });
+  const [loading, setLoading] = useState(() => {
+    if (typeof window !== "undefined") {
+      try {
+        return !sessionStorage.getItem("conpi:attestation_badge");
+      } catch {}
+    }
+    return true;
+  });
 
   useEffect(() => {
     let mounted = true;
@@ -16,6 +31,9 @@ export function AttestationBadge({ showLink = true }: { showLink?: boolean }) {
         if (mounted) {
           setResult(res);
           setLoading(false);
+          try {
+            sessionStorage.setItem("conpi:attestation_badge", JSON.stringify(res));
+          } catch {}
         }
       })
       .catch((err) => {

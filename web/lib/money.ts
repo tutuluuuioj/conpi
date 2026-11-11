@@ -43,7 +43,7 @@ export function settleRevoke(deal: Deal): Split {
   const e = escrowOf(deal);
   const meteredCreditUsd = deal.creditUsd ?? deal.credit;
   const fraction = meteredCreditUsd ? deal.usedUsd / meteredCreditUsd : 0;
-  const amount = (value: number) => deal.token === "NEAR" ? assetAmount(value, "NEAR") : usd(value);
+  const amount = (value: number) => usd(value);
   const sellerEarned = round2(fraction * deal.price);
   const already = round2(deal.releasedUsd);
   const priceOwed = round2(Math.max(0, sellerEarned - already));
@@ -83,7 +83,7 @@ export function cashMoves(split: Split) {
 
 export function outcomeCopy(deal: Deal) {
   const e = escrowOf(deal);
-  const amount = (value: number) => deal.token === "NEAR" ? assetAmount(value, "NEAR") : usd(value);
+  const amount = (value: number) => usd(value);
   const meteredCreditUsd = deal.creditUsd ?? deal.credit;
   const usedPct = meteredCreditUsd ? Math.round((deal.usedUsd / meteredCreditUsd) * 100) : 0;
   switch (deal.outcome) {

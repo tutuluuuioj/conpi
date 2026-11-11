@@ -20,7 +20,8 @@ export function ratioOf(price: number, credit: number) {
   return `${(price / credit).toFixed(2)}×`;
 }
 
-export function middle(value: string, lead = 6, tail = 4) {
+export function middle(value: string | null | undefined, lead = 6, tail = 4) {
+  if (!value || typeof value !== "string") return "";
   if (value.length <= lead + tail + 1) return value;
   return `${value.slice(0, lead)}…${value.slice(-tail)}`;
 }
@@ -44,9 +45,11 @@ export function clockTime(value: string) {
 
 export function absoluteTime(iso: string) {
   const date = new Date(iso);
-  return new Intl.DateTimeFormat(undefined, {
+  if (Number.isNaN(date.getTime())) return iso;
+  return new Intl.DateTimeFormat("en-US", {
     dateStyle: "medium",
     timeStyle: "short",
+    timeZone: "UTC",
   }).format(date);
 }
 

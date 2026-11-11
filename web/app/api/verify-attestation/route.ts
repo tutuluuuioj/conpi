@@ -5,10 +5,19 @@ import { BASE_URL, CONTRACT_ID } from "@/lib/chain";
 
 export const dynamic = "force-dynamic";
 
+let cachedVerification: { data: any; timestamp: number } | null = null;
+const CACHE_TTL_MS = 300_000; // 5 minutes
+
 export async function GET(req: NextRequest) {
   try {
     const searchParams = req.nextUrl.searchParams;
     const requestedNonce = searchParams.get("nonce");
+    const force = searchParams.get("force") === "true";
+
+    // Return cached verification if valid and no explicit nonce or force reload requested
+    if (!requestedNonce && !force && cachedVerification && Date.now() - cachedVerification.timestamp < CACHE_TTL_MS) {
+      return NextResponse.json(cachedVerification.data);
+    }
 
     // 1. Generate or use fresh 16-byte nonce
     const nonceHex = requestedNonce || crypto.randomBytes(16).toString("hex");
@@ -150,8 +159,9 @@ export async function GET(req: NextRequest) {
       try {
         const nearRpcUrls = Array.from(new Set([
           process.env.NEXT_PUBLIC_NEAR_RPC,
-          "https://test.rpc.fastnear.com",
+          "https://archival-rpc.testnet.near.org",
           "https://rpc.testnet.near.org",
+          "https://test.rpc.fastnear.com",
         ].filter((url): url is string => Boolean(url))));
         const argsBase64 = Buffer.from(JSON.stringify({ public_key: signerPublicKeyNear })).toString("base64");
         let signerData: any = null;
@@ -230,7 +240,7 @@ export async function GET(req: NextRequest) {
       checks.onChainMeasurementMatches &&
       errors.length === 0;
 
-    return NextResponse.json({
+    const result = {
       verified,
       inEnclave: data.inEnclave,
       signerPublicKeyNear,
@@ -244,7 +254,13 @@ export async function GET(req: NextRequest) {
       expectedReportDataHex,
       checks,
       errors,
-    });
+    };
+
+    if (!requestedNonce && verified) {
+      cachedVerification = { data: result, timestamp: Date.now() };
+    }
+
+    return NextResponse.json(result);
   } catch (err: any) {
     return NextResponse.json({ verified: false, error: err.message }, { status: 500 });
   }

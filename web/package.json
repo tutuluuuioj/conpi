@@ -17,15 +17,20 @@
     "@noble/ciphers": "^2.4.0",
     "@noble/curves": "^2.4.0",
     "@phala/dcap-qvl": "^0.7.1",
+    "@solana/spl-token": "^0.4.15",
+    "@solana/web3.js": "^1.99.0",
+    "buffer": "^6.0.3",
     "clsx": "^2.1.1",
     "lucide-react": "^0.460.0",
     "near-api-js": "^6.5.1",
     "next": "^14.2.18",
     "react": "^18.3.1",
     "react-dom": "^18.3.1",
-    "tailwind-merge": "^2.5.4"
+    "tailwind-merge": "^2.5.4",
+    "viem": "^2.57.16"
   },
   "devDependencies": {
+    "@types/bs58": "^4.0.4",
     "@types/node": "^22.9.0",
     "@types/react": "^18.3.12",
     "@types/react-dom": "^18.3.1",

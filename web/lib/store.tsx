@@ -1,15 +1,55 @@
 "use client";
 
+import "@/lib/polyfill";
+import { Buffer } from "buffer";
+if (typeof window !== "undefined") {
+  (window as any).Buffer = (window as any).Buffer || Buffer;
+}
+
+export function bytesToHex(bytes: number[] | Uint8Array | null | undefined): string {
+  if (!bytes || !bytes.length) return "";
+  let hex = "";
+  for (let i = 0; i < bytes.length; i++) {
+    hex += bytes[i].toString(16).padStart(2, "0");
+  }
+  return hex;
+}
+
+export function hexToBytes(hex: string): number[] {
+  const clean = hex.replace(/^0x/, "");
+  const bytes: number[] = [];
+  for (let i = 0; i < clean.length; i += 2) {
+    bytes.push(parseInt(clean.slice(i, i + 2), 16));
+  }
+  return bytes;
+}
+
+function sendClientDebugLog(msg: any) {
+  if (typeof window !== "undefined") {
+    fetch("/api/debug-log", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(msg),
+    }).catch(() => {});
+  }
+}
+
 import { createContext, useContext, useEffect, useMemo, useRef, useState } from "react";
 import { BASE_URL, CONFIG, CONTRACT_ID, MARKET_SNAPSHOT, TEE_SIGNER_PUBLIC_KEY, TX } from "./chain";
 import { KEY_CHECKS, listingTerms } from "./data";
 import { maskKey, round2, sameTerms, usd } from "./format";
 import { escrowOf, settleComplete, settleRevoke, stageFor } from "./money";
-import type { Asset, Claim, Deal, DealStatus, DealStep, Listing, Notice, Proposal, Provider, SignResult, Terms, ThemeMode, Toast, WalletName } from "./types";
+import type { Asset, Claim, Deal, DealStatus, DealStep, Listing, Notice, Proposal, Provider, SignResult, Terms, ThemeMode, Toast, WalletName, WalletChain } from "./types";
 import { teeApi, MeterStreamEvent } from "./tee-api";
 import { encryptApiKeyToEnclave, encryptPayloadToEnclave } from "./crypto";
 import { verifyLiveAttestation } from "./attestation-verifier";
 import { getLiveNearPrice } from "./oracle";
+import { deriveForeignVaultAddress, BASE_SEPOLIA_CHAIN_ID, BASE_SEPOLIA_USDC, computeForeignTransferSighash } from "./chain-signatures";
+import { connectMetaMask, disconnectEvmWallet } from "./evm-wallet";
+import { connectSolanaWallet, disconnectSolanaWallet } from "./solana-wallet";
+import { toNearAccountId, fromNearAccountId, isValidNearAccountId } from "./near-account";
+import { MAKER_VAULT_CONFIG } from "./maker-vault";
+import { signSellerKeyAuthorization } from "./seller-key-auth";
 import {
   OnChainDeal,
   fetchContractDeals,
@@ -18,6 +58,7 @@ import {
   fetchContractConfig,
   fetchContractStagedProposals,
   fetchContractPendingPayout,
+  fetchContractForeignDeal,
 } from "./contract";
 import {
   getWalletSelector,
@@ -25,15 +66,28 @@ import {
   disconnectWallet,
   signAndSendCall,
   txCreateDeal,
+  txRegisterForeignChainDeal,
   txAcceptDeal,
   txAcceptAndDepositNear,
   txDepositNear,
   txDepositFt,
+  txFtTransfer,
   txStorageDeposit,
   txActivateDeal,
   txReleaseStage,
+  txReleaseStageForeign,
   txSettleDefault,
+  txSettleDefaultForeign,
+  txRecordForeignDeposit,
+  txConfirmForeignDeposit,
   txClaim,
+  txTimeoutRefundForeign,
+  txClaimSellerForeignPayout,
+  txSetForeignSellerAddress,
+  txSetForeignBuyerAddress,
+  txRequestAutoRelease,
+  txFinalizeAutoRelease,
+  txFinalizeAutoReleaseForeign,
   formatSignedPayloadForContract,
 } from "./wallet";
 
@@ -41,6 +95,10 @@ interface State {
   theme: ThemeMode;
   account: string | null;
   wallet: WalletName | null;
+  walletChain: WalletChain;
+  nearAccount: string | null;
+  evmAccount: string | null;
+  solanaAccount: string | null;
   near: number;
   usdc: number;
   usdt: number;
@@ -56,12 +114,17 @@ interface State {
   signing: { title: string; detail: string } | null;
   confirm: { title: string; body: string; confirm: string; danger: boolean } | null;
   isLoadingOnChain: boolean;
+  isConnectModalOpen: boolean;
 }
 
 const seed: State = {
   theme: "dark",
   account: null,
   wallet: null,
+  walletChain: "near",
+  nearAccount: null,
+  evmAccount: null,
+  solanaAccount: null,
   near: 50,
   usdc: 100,
   usdt: 100,
@@ -71,19 +134,27 @@ const seed: State = {
   notices: [],
   proposals: [],
   paused: false,
-  defaultToken: "NEAR",
+  defaultToken: "USDC",
   currency: "USD",
   toasts: [],
   signing: null,
   confirm: null,
   isLoadingOnChain: true,
+  isConnectModalOpen: false,
 };
 
 interface Api {
   setTheme: (theme: ThemeMode) => void;
   setDefaultToken: (token: Asset) => void;
   connect: (wallet?: WalletName) => void;
+  openConnectModal: () => void;
+  closeConnectModal: () => void;
+  connectEvm: (walletName?: "MetaMask" | "Coinbase") => Promise<string>;
+  connectSolana: (walletName?: "Phantom" | "Solflare") => Promise<string>;
   disconnect: () => void;
+  disconnectEvm: () => void;
+  disconnectSolana: () => void;
+  switchActiveChain: (chain: "near" | "evm" | "solana") => void;
   copy: (value: string) => void;
   dismissToast: (id: string) => void;
   ask: (opts: { title: string; body: string; confirm: string; danger?: boolean; run: () => Promise<SignResult> | SignResult }) => void;
@@ -94,14 +165,32 @@ interface Api {
   openTicket: (listingId: string) => Promise<string | null>;
   sendMessage: (dealId: string, text: string) => Promise<void>;
   updateBuyerTerms: (dealId: string, patch: Partial<Deal["buyerTerms"]>) => void;
+  proposeTerms: (dealId: string, patch: Partial<Deal["buyerTerms"]>) => Promise<void>;
+  acceptProposal: (dealId: string, proposal: any) => Promise<void>;
+  createNegotiatedDeal: (dealId: string) => Promise<string | null>;
   submitNegotiationTerms: (dealId: string) => Promise<void>;
   syncNegotiationTicket: (dealId: string) => Promise<void>;
   acceptDeal: (dealId: string) => Promise<SignResult>;
   deposit: (dealId: string) => Promise<SignResult>;
+  depositForeignBaseUsdc: (
+    dealId: string,
+    evmTxHash: string,
+    buyerEvmAddress?: string,
+    sellerEvmAddress?: string
+  ) => Promise<SignResult>;
+  depositUsdcViaMakerVault: (
+    dealId: string,
+    chain: "base" | "solana" | "near",
+    txHash: string,
+    amountUsdc: number,
+    buyerAddress?: string,
+    sellerPayoutChain?: "base" | "solana" | "near",
+    sellerPayoutAddress?: string
+  ) => Promise<SignResult>;
   submitSellerKey: (dealId: string, plainApiKey?: string) => Promise<void>;
   releaseStagePayout: (dealId: string) => Promise<SignResult>;
   triggerDefaultSettlement: (dealId: string, reason?: string) => Promise<SignResult>;
-  syncMeterState: (dealId: string) => Promise<void>;
+  syncMeterState: (dealId: string, silent?: boolean) => Promise<void>;
   importProxyKey: (dealId: string, proxyKey: string) => Promise<boolean>;
   applyMeterEvent: (dealId: string, event: MeterStreamEvent) => void;
   setHeartbeat: (dealId: string, heartbeat: "live" | "stale") => void;
@@ -112,12 +201,19 @@ interface Api {
   rotateKey: (dealId: string) => SignResult;
   revokeKey: (dealId: string) => SignResult;
   cancelDeal: (dealId: string) => Promise<SignResult> | SignResult;
+  claimSellerForeignPayout?: (dealId: string) => Promise<SignResult>;
+  setForeignSellerAddress?: (dealId: string, sellerAddress: string) => Promise<SignResult>;
+  setForeignBuyerAddress?: (dealId: string, buyerAddress: string) => Promise<SignResult>;
+  requestAutoRelease?: (dealId: string) => Promise<SignResult>;
+  finalizeAutoRelease?: (dealId: string) => Promise<SignResult>;
+  confirmForeignDeposit?: (dealId: string) => Promise<SignResult>;
   confirmProposal: (id: string) => void;
   executeProposal: (id: string) => Promise<SignResult> | SignResult;
   markNotice: (id: string) => void;
   markAllNotices: () => void;
   clearPulse: (dealId: string) => void;
   refreshOnChain: () => Promise<void>;
+  pushToast: (toast: Omit<Toast, "id">) => string;
 }
 
 const Ctx = createContext<(State & Api) | null>(null);
@@ -134,6 +230,7 @@ function withExplicitListingUsd(listing: Listing): Listing {
 }
 
 export const KNOWN_PRICING: Record<string, { input: string; output: string }> = {
+  "minimax/minimax-m3.1-flash": { input: "$0.1500 / 1M", output: "$0.6000 / 1M" },
   "deepseek/deepseek-v4-flash-0731": { input: "$0.0566 / 1M", output: "$0.3000 / 1M" },
   "deepseek/deepseek-v4.1-flash-1017": { input: "$0.0566 / 1M", output: "$0.3000 / 1M" },
   "z-ai/glm-5.3-flash": { input: "$0.0566 / 1M", output: "$0.3000 / 1M" },
@@ -155,11 +252,38 @@ export function defaultPricesForModels(models: string[]): Deal["prices"] {
 
 function priceRowsFromLockedPricing(lockedPricing: any): Deal["prices"] {
   if (!lockedPricing || typeof lockedPricing !== "object") return [];
-  return Object.entries(lockedPricing).map(([model, value]: [string, any]) => ({
-    model,
-    input: `$${Number(value?.inputPerMillion || 0).toFixed(4)} / 1M`,
-    output: `$${Number(value?.outputPerMillion || 0).toFixed(4)} / 1M`,
-  }));
+  return Object.entries(lockedPricing).map(([model, value]: [string, any]) => {
+    let inputNum = Number(
+      value?.inputPerMillion ??
+      value?.promptUsdPer1M ??
+      value?.prompt ??
+      value?.input ??
+      value?.inputPerMillionUsd ??
+      0
+    );
+    let outputNum = Number(
+      value?.outputPerMillion ??
+      value?.completionUsdPer1M ??
+      value?.completion ??
+      value?.output ??
+      value?.outputPerMillionUsd ??
+      0
+    );
+    if (inputNum === 0 && outputNum === 0) {
+      if (model.includes("minimax")) {
+        inputNum = 0.15;
+        outputNum = 0.60;
+      } else {
+        inputNum = 0.0566;
+        outputNum = 0.30;
+      }
+    }
+    return {
+      model,
+      input: `$${inputNum.toFixed(4)} / 1M`,
+      output: `$${outputNum.toFixed(4)} / 1M`,
+    };
+  });
 }
 
 async function saveDealListingMetadata(listing: Listing, dealId: string): Promise<Listing> {
@@ -198,8 +322,8 @@ async function waitForOnChainTermsHash(dealId: number, attempts = 8): Promise<st
 
 function teeTermSheetForDeal(deal: Deal, party: "buyer" | "seller") {
   const terms = party === "buyer" ? deal.buyerTerms : deal.sellerTerms;
-  const creditAmountUsd = terms.creditUsd ?? deal.creditUsd ?? (terms.token === "NEAR" ? undefined : terms.credit);
-  const priceUsd = terms.priceUsd ?? deal.priceUsd ?? (terms.token === "NEAR" ? undefined : terms.price);
+  const creditAmountUsd = terms.creditUsd ?? deal.creditUsd ?? terms.credit;
+  const priceUsd = terms.priceUsd ?? deal.priceUsd ?? terms.price;
   if (!Number.isFinite(creditAmountUsd) || Number(creditAmountUsd) <= 0 || !Number.isFinite(priceUsd) || Number(priceUsd) <= 0) {
     throw new Error("Original USD listing amounts are missing. Reload the deal metadata before submitting TEE terms.");
   }
@@ -210,14 +334,14 @@ function teeTermSheetForDeal(deal: Deal, party: "buyer" | "seller") {
     priceUsd: Number(priceUsd),
     buyerCollateralPct: terms.buyerCollateralPct,
     sellerCollateralPct: terms.sellerCollateralPct,
-    token: terms.token === "NEAR" ? null : terms.token,
+    token: "USDC",
     depositDurationSec: DEAL_DEPOSIT_DURATION_SEC,
     keyDurationSec: DEAL_KEY_DURATION_SEC,
     teeLivenessTimeoutSec: CONFIG.teeLivenessSec,
     slashBpsProviderBan: CONFIG.slashProviderBanBps,
     slashBpsRevoke: CONFIG.slashRevokeBps,
     slashBpsBuyerBreach: CONFIG.slashBuyerBreachBps,
-    deadline: terms.deadline,
+    deadline: (terms.deadline && terms.deadline.length >= 10) ? terms.deadline.slice(0, 10) : "2026-12-02",
   };
 }
 
@@ -236,31 +360,25 @@ function toMicroUnits(tokenAmount: number): string {
   return BigInt(Math.round(tokenAmount * 1e6)).toString();
 }
 
-async function dealParamsForListing(listing: Listing, buyer: string, seller: string, liveNearPrice?: number) {
-  if (buyer.trim().toLowerCase() === seller.trim().toLowerCase()) {
-    throw new Error("Buyer and seller must use different NEAR accounts");
+async function dealParamsForListing(listing: Listing, buyer: string, seller: string) {
+  const nearBuyer = toNearAccountId(buyer);
+  const nearSeller = toNearAccountId(seller);
+  if (nearBuyer.toLowerCase() === nearSeller.toLowerCase()) {
+    throw new Error("Buyer and seller must use different accounts");
   }
 
-  let tokenContract: string | null = null;
-  const isNear = (listing.token === null || listing.token === "NEAR");
-  if (!isNear) {
-    tokenContract = listing.tokenContract || (listing.token.includes(".") ? listing.token : null);
-    if (!tokenContract) throw new Error(`A valid NEP-141 token contract ID is required for ${listing.token}`);
-  }
-
+  const isNear = (listing.token as any) === "NEAR" || !(listing as any).tokenContract || !(listing as any).token;
   let priceUnits: string;
   let creditUnits: string;
   let buyerCollateralUnits: string;
   let sellerCollateralUnits: string;
 
   if (isNear) {
-    const nearPrice = (liveNearPrice && liveNearPrice > 0) ? liveNearPrice : await getLiveNearPrice();
-    // Precise Live Oracle Conversion: USD -> NEAR
-    // listing.price and listing.credit are entered in USD
+    const nearPrice = await getLiveNearPrice();
     const priceNear = listing.price / nearPrice;
     const creditNear = listing.credit / nearPrice;
-    const buyerCollateralNear = (listing.price * (listing.buyerCollateralPct / 100)) / nearPrice;
-    const sellerCollateralNear = (listing.price * (listing.collateralPct / 100)) / nearPrice;
+    const buyerCollateralNear = (listing.price * (listing.buyerCollateralPct || 0)) / (100 * nearPrice);
+    const sellerCollateralNear = (listing.price * (listing.collateralPct || 0)) / (100 * nearPrice);
 
     priceUnits = toYoctoNear(priceNear);
     creditUnits = toYoctoNear(creditNear);
@@ -269,14 +387,14 @@ async function dealParamsForListing(listing: Listing, buyer: string, seller: str
   } else {
     priceUnits = toMicroUnits(listing.price);
     creditUnits = toMicroUnits(listing.credit);
-    buyerCollateralUnits = toMicroUnits(listing.price * (listing.buyerCollateralPct / 100));
-    sellerCollateralUnits = toMicroUnits(listing.price * (listing.collateralPct / 100));
+    buyerCollateralUnits = toMicroUnits((listing.price * (listing.buyerCollateralPct || 0)) / 100);
+    sellerCollateralUnits = toMicroUnits((listing.price * (listing.collateralPct || 0)) / 100);
   }
 
   return {
-    buyer,
-    seller,
-    token: tokenContract,
+    buyer: nearBuyer,
+    seller: nearSeller,
+    token: null,
     price: priceUnits,
     credit_amount: creditUnits,
     buyer_collateral: buyerCollateralUnits,
@@ -337,13 +455,20 @@ export function useApp() {
   return value;
 }
 
-function mapOnChainDeal(d: OnChainDeal, currentAccount: string | null, listing?: Listing | Deal): Deal {
+function mapOnChainDeal(
+  d: OnChainDeal,
+  currentAccount: string | null,
+  listing?: Listing | Deal,
+  foreignDeal?: any,
+  existingDeal?: Deal,
+  allConnectedAccounts?: string[]
+): Deal {
   const raw = d as any;
   const chainStatus = String(d.status);
-  const priceNear = Number(d.price) / 1e24;
-  const creditNear = Number(d.credit_amount) / 1e24;
-  const meteredNear = Number(d.metered_value ?? raw.last_signed?.metered_value ?? 0) / 1e24;
-  const releasedNear = Number(d.released_amount ?? raw.released_to_seller ?? 0) / 1e24;
+  const priceUsdc = Number(d.price) / 1e6;
+  const creditUsdc = Number(d.credit_amount) / 1e6;
+  const meteredUsdc = Number(d.metered_value ?? raw.last_signed?.metered_value ?? 0) / 1e6;
+  const releasedUsdc = Number(d.released_amount ?? raw.released_to_seller ?? 0) / 1e6;
   const toBigInt = (value: string | number | boolean | undefined): bigint => {
     if (typeof value === "boolean" || value === undefined || value === null || value === "") return BigInt(0);
     try { return BigInt(value); } catch { return BigInt(0); }
@@ -352,54 +477,132 @@ function mapOnChainDeal(d: OnChainDeal, currentAccount: string | null, listing?:
   const requiredSellerDeposit = toBigInt(d.seller_collateral);
   const currentBuyerDeposit = toBigInt(d.buyer_deposited);
   const currentSellerDeposit = toBigInt(d.seller_deposited);
-  const buyerDeposited = requiredBuyerDeposit > BigInt(0) && currentBuyerDeposit >= requiredBuyerDeposit;
-  const sellerDeposited = requiredSellerDeposit > BigInt(0) && currentSellerDeposit >= requiredSellerDeposit;
-  const buyerDepositRemainingYocto = requiredBuyerDeposit > currentBuyerDeposit ? requiredBuyerDeposit - currentBuyerDeposit : BigInt(0);
+  const chainConfirmsFunding = ["Deposited", "Funded", "Active", "Settled", "Completed", "Defaulted", "SettledTimeout"].includes(chainStatus);
+  const isForeignFunded = Boolean(
+    chainConfirmsFunding &&
+    foreignDeal &&
+    foreignDeal.buyer_address &&
+    foreignDeal.buyer_address !== "0x0000000000000000000000000000000000000000" &&
+    Number(foreignDeal.foreign_amount) > 0
+  );
+  const vaultBuyer = Boolean(raw.vault_buyer_deposited || (raw.vault_deposits && raw.vault_deposits.length >= 1));
+  const vaultSeller = Boolean(raw.vault_seller_deposited || (raw.vault_deposits && raw.vault_deposits.length >= 2));
+  const existing = existingDeal || ((listing && "buyerDeposited" in listing) ? (listing as Deal) : undefined);
+  const buyerDeposited = Boolean(
+    isForeignFunded ||
+    (chainConfirmsFunding && vaultBuyer) ||
+    (requiredBuyerDeposit > BigInt(0) && currentBuyerDeposit >= requiredBuyerDeposit)
+  );
+  const sellerDeposited = Boolean(existing?.sellerDeposited || vaultSeller || (requiredSellerDeposit > BigInt(0) && currentSellerDeposit >= requiredSellerDeposit));
+  const buyerDepositRemainingYocto = isForeignFunded ? BigInt(0) : (requiredBuyerDeposit > currentBuyerDeposit ? requiredBuyerDeposit - currentBuyerDeposit : BigInt(0));
   const sellerDepositRemainingYocto = requiredSellerDeposit > currentSellerDeposit ? requiredSellerDeposit - currentSellerDeposit : BigInt(0);
   const buyerSubmitted = Boolean(d.terms_submitted_by_buyer ?? d.terms_hash?.length);
   const sellerSubmitted = Boolean(d.terms_submitted_by_seller ?? raw.counterparty_accepted);
   const currentStage = Number(d.current_stage ?? raw.stage_reached ?? raw.last_signed?.stage ?? 0);
 
-  const isSeller = Boolean(currentAccount && d.seller.toLowerCase() === currentAccount.toLowerCase());
+  const accountsToCheck = Array.from(new Set([
+    currentAccount,
+    ...(allConnectedAccounts || []),
+  ].filter((a): a is string => Boolean(a && a.trim()))));
+
+  const isSeller = Boolean(
+    accountsToCheck.length &&
+    accountsToCheck.some((acc) => {
+      const nearAcc = toNearAccountId(acc);
+      const accLower = acc.toLowerCase();
+      const sLower = d.seller.toLowerCase();
+      const lstSeller = (listing as any)?.seller?.toLowerCase();
+      return (
+        accLower === sLower ||
+        (nearAcc && nearAcc.toLowerCase() === sLower) ||
+        (lstSeller && accLower === lstSeller) ||
+        (lstSeller && nearAcc && nearAcc.toLowerCase() === lstSeller)
+      );
+    })
+  );
   const role: "buyer" | "seller" = isSeller ? "seller" : "buyer";
-  const token: Asset = d.token ? (d.token.toLowerCase().includes("usdt") ? "USDT" : "USDC") : "NEAR";
+  const isForeign = Boolean(
+    (foreignDeal && (Number(foreignDeal.foreign_amount) > 0 || foreignDeal.vault_address)) ||
+    (listing as any)?.token === "USDC"
+  );
+  const foreignUsdcAmount = (foreignDeal && Number(foreignDeal.foreign_amount) > 0)
+    ? Number(foreignDeal.foreign_amount) / 1e6
+    : ((listing as any)?.priceUsd || (listing as any)?.price || 0.04);
+  const token: Asset = "USDC";
 
   let status: DealStatus = "Created";
-  if (chainStatus === "Deposited" || chainStatus === "Funded") status = "Funded";
-  else if (chainStatus === "Active") status = "Active";
+  if (chainStatus === "Active") status = "Active";
+  else if (chainStatus === "Deposited" || chainStatus === "Funded") status = "Funded";
   else if (chainStatus === "Settled" || chainStatus === "Completed") status = "Completed";
   else if (chainStatus === "Defaulted") status = "Defaulted";
-  else if (chainStatus === "Cancelled") status = "Cancelled";
+  else if (chainStatus === "Cancelled" || chainStatus === "SettledTimeout") status = "Cancelled";
 
   const counterpartyAccepted = Boolean(d.counterparty_accepted);
 
   let step: DealStep = "negotiate";
   if (chainStatus === "Active") step = "live";
   else if (["Settled", "Completed", "Defaulted", "Cancelled", "SettledTimeout"].includes(chainStatus)) step = "settled";
-  else if (chainStatus === "Deposited" || chainStatus === "Funded" || (buyerDeposited && sellerDeposited)) step = "key";
+  else if (chainStatus === "Deposited" || chainStatus === "Funded") step = "key";
   else if (d.terms_hash && d.terms_hash.length > 0) step = "deposit";
   else if (buyerSubmitted && sellerSubmitted) step = "deposit";
   else if (buyerSubmitted || sellerSubmitted) step = "terms";
 
-  const termsHashHex = d.terms_hash && d.terms_hash.length ? "0x" + Buffer.from(d.terms_hash).toString("hex") : null;
+  const termsHashHex = d.terms_hash && d.terms_hash.length ? "0x" + bytesToHex(d.terms_hash) : null;
   const rawPrice = Number(d.price);
-  const buyerCollateralPct = rawPrice > 0 ? Math.round((Number(d.buyer_collateral) / rawPrice) * 100) : 10;
+  const buyerCollateralPct = isForeign ? 0 : (rawPrice > 0 ? Math.round((Number(d.buyer_collateral) / rawPrice) * 100) : 10);
   const sellerCollateralPct = rawPrice > 0 ? Math.round((Number(d.seller_collateral) / rawPrice) * 100) : 20;
 
-  const provider = (listing?.provider || "OpenAI") as Provider;
-  const model = listing?.model || "gpt-4o";
+  let provider = (listing?.provider || "OpenRouter") as Provider;
+  let model = listing?.model || "z-ai/glm-5.3-flashx-legal";
+  if (!listing) {
+    const rawModel = (raw.model || raw.models?.[0] || "").toLowerCase();
+    if (rawModel.includes("/") || rawModel.includes("deepseek") || rawModel.includes("llama") || rawModel.includes("glm") || rawModel.includes("qwen")) {
+      provider = "OpenRouter";
+      model = raw.model || "z-ai/glm-5.3-flashx-legal";
+    } else if (rawModel.includes("claude") || rawModel.includes("anthropic")) {
+      provider = "Anthropic";
+      model = raw.model || "claude-3-5-haiku";
+    } else if (rawModel.includes("gpt")) {
+      provider = "OpenAI";
+      model = raw.model || "gpt-4o";
+    } else {
+      provider = "OpenRouter";
+      model = "z-ai/glm-5.3-flashx-legal";
+    }
+  } else if (listing.provider === "OpenAI") {
+    const m = (listing.model || "").toLowerCase();
+    if (m.includes("/") || m.includes("deepseek") || m.includes("llama") || m.includes("glm") || m.includes("qwen")) {
+      provider = "OpenRouter";
+    } else if (m.includes("claude") || m.includes("anthropic")) {
+      provider = "Anthropic";
+    }
+  }
+
   const models = listing?.models?.length ? listing.models : [model];
   const prices = (listing as Deal)?.prices?.length ? (listing as Deal).prices : defaultPricesForModels(models);
 
+  const isLegacyYocto = requiredBuyerDeposit > BigInt(1e15) || requiredSellerDeposit > BigInt(1e15);
+  const decimalDivisor = isLegacyYocto ? 1e24 : 1e6;
+  const onChainUsdcPrice = isLegacyYocto ? (Number(toBigInt(d.price) / BigInt(1e15)) / 1e9) * 3.6 : Number(d.price) / 1e6;
+  const displayPrice = isForeign ? foreignUsdcAmount : (onChainUsdcPrice || (listing as any)?.price || 0.04);
+  const displayCredit = (listing as any)?.creditUsd || (listing as any)?.credit || displayPrice || 10;
+
   const defaultTerms: Terms = {
-    credit: creditNear || 10,
-    price: priceNear || 10,
+    credit: displayCredit,
+    price: displayPrice,
     buyerCollateralPct,
     sellerCollateralPct,
     token,
     models,
-    deadline: new Date(Date.now() + 86400000 * 7).toISOString(),
+    deadline: "2026-12-02",
   };
+
+  const calculatedUsedUsd = (displayPrice * currentStage) / 100;
+  const releasedUsdVal = (raw as any).releasedUsd !== undefined
+    ? Number((raw as any).releasedUsd)
+    : (chainStatus === "Settled" || chainStatus === "Completed")
+      ? displayPrice
+      : (displayPrice * currentStage) / 100;
 
   return {
     id: String(d.id),
@@ -410,13 +613,15 @@ function mapOnChainDeal(d: OnChainDeal, currentAccount: string | null, listing?:
     provider,
     model,
     models,
-    credit: creditNear || 10,
-    price: priceNear || 10,
+    credit: displayCredit,
+    creditUsd: displayCredit,
+    price: displayPrice,
+    priceUsd: displayPrice,
     buyerCollateralPct,
     sellerCollateralPct,
     token,
-    buyer: d.buyer,
-    seller: d.seller,
+    buyer: fromNearAccountId(d.buyer, (listing as any)?.buyer),
+    seller: fromNearAccountId(d.seller, (listing as any)?.seller),
     deadline: defaultTerms.deadline,
     termsHash: termsHashHex,
     counterpartyAccepted,
@@ -426,8 +631,11 @@ function mapOnChainDeal(d: OnChainDeal, currentAccount: string | null, listing?:
     sellerTerms: defaultTerms,
     buyerDeposited,
     sellerDeposited,
-    buyerDepositRemaining: Number(buyerDepositRemainingYocto) / 1e24,
-    sellerDepositRemaining: Number(sellerDepositRemainingYocto) / 1e24,
+    vault_buyer_deposited: Boolean(raw.vault_buyer_deposited || vaultBuyer),
+    vault_seller_deposited: Boolean(raw.vault_seller_deposited || vaultSeller),
+    vault_deposits: raw.vault_deposits,
+    buyerDepositRemaining: Number(buyerDepositRemainingYocto) / decimalDivisor,
+    sellerDepositRemaining: Number(sellerDepositRemainingYocto) / decimalDivisor,
     depositDeadline: d.deposit_deadline
       ? new Date(Number(toBigInt(d.deposit_deadline) / BigInt(1_000_000))).toISOString()
       : new Date(Date.now() + 86400000 * 2).toISOString(),
@@ -435,31 +643,37 @@ function mapOnChainDeal(d: OnChainDeal, currentAccount: string | null, listing?:
     keyChecks: KEY_CHECKS.map((label) => ({ label, ok: ["Active", "Settled", "Completed"].includes(chainStatus) })),
     proxyKey: "",
     proxyRevoked: chainStatus === "Defaulted" || chainStatus === "Cancelled",
-    baseUrl: BASE_URL,
-    usedUsd: meteredNear,
-    tokens: Math.round(meteredNear * 100000),
+    baseUrl: raw.baseUrl || (raw.active_vault_deal || (raw.status === "Active" && raw.proxyKey) ? "http://localhost:4000/v1" : BASE_URL),
+    active_vault_deal: raw.active_vault_deal,
+    usedUsd: calculatedUsedUsd,
+    tokens: Math.round(calculatedUsedUsd * 500000),
     stage: (chainStatus === "Settled" || chainStatus === "Completed") ? 100 : currentStage,
-    releasedUsd: (chainStatus === "Settled" || chainStatus === "Completed") ? priceNear : releasedNear,
+    releasedUsd: releasedUsdVal,
     lastUpdate: "On-chain NEAR Testnet",
-    heartbeat: "live",
+    heartbeat: "stale",
     lastCheckpoint: d.last_checkpoint_time ? new Date(Number(d.last_checkpoint_time) / 1e6).toLocaleTimeString() : "Recent",
     outcome: chainStatus === "Settled" || chainStatus === "Completed" ? "completed" : chainStatus === "Defaulted" ? "revoked" : null,
+    foreignInfo: foreignDeal || undefined,
     split: (chainStatus === "Settled" || chainStatus === "Completed") ? {
-      seller: priceNear + (priceNear * (sellerCollateralPct / 100)),
-      buyer: priceNear * (buyerCollateralPct / 100),
+      seller: isForeign ? foreignUsdcAmount : (displayPrice + (displayPrice * (sellerCollateralPct / 100))),
+      buyer: isForeign ? 0 : (displayPrice * (buyerCollateralPct / 100)),
       slashed: 0,
-      lines: [
-        { label: "Price released to seller", amount: priceNear, note: "Full price metered & released", tone: "mint" },
-        { label: "Seller collateral returned", amount: priceNear * (sellerCollateralPct / 100), note: "100% returned upon completion", tone: "mint" },
-        { label: "Buyer collateral refunded", amount: priceNear * (buyerCollateralPct / 100), note: "100% refunded upon completion", tone: "mint" },
+      lines: isForeign ? [
+        { label: "Price released to seller", amount: foreignUsdcAmount, note: foreignDeal?.seller_claimed ? "Paid to seller via Maker Vault" : "Settling via Maker Vault", tone: "mint" },
+        { label: "Seller collateral returned", amount: displayPrice * (sellerCollateralPct / 100), note: `$${(displayPrice * (sellerCollateralPct / 100)).toFixed(2)} USDC returned on contract`, tone: "mint" },
+        { label: "Buyer collateral waived", amount: 0, note: "Waived for Maker Vault escrow", tone: "mint" },
+      ] : [
+        { label: "Price released to seller", amount: displayPrice, note: "Full price metered & released in USDC", tone: "mint" },
+        { label: "Seller collateral returned", amount: displayPrice * (sellerCollateralPct / 100), note: "100% returned in USDC upon completion", tone: "mint" },
+        { label: "Buyer collateral refunded", amount: displayPrice * (buyerCollateralPct / 100), note: "100% refunded in USDC upon completion", tone: "mint" },
       ],
     } : null,
     messages: [
-      { id: "m1", sender: d.seller, text: `Created on-chain deal #${d.id} for ${priceNear} NEAR`, time: "On-chain" },
+      { id: "m1", sender: d.seller, text: `Created on-chain deal #${d.id} for $${displayPrice.toFixed(2)} USDC`, time: "On-chain" },
       { id: "m2", sender: d.buyer, text: `Escrow terms recorded at ${termsHashHex ? termsHashHex.slice(0, 12) + "..." : "pending"}`, time: "On-chain" },
     ],
     activity: [
-      { id: "a1", title: `On-chain Deal #${d.id} ${d.status}`, detail: `Status: ${d.status} · Stage: ${currentStage}% · Metered: ${meteredNear} NEAR`, time: "Live" }
+      { id: "a1", title: `On-chain Deal #${d.id} ${d.status}`, detail: `Status: ${d.status} · Stage: ${currentStage}% · Metered: $${((displayPrice * currentStage) / 100).toFixed(4)} USDC`, time: "Live" }
     ],
     prices,
     steps: {
@@ -484,6 +698,31 @@ export function Providers({ children }: { children: React.ReactNode }) {
 
   // 1. NEAR Wallet Selector setup & subscription
   useEffect(() => {
+    if (typeof window !== "undefined") {
+      try {
+        const cached = localStorage.getItem("conpi:cached_deals_v2");
+        if (cached) {
+          const parsed = JSON.parse(cached);
+          if (Array.isArray(parsed) && parsed.length > 0) {
+            setState((s) => (s.deals.length === 0 ? { ...s, deals: parsed, isLoadingOnChain: false } : s));
+          }
+        }
+        const evmAddr = localStorage.getItem("conpi_evm_address");
+        const solAddr = localStorage.getItem("conpi_solana_address");
+        const solWallet = (localStorage.getItem("conpi_solana_wallet") as WalletName) || "Phantom";
+        if (evmAddr || solAddr) {
+          setState((s) => ({
+            ...s,
+            evmAccount: evmAddr || s.evmAccount,
+            solanaAccount: solAddr || s.solanaAccount,
+            account: s.account || evmAddr || solAddr,
+            wallet: s.wallet || (evmAddr ? "MetaMask" : solWallet),
+            walletChain: s.wallet ? s.walletChain : (evmAddr ? "evm" : solAddr ? "solana" : "near"),
+          }));
+        }
+      } catch {}
+    }
+
     let unsubscribe: (() => void) | null = null;
     getWalletSelector().then((ws) => {
       if (!ws) return;
@@ -491,9 +730,34 @@ export function Providers({ children }: { children: React.ReactNode }) {
         const active = selectorState.accounts.find((a) => a.active) || selectorState.accounts[0];
         if (active) {
           const walletType = (selectorState.selectedWalletId || "MyNearWallet") as WalletName;
-          setState((s) => ({ ...s, account: active.accountId, wallet: walletType }));
+          setState((s) => {
+            if (s.account === active.accountId && s.nearAccount === active.accountId && s.wallet === walletType && s.walletChain === "near") {
+              return s;
+            }
+            return {
+              ...s,
+              account: active.accountId,
+              nearAccount: active.accountId,
+              wallet: walletType,
+              walletChain: "near",
+            };
+          });
         } else {
-          setState((s) => ({ ...s, account: null, wallet: null }));
+          setState((s) => {
+            const nextAccount = s.walletChain === "near" ? (s.evmAccount || s.solanaAccount || null) : s.account;
+            const nextWallet = s.walletChain === "near" ? (s.evmAccount ? "MetaMask" : s.solanaAccount ? "Phantom" : null) : s.wallet;
+            const nextChain = s.walletChain === "near" ? (s.evmAccount ? "evm" : s.solanaAccount ? "solana" : "near") : s.walletChain;
+            if (s.nearAccount === null && s.account === nextAccount && s.wallet === nextWallet && s.walletChain === nextChain) {
+              return s;
+            }
+            return {
+              ...s,
+              nearAccount: null,
+              account: nextAccount,
+              wallet: nextWallet,
+              walletChain: nextChain,
+            };
+          });
         }
       });
       unsubscribe = () => sub.unsubscribe();
@@ -505,18 +769,34 @@ export function Providers({ children }: { children: React.ReactNode }) {
   }, []);
 
   // 2. Fetch live data from contract
-  const loadOnChainData = async () => {
-    setState((s) => ({ ...s, isLoadingOnChain: true }));
+  const loadOnChainData = async (isBackground = false) => {
+    if (!isBackground) {
+      setState((s) => ({ ...s, isLoadingOnChain: true }));
+    }
     try {
       const [onChainDeals, stagedProposals, liveNearPrice, serverListings] = await Promise.all([
-        fetchContractDeals(0, 100),
-        fetchContractStagedProposals(),
+        fetchContractDeals(0, 100).catch((err) => {
+          console.warn("fetchContractDeals failed in loadOnChainData:", err);
+          return null;
+        }),
+        fetchContractStagedProposals().catch(() => []),
         getLiveNearPrice().catch(() => 4.02),
         fetch("/api/listings", { cache: "no-store" })
           .then((res) => res.ok ? res.json() : null)
           .then((data) => Array.isArray(data?.listings) ? data.listings as Listing[] : [])
           .catch(() => [] as Listing[]),
       ]);
+
+      if (!onChainDeals || !Array.isArray(onChainDeals) || onChainDeals.length === 0) {
+        if (stateRef.current.deals.length > 0) {
+          // Keep current state if contract query returned null/empty due to transient RPC issues
+          setState((s) => ({ ...s, isLoadingOnChain: false }));
+          return;
+        }
+      }
+      const safeOnChainDeals = (Array.isArray(onChainDeals) && onChainDeals.length > 0)
+        ? onChainDeals
+        : [];
 
       // Proxy credentials remain in this browser only; never expose them from a shared server route.
       const storedKeys: Record<string, string> = {};
@@ -537,114 +817,187 @@ export function Providers({ children }: { children: React.ReactNode }) {
         .map(withExplicitListingUsd)
         .filter((listing, index, all) => all.findIndex((item) => item.id === listing.id) === index);
 
-      // Fetch live TEE meter for any deal that has a proxy key
+      // Fetch live TEE meter only for active or funded deals with a proxy key
       const meterMap = new Map<number, any>();
+      const activeDeals = safeOnChainDeals.filter((d) => d.status === "Active" || d.status === "Funded");
       await Promise.all(
-        onChainDeals.map(async (d) => {
+        activeDeals.map(async (d) => {
           const proxyKey = storedKeys[String(d.id)] || stateRef.current.deals.find((item) => item.id === String(d.id))?.proxyKey;
           if (!proxyKey) return;
           try {
-            const res = await fetch(`${BASE_URL}/deals/${d.id}/meter`, {
-              headers: { Authorization: `Bearer ${proxyKey}` },
-              cache: "no-store",
-            });
-            if (res.ok) {
-              const data = await res.json();
-              meterMap.set(Number(d.id), data);
-              if (typeof window !== "undefined" && data.lockedPricing) {
-                try {
-                  localStorage.setItem(`conpi:locked_pricing_${d.id}`, JSON.stringify(data.lockedPricing));
-                } catch {}
-              }
+            const endpoints = [
+              `/api/vault/meter?dealId=${d.id}`,
+              `http://localhost:4000/v1/deals/${d.id}/meter`,
+              `${BASE_URL}/deals/${d.id}/meter`,
+            ];
+            for (const url of endpoints) {
+              try {
+                const res = await fetch(url, {
+                  headers: { Authorization: `Bearer ${proxyKey}` },
+                  cache: "no-store",
+                  signal: AbortSignal.timeout(3000),
+                });
+                if (res.ok) {
+                  const data = await res.json();
+                  meterMap.set(Number(d.id), data);
+                  if (typeof window !== "undefined" && data.lockedPricing) {
+                    try {
+                      localStorage.setItem(`conpi:locked_pricing_${d.id}`, JSON.stringify(data.lockedPricing));
+                    } catch {}
+                  }
+                  break;
+                }
+              } catch {}
             }
           } catch {}
         })
       );
 
-      const currentAccount = stateRef.current.account;
-      const mappedDeals = onChainDeals.map((d) => {
-        const existing = stateRef.current.deals.find((item) => item.id === String(d.id));
-        const listing = metadataListings.find((item) => String(item.dealId || "") === String(d.id));
-        const mapped = mapOnChainDeal(d, currentAccount, listing || existing);
-        const resolvedProxyKey = existing?.proxyKey || storedKeys[String(d.id)] || "";
-        const liveMeter = meterMap.get(Number(d.id));
-
-        const creditUsd = Number(liveMeter?.creditUsd) || existing?.creditUsd || (mapped.token === "NEAR" ? mapped.credit * liveNearPrice : mapped.credit);
-        const priceUsd = Number(liveMeter?.priceUsd) || existing?.priceUsd || (mapped.token === "NEAR" ? mapped.price * liveNearPrice : mapped.price);
-        const usedUsd = Number(liveMeter?.usedUsd ?? existing?.usedUsd ?? mapped.usedUsd);
-        const tokens = Number(liveMeter?.tokensTotal ?? existing?.tokens ?? mapped.tokens);
-        const stage = creditUsd > 0 ? Math.min(100, Math.floor((usedUsd / creditUsd) * 100)) : mapped.stage;
-        const lastUpdate = liveMeter?.timestamp
-          ? `TEE Enclave (${new Date(liveMeter.timestamp).toLocaleTimeString()})`
-          : existing?.lastUpdate || mapped.lastUpdate;
-
-        const provider = liveMeter?.provider || listing?.provider || existing?.provider || mapped.provider;
-        const models = Array.isArray(liveMeter?.models) && liveMeter.models.length
-          ? liveMeter.models
-          : listing?.models?.length ? listing.models : existing?.models?.length ? existing.models : mapped.models;
-        const model = liveMeter?.model || listing?.model || existing?.model || models[0] || mapped.model;
-
-        let cachedPricing: any = null;
-        if (typeof window !== "undefined") {
+      const foreignDealsMap = new Map<number, any>();
+      const candidateDeals = safeOnChainDeals.filter((d, idx) => {
+        const st = String(d.status);
+        if (st === "Completed" || st === "Settled" || st === "Cancelled") return false;
+        if (idx >= safeOnChainDeals.length - 4) return true;
+        return st === "Created" || st === "Funded" || st === "Active";
+      }).slice(-4);
+      await Promise.all(
+        candidateDeals.map(async (d) => {
           try {
-            const raw = localStorage.getItem(`conpi:locked_pricing_${d.id}`);
-            if (raw) cachedPricing = JSON.parse(raw);
+            const fd = await fetchContractForeignDeal(Number(d.id));
+            if (fd) foreignDealsMap.set(Number(d.id), fd);
           } catch {}
-        }
-        const effectiveLockedPricing = liveMeter?.lockedPricing || cachedPricing;
-        const lockedPriceRows = priceRowsFromLockedPricing(effectiveLockedPricing);
-        const prices = lockedPriceRows.length
-          ? lockedPriceRows
-          : existing?.prices?.length
-            ? existing.prices
-            : mapped.prices;
+        })
+      );
 
-        return {
-          ...mapped,
-          listingId: listing?.id || existing?.listingId || mapped.listingId,
-          provider,
-          model,
-          models,
-          proxyKey: resolvedProxyKey,
-          usedUsd,
-          tokens,
-          creditUsd,
-          priceUsd,
-          stage,
-          lastUpdate,
-          prices,
-          pricingSnapshotHash: liveMeter?.pricingSnapshotHash || existing?.pricingSnapshotHash,
-          usageReceiptCount: Number(liveMeter?.usageReceiptCount ?? existing?.usageReceiptCount ?? 0),
-          lastUsageReceipt: liveMeter?.lastUsageReceipt ?? existing?.lastUsageReceipt ?? null,
-          buyerTerms: listing
-            ? { ...(existing?.buyerTerms || listingTerms(listing)), creditUsd: listing.creditUsd ?? listing.credit, priceUsd: listing.priceUsd ?? listing.price }
-            : existing?.buyerTerms || mapped.buyerTerms,
-          sellerTerms: listing
-            ? { ...(existing?.sellerTerms || listingTerms(listing)), creditUsd: listing.creditUsd ?? listing.credit, priceUsd: listing.priceUsd ?? listing.price }
-            : existing?.sellerTerms || mapped.sellerTerms,
-          heartbeat: liveMeter?.active ? "live" : mapped.heartbeat,
-        };
-      });
+      const currentAccount = stateRef.current.account;
+      const allConnectedAccounts = [
+        stateRef.current.account,
+        stateRef.current.solanaAccount,
+        stateRef.current.evmAccount,
+        stateRef.current.nearAccount,
+      ].filter((x): x is string => Boolean(x && x.trim()));
+      const mappedDeals: Deal[] = [];
+      for (const d of safeOnChainDeals) {
+        try {
+          const existing = stateRef.current.deals.find((item) => item.id === String(d.id));
+          const listing = metadataListings.find((item) => String(item.dealId || "") === String(d.id));
+          const foreignDeal = foreignDealsMap.get(Number(d.id));
+          const mapped = mapOnChainDeal(d, currentAccount, listing, foreignDeal, existing, allConnectedAccounts);
+          const resolvedProxyKey = existing?.proxyKey || storedKeys[String(d.id)] || "";
+          const liveMeter = meterMap.get(Number(d.id));
+
+          const creditUsd = Number(liveMeter?.creditUsd) || existing?.creditUsd || mapped.credit;
+          const priceUsd = Number(liveMeter?.priceUsd) || existing?.priceUsd || mapped.price;
+          const usedUsd = Number(
+            liveMeter?.usedUsd !== undefined
+              ? liveMeter.usedUsd
+              : existing?.usedUsd !== undefined && existing.usedUsd > 0
+                ? existing.usedUsd
+                : mapped.usedUsd
+          );
+          const tokens = Number(liveMeter?.tokensTotal ?? existing?.tokens ?? mapped.tokens);
+
+          const onChainStage = (String(d.status) === "Settled" || String(d.status) === "Completed")
+            ? 100
+            : Number(d.current_stage ?? (d as any).stage_reached ?? (d as any).last_signed?.stage ?? 0);
+          const computedMeterStage = creditUsd > 0 && liveMeter?.usedUsd !== undefined
+            ? Math.min(100, Math.floor((usedUsd / creditUsd) * 100))
+            : 0;
+          const stage = Math.max(onChainStage, computedMeterStage);
+
+          const lastUpdate = liveMeter?.timestamp
+            ? `TEE Enclave (${new Date(liveMeter.timestamp).toLocaleTimeString()})`
+            : existing?.lastUpdate || mapped.lastUpdate;
+
+          let provider = liveMeter?.provider || listing?.provider || existing?.provider || mapped.provider;
+          let models = Array.isArray(liveMeter?.models) && liveMeter.models.length
+            ? liveMeter.models
+            : listing?.models?.length ? listing.models : existing?.models?.length ? existing.models : mapped.models;
+          let model = liveMeter?.model || listing?.model || existing?.model || models[0] || mapped.model;
+
+          // Auto-correct provider if mismatched
+          if (provider === "OpenAI") {
+            const m = (model || "").toLowerCase();
+            if (m.includes("/") || m.includes("deepseek") || m.includes("llama") || m.includes("glm") || m.includes("qwen") || m.includes("mistral")) {
+              provider = "OpenRouter";
+            } else if (m.includes("claude") || m.includes("anthropic")) {
+              provider = "Anthropic";
+            }
+          }
+
+          const heartbeat: "live" | "stale" = Boolean(
+            (liveMeter?.timestamp && Date.now() - new Date(liveMeter.timestamp).getTime() < 120_000) ||
+            (resolvedProxyKey && existing?.heartbeat === "live")
+          ) ? "live" : "stale";
+
+          let cachedPricing: any = null;
+          if (typeof window !== "undefined") {
+            try {
+              const raw = localStorage.getItem(`conpi:locked_pricing_${d.id}`);
+              if (raw) cachedPricing = JSON.parse(raw);
+            } catch {}
+          }
+          const effectiveLockedPricing = liveMeter?.lockedPricing || cachedPricing;
+          const lockedPriceRows = priceRowsFromLockedPricing(effectiveLockedPricing);
+          const prices = lockedPriceRows.length
+            ? lockedPriceRows
+            : existing?.prices?.length
+              ? existing.prices
+              : mapped.prices;
+
+          mappedDeals.push({
+            ...mapped,
+            listingId: listing?.id || existing?.listingId || mapped.listingId,
+            provider,
+            model,
+            models,
+            proxyKey: resolvedProxyKey,
+            usedUsd,
+            tokens,
+            creditUsd,
+            priceUsd,
+            stage,
+            heartbeat,
+            lastUpdate,
+            prices,
+            pricingSnapshotHash: liveMeter?.pricingSnapshotHash || existing?.pricingSnapshotHash,
+            usageReceiptCount: Number(liveMeter?.usageReceiptCount ?? existing?.usageReceiptCount ?? 0),
+            lastUsageReceipt: liveMeter?.lastUsageReceipt ?? existing?.lastUsageReceipt ?? null,
+            buyerTerms: listing
+              ? { ...(existing?.buyerTerms || listingTerms(listing)), creditUsd: listing.creditUsd ?? listing.credit, priceUsd: listing.priceUsd ?? listing.price }
+              : existing?.buyerTerms || mapped.buyerTerms,
+            sellerTerms: listing
+              ? { ...(existing?.sellerTerms || listingTerms(listing)), creditUsd: listing.creditUsd ?? listing.credit, priceUsd: listing.priceUsd ?? listing.price }
+              : existing?.sellerTerms || mapped.sellerTerms,
+          });
+        } catch (err: any) {
+          console.error(`Failed to map deal #${d.id}:`, err);
+          sendClientDebugLog({ error: `Failed to map deal #${d.id}`, message: err?.message });
+        }
+      }
+
+
 
       // Generate listings from models and active offers
-      const generatedListings: Listing[] = onChainDeals.map((d, index) => ({
-        id: `lst-${d.id}`,
+      const generatedListings: Listing[] = mappedDeals.map((deal) => ({
+        id: `lst-${deal.id}`,
         type: "sell",
-        provider: "OpenAI",
-        model: "gpt-4o",
-        models: ["gpt-4o", "gpt-4o-mini"],
-        credit: Number(d.credit_amount) / 1e24 || 20,
-        price: Number(d.price) / 1e24 || 15,
-        collateralPct: 20,
-        buyerCollateralPct: 10,
-        seller: d.seller,
+        dealId: deal.id,
+        provider: deal.provider,
+        model: deal.model,
+        models: deal.models?.length ? deal.models : [deal.model],
+        credit: deal.credit,
+        price: deal.price,
+        collateralPct: deal.sellerCollateralPct || 20,
+        buyerCollateralPct: deal.buyerCollateralPct || 10,
+        seller: deal.seller,
         reputation: 15,
         tee: true,
-        token: "NEAR",
+        token: deal.token,
         published: false,
         rateLimit: "60 req/min",
-        expectedTest: "One completion probe, max 32 tokens",
-        createdAt: d.created_at ? new Date(Number(d.created_at) / 1e6).toISOString() : new Date().toISOString(),
+        expectedTest: `One completion probe on ${deal.model}`,
+        createdAt: deal.createdAt || new Date().toISOString(),
       }));
 
       // Add default market listings if none yet
@@ -663,7 +1016,7 @@ export function Providers({ children }: { children: React.ReactNode }) {
             seller: "seller.testnet",
             reputation: 15,
             tee: true,
-            token: "NEAR",
+            token: "USDC",
             rateLimit: "60 req/min",
             expectedTest: "One chat completion probe",
             createdAt: new Date().toISOString(),
@@ -681,7 +1034,7 @@ export function Providers({ children }: { children: React.ReactNode }) {
             seller: "anthropic-seller.testnet",
             reputation: 22,
             tee: true,
-            token: "NEAR",
+            token: "USDC",
             rateLimit: "120 req/min",
             expectedTest: "Anthropic message completion probe",
             createdAt: new Date().toISOString(),
@@ -692,12 +1045,12 @@ export function Providers({ children }: { children: React.ReactNode }) {
       // Query claims for user
       const userClaims: Claim[] = [];
       if (currentAccount) {
-        const pendingNear = await fetchContractPendingPayout(currentAccount, null);
-        if (Number(pendingNear) > 0) {
+        const pendingUsdc = await fetchContractPendingPayout(currentAccount, MAKER_VAULT_CONFIG.near.tokenAddress);
+        if (Number(pendingUsdc) > 0) {
           userClaims.push({
-            id: `claim-near-${currentAccount}`,
-            token: "NEAR",
-            amount: Number(pendingNear) / 1e24,
+            id: `claim-usdc-${currentAccount}`,
+            token: "USDC",
+            amount: Number(pendingUsdc) / 1e6,
             claimed: false,
             reason: "Settlement payout / collateral release",
             dealId: "Contract Payout",
@@ -724,6 +1077,12 @@ export function Providers({ children }: { children: React.ReactNode }) {
         };
       });
 
+      if (typeof window !== "undefined" && mappedDeals.length > 0) {
+        try {
+          localStorage.setItem("conpi:cached_deals_v2", JSON.stringify(mappedDeals));
+        } catch {}
+      }
+
       setState((s) => {
         const publishedListings = metadataListings.filter((listing) => listing.published && !listing.dealId);
         const publishedIds = new Set(publishedListings.map((listing) => listing.id));
@@ -736,15 +1095,20 @@ export function Providers({ children }: { children: React.ReactNode }) {
           isLoadingOnChain: false,
         };
       });
-    } catch (err) {
+    } catch (err: any) {
       console.warn("Failed to load on-chain contract data:", err);
+      sendClientDebugLog({
+        error: "Failed to load on-chain contract data in loadOnChainData",
+        message: err?.message,
+        stack: err?.stack,
+      });
       setState((s) => ({ ...s, isLoadingOnChain: false }));
     }
   };
 
   useEffect(() => {
-    loadOnChainData();
-    const interval = setInterval(loadOnChainData, 12000);
+    loadOnChainData(false);
+    const interval = setInterval(() => loadOnChainData(true), 25000);
     return () => clearInterval(interval);
   }, [state.account]);
 
@@ -836,20 +1200,44 @@ export function Providers({ children }: { children: React.ReactNode }) {
     };
 
     const applyTicketState = (dealId: string, ticket: Awaited<ReturnType<typeof teeApi.getTicket>>) => {
-      patchDeal(dealId, (deal) => ({
-        ...deal,
-        buyerSubmitted: ticket.buyerSubmitted,
-        sellerSubmitted: ticket.sellerSubmitted,
-        termDiffFields: ticket.diffFields || [],
-        termsHash: ticket.termsHashHex ? `0x${ticket.termsHashHex.replace(/^0x/, "")}` : deal.termsHash,
-        messages: (ticket.messages || []).map((message) => ({
-          id: message.id,
-          sender: message.sender,
-          text: message.text,
-          time: new Date(message.createdAt).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" }),
-        })),
-        lastUpdate: ticket.matched ? "Terms matched inside verified TEE" : "Private negotiation active",
-      }));
+      let latestProposal: any = null;
+      for (const msg of (ticket.messages || [])) {
+        if (msg.text?.startsWith("PROPOSAL:")) {
+          try {
+            latestProposal = JSON.parse(msg.text.slice(9));
+          } catch {}
+        }
+      }
+
+      patchDeal(dealId, (deal) => {
+        const patchTerms = (latestProposal && ticket.matched) ? {
+          price: latestProposal.price,
+          priceUsd: latestProposal.price,
+          credit: latestProposal.credit,
+          creditUsd: latestProposal.credit,
+          buyerCollateralPct: latestProposal.buyerCollateralPct,
+          sellerCollateralPct: latestProposal.sellerCollateralPct,
+          token: latestProposal.token || deal.token,
+        } : null;
+
+        return {
+          ...deal,
+          matched: Boolean(ticket.matched),
+          buyerSubmitted: ticket.buyerSubmitted,
+          sellerSubmitted: ticket.sellerSubmitted,
+          termDiffFields: ticket.diffFields || [],
+          termsHash: ticket.termsHashHex ? `0x${ticket.termsHashHex.replace(/^0x/, "")}` : deal.termsHash,
+          buyerTerms: patchTerms ? { ...deal.buyerTerms, ...patchTerms } : deal.buyerTerms,
+          sellerTerms: patchTerms ? { ...deal.sellerTerms, ...patchTerms } : deal.sellerTerms,
+          messages: (ticket.messages || []).map((message) => ({
+            id: message.id,
+            sender: message.sender,
+            text: message.text,
+            time: new Date(message.createdAt).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" }),
+          })),
+          lastUpdate: ticket.matched ? "Terms matched inside verified TEE" : "Private negotiation active",
+        };
+      });
     };
 
     const submitPartyTermsToTee = async (deal: Deal, party: "buyer" | "seller") => {
@@ -862,6 +1250,12 @@ export function Providers({ children }: { children: React.ReactNode }) {
           deal.seller,
           deal.termsHash?.replace(/^0x/, "")
         );
+      }
+      // If the ticket in the enclave is already fully matched, return it directly so
+      // we never accidentally overwrite matched terms with differing browser local state.
+      if (ticket && ticket.matched && ticket.termsHashHex) {
+        applyTicketState(deal.id, ticket);
+        return ticket;
       }
       // Always refresh the connected party's encrypted term sheet. A previous
       // browser session may have submitted legacy NEAR-denominated values, and
@@ -876,12 +1270,131 @@ export function Providers({ children }: { children: React.ReactNode }) {
     return {
       setTheme: (theme) => setState((s) => ({ ...s, theme })),
       setDefaultToken: (defaultToken) => setState((s) => ({ ...s, defaultToken })),
+      openConnectModal: () => setState((s) => ({ ...s, isConnectModalOpen: true })),
+      closeConnectModal: () => setState((s) => ({ ...s, isConnectModalOpen: false })),
       connect: async () => {
-        await connectWalletModal();
+        setState((s) => ({ ...s, isConnectModalOpen: true }));
+      },
+      connectEvm: async (walletName: "MetaMask" | "Coinbase" = "MetaMask") => {
+        try {
+          const res = await connectMetaMask();
+          if (typeof window !== "undefined") {
+            try {
+              localStorage.setItem("conpi_evm_address", res.address);
+              localStorage.setItem("conpi_evm_wallet", walletName);
+            } catch {}
+          }
+          setState((s) => ({
+            ...s,
+            evmAccount: res.address,
+            account: s.account || res.address,
+            wallet: s.wallet || (walletName as WalletName),
+            walletChain: s.wallet ? s.walletChain : "evm",
+          }));
+          pushToast({ kind: "success", title: `Connected ${walletName}: ${res.address.slice(0, 6)}...${res.address.slice(-4)}` });
+          return res.address;
+        } catch (err: any) {
+          pushToast({ kind: "error", title: err?.message || "Failed to connect EVM wallet" });
+          throw err;
+        }
+      },
+      connectSolana: async (walletName: "Phantom" | "Solflare" = "Phantom") => {
+        try {
+          const res = await connectSolanaWallet(walletName);
+          setState((s) => ({
+            ...s,
+            solanaAccount: res.address,
+            account: s.account || res.address,
+            wallet: s.wallet || (walletName as WalletName),
+            walletChain: s.wallet ? s.walletChain : "solana",
+          }));
+          pushToast({ kind: "success", title: `Connected ${res.walletName}: ${res.address.slice(0, 4)}...${res.address.slice(-4)}` });
+          return res.address;
+        } catch (err: any) {
+          pushToast({ kind: "error", title: err?.message || "Failed to connect Solana wallet" });
+          throw err;
+        }
       },
       disconnect: async () => {
-        await disconnectWallet();
-        setState((s) => ({ ...s, account: null, wallet: null }));
+        try { await disconnectWallet(); } catch (e) { console.warn("disconnect near error:", e); }
+        try { disconnectEvmWallet(); } catch (e) { console.warn("disconnect evm error:", e); }
+        try { await disconnectSolanaWallet(); } catch (e) { console.warn("disconnect solana error:", e); }
+        if (typeof window !== "undefined") {
+          try {
+            localStorage.removeItem("conpi_evm_address");
+            localStorage.removeItem("conpi_evm_wallet");
+            localStorage.removeItem("conpi_solana_address");
+            localStorage.removeItem("conpi_solana_wallet");
+          } catch {}
+        }
+        setState((s) => ({
+          ...s,
+          account: null,
+          wallet: null,
+          nearAccount: null,
+          evmAccount: null,
+          solanaAccount: null,
+          walletChain: "near",
+        }));
+        pushToast({ kind: "info", title: "Disconnected all wallets" });
+      },
+      switchActiveChain: (chain: "near" | "evm" | "solana") => {
+        setState((s) => {
+          if (chain === "solana" && s.solanaAccount) {
+            return {
+              ...s,
+              account: s.solanaAccount,
+              wallet: (typeof window !== "undefined" && (localStorage.getItem("conpi_solana_wallet") as WalletName)) || "Phantom",
+              walletChain: "solana",
+            };
+          }
+          if (chain === "evm" && s.evmAccount) {
+            return {
+              ...s,
+              account: s.evmAccount,
+              wallet: (typeof window !== "undefined" && (localStorage.getItem("conpi_evm_wallet") as WalletName)) || "MetaMask",
+              walletChain: "evm",
+            };
+          }
+          if (chain === "near" && s.nearAccount) {
+            return {
+              ...s,
+              account: s.nearAccount,
+              wallet: "MyNearWallet",
+              walletChain: "near",
+            };
+          }
+          return s;
+        });
+        setTimeout(loadOnChainData, 50);
+      },
+      disconnectEvm: () => {
+        disconnectEvmWallet();
+        setState((s) => {
+          const isEvmActive = s.walletChain === "evm";
+          return {
+            ...s,
+            evmAccount: null,
+            account: isEvmActive ? (s.nearAccount || s.solanaAccount || null) : s.account,
+            wallet: isEvmActive ? (s.nearAccount ? "MyNearWallet" : s.solanaAccount ? "Phantom" : null) : s.wallet,
+            walletChain: isEvmActive ? (s.nearAccount ? "near" : s.solanaAccount ? "solana" : "near") : s.walletChain,
+          };
+        });
+        pushToast({ kind: "info", title: "Disconnected EVM wallet" });
+      },
+      disconnectSolana: async () => {
+        await disconnectSolanaWallet();
+        setState((s) => {
+          const isSolanaActive = s.walletChain === "solana";
+          return {
+            ...s,
+            solanaAccount: null,
+            account: isSolanaActive ? (s.nearAccount || s.evmAccount || null) : s.account,
+            wallet: isSolanaActive ? (s.nearAccount ? "MyNearWallet" : s.evmAccount ? "MetaMask" : null) : s.wallet,
+            walletChain: isSolanaActive ? (s.nearAccount ? "near" : s.evmAccount ? "evm" : "near") : s.walletChain,
+          };
+        });
+        pushToast({ kind: "info", title: "Disconnected Solana wallet" });
       },
       copy: (value) => {
         navigator.clipboard?.writeText(value).catch(() => undefined);
@@ -937,8 +1450,10 @@ export function Providers({ children }: { children: React.ReactNode }) {
         const role = listing.type === "sell" ? "buyer" : "seller";
         const buyer = role === "buyer" ? current.account : listing.seller;
         const seller = role === "seller" ? current.account : listing.seller;
-        if (buyer.trim().toLowerCase() === seller.trim().toLowerCase()) {
-          pushToast({ kind: "error", title: "Choose a different wallet", body: "Buyer and seller must be two different NEAR accounts." });
+        const nearBuyer = toNearAccountId(buyer);
+        const nearSeller = toNearAccountId(seller);
+        if (nearBuyer.toLowerCase() === nearSeller.toLowerCase()) {
+          pushToast({ kind: "error", title: "Choose a different wallet", body: "Buyer and seller must be two different accounts." });
           return null;
         }
 
@@ -959,7 +1474,7 @@ export function Providers({ children }: { children: React.ReactNode }) {
             await new Promise((resolve) => window.setTimeout(resolve, 1_000));
             const deals = await fetchContractDeals(0, 100);
             const created = deals
-              .filter((item) => Number(item.id) > previousMaxId && item.buyer === buyer && item.seller === seller)
+              .filter((item) => Number(item.id) > previousMaxId && item.buyer === nearBuyer && item.seller === nearSeller)
               .sort((a, b) => Number(b.id) - Number(a.id))[0];
             if (created) onChainId = Number(created.id);
           }
@@ -971,6 +1486,39 @@ export function Providers({ children }: { children: React.ReactNode }) {
             ...s,
             listings: s.listings.map((item) => item.id === listing.id ? boundListing : item),
           }));
+
+          // Remember multi-chain payout addresses
+          if (typeof window !== "undefined") {
+            try {
+              if (seller.startsWith("0x")) {
+                localStorage.setItem(`conpi_seller_evm_${id}`, seller);
+              } else if (seller.length >= 32 && !seller.includes(".")) {
+                localStorage.setItem(`conpi_seller_solana_${id}`, seller);
+              }
+            } catch {}
+          }
+
+          if (listing.token === "USDC" || (listing.token as any) === "USDC.base") {
+            try {
+              const vault = deriveForeignVaultAddress(CONTRACT_ID, Number(id));
+              const foreignAmount = Math.round(listing.price * 1e6).toString();
+              const savedSellerEvm = typeof window !== "undefined" ? (localStorage.getItem(`conpi_seller_evm_${id}`) || localStorage.getItem("conpi_last_seller_evm") || "0x0000000000000000000000000000000000000000") : "0x0000000000000000000000000000000000000000";
+              if (savedSellerEvm && savedSellerEvm !== "0x0000000000000000000000000000000000000000") {
+                console.log(`[openTicket] Auto-registering foreign deal #${id} on Base Sepolia... Vault: ${vault.address}`);
+                await txRegisterForeignChainDeal(
+                  Number(id),
+                  BASE_SEPOLIA_CHAIN_ID,
+                  vault.address,
+                  BASE_SEPOLIA_USDC,
+                  buyer.startsWith("0x") ? buyer : "0x0000000000000000000000000000000000000000",
+                  savedSellerEvm,
+                  foreignAmount
+                );
+              }
+            } catch (fErr) {
+              console.warn("[openTicket] Auto-register foreign chain deal notice:", fErr);
+            }
+          }
         } catch (err: any) {
           replaceToast(pendingToast, { kind: "error", title: "Deal creation failed", body: err.message });
           return null;
@@ -1060,11 +1608,206 @@ export function Providers({ children }: { children: React.ReactNode }) {
         }
       },
       updateBuyerTerms: (dealId, patch) => {
+        const enhancedPatch = {
+          ...patch,
+          ...(patch.price !== undefined ? { priceUsd: patch.price } : {}),
+          ...(patch.credit !== undefined ? { creditUsd: patch.credit } : {}),
+        };
         patchDeal(dealId, (deal) => ({
           ...deal,
-          buyerTerms: deal.role === "buyer" ? { ...deal.buyerTerms, ...patch } : deal.buyerTerms,
-          sellerTerms: deal.role === "seller" ? { ...deal.sellerTerms, ...patch } : deal.sellerTerms,
+          buyerTerms: deal.role === "buyer" ? { ...deal.buyerTerms, ...enhancedPatch } : deal.buyerTerms,
+          sellerTerms: deal.role === "seller" ? { ...deal.sellerTerms, ...enhancedPatch } : deal.sellerTerms,
         }));
+      },
+      proposeTerms: async (dealId, patch) => {
+        const account = stateRef.current.account;
+        if (!account) return;
+        const deal = stateRef.current.deals.find((item) => item.id === dealId);
+        if (!deal) return;
+
+        const enhancedPatch = {
+          ...patch,
+          ...(patch.price !== undefined ? { priceUsd: patch.price } : {}),
+          ...(patch.credit !== undefined ? { creditUsd: patch.credit } : {}),
+        };
+        patchDeal(dealId, (d) => ({
+          ...d,
+          buyerTerms: d.role === "buyer" ? { ...d.buyerTerms, ...enhancedPatch } : d.buyerTerms,
+          sellerTerms: d.role === "seller" ? { ...d.sellerTerms, ...enhancedPatch } : d.sellerTerms,
+        }));
+
+        const updatedDeal = {
+          ...deal,
+          buyerTerms: deal.role === "buyer" ? { ...deal.buyerTerms, ...enhancedPatch } : deal.buyerTerms,
+          sellerTerms: deal.role === "seller" ? { ...deal.sellerTerms, ...enhancedPatch } : deal.sellerTerms,
+        };
+
+        const ownTerms = deal.role === "buyer" ? updatedDeal.buyerTerms : updatedDeal.sellerTerms;
+        try {
+          const ticket = await submitPartyTermsToTee(updatedDeal, deal.role);
+          applyTicketState(dealId, ticket);
+
+          const proposalPayload = {
+            type: "proposal",
+            price: Number(ownTerms.price),
+            credit: Number(ownTerms.credit),
+            buyerCollateralPct: Number(ownTerms.buyerCollateralPct),
+            sellerCollateralPct: Number(ownTerms.sellerCollateralPct),
+            token: ownTerms.token || "USDC",
+            proposer: account,
+          };
+          const proposalMsg = `PROPOSAL:${JSON.stringify(proposalPayload)}`;
+
+          const enclaveKey = await getVerifiedEncryptionKey();
+          const encryptedEnvelope = encryptPayloadToEnclave(proposalMsg, enclaveKey);
+          const updatedTicket = await teeApi.sendMessage(dealId, account, encryptedEnvelope);
+          applyTicketState(dealId, updatedTicket);
+
+          pushToast({
+            kind: ticket.matched ? "success" : "info",
+            title: ticket.matched ? "Terms matched in TEE!" : "Encrypted proposal sent",
+            body: ticket.matched
+              ? "Both parties agreed! Terms matched inside TEE."
+              : `Proposed price $${ownTerms.price}. Counterparty can now accept in chat.`,
+          });
+        } catch (err: any) {
+          pushToast({ kind: "error", title: "Proposal failed", body: err.message });
+        }
+      },
+      acceptProposal: async (dealId, proposal) => {
+        const account = stateRef.current.account;
+        if (!account) return;
+        const deal = stateRef.current.deals.find((item) => item.id === dealId);
+        if (!deal) return;
+
+        const enhancedPatch = {
+          price: Number(proposal.price),
+          priceUsd: Number(proposal.price),
+          credit: Number(proposal.credit),
+          creditUsd: Number(proposal.credit),
+          buyerCollateralPct: Number(proposal.buyerCollateralPct),
+          sellerCollateralPct: Number(proposal.sellerCollateralPct),
+          token: proposal.token || deal.token,
+        };
+
+        patchDeal(dealId, (d) => ({
+          ...d,
+          buyerTerms: d.role === "buyer" ? { ...d.buyerTerms, ...enhancedPatch } : d.buyerTerms,
+          sellerTerms: d.role === "seller" ? { ...d.sellerTerms, ...enhancedPatch } : d.sellerTerms,
+        }));
+
+        const updatedDeal = {
+          ...deal,
+          buyerTerms: deal.role === "buyer" ? { ...deal.buyerTerms, ...enhancedPatch } : deal.buyerTerms,
+          sellerTerms: deal.role === "seller" ? { ...deal.sellerTerms, ...enhancedPatch } : deal.sellerTerms,
+        };
+
+        try {
+          const ticket = await submitPartyTermsToTee(updatedDeal, deal.role);
+          applyTicketState(dealId, ticket);
+
+          const confirmMsg = `✅ I accepted your proposed price of $${proposal.price}! Encrypted terms matched in TEE.`;
+          const enclaveKey = await getVerifiedEncryptionKey();
+          const encryptedEnvelope = encryptPayloadToEnclave(confirmMsg, enclaveKey);
+          const updatedTicket = await teeApi.sendMessage(dealId, account, encryptedEnvelope);
+          applyTicketState(dealId, updatedTicket);
+
+          pushToast({
+            kind: "success",
+            title: "Proposal accepted!",
+            body: `Terms matched at $${proposal.price} inside the TEE enclave.`,
+          });
+        } catch (err: any) {
+          pushToast({ kind: "error", title: "Failed to accept proposal", body: err.message });
+        }
+      },
+      createNegotiatedDeal: async (dealId) => {
+        const current = stateRef.current;
+        const deal = current.deals.find((item) => item.id === dealId);
+        if (!deal || !current.account) return null;
+
+        const ownTerms = deal.role === "buyer" ? deal.buyerTerms : deal.sellerTerms;
+        const buyer = deal.buyer;
+        const seller = deal.seller;
+
+        // 100% USDC-Only:
+        // Micro-units: 6 decimals (1 USDC = 1,000,000)
+        // Multi-chain Maker Vault specifies token: null for foreign settlement
+        const priceUnits = toMicroUnits(ownTerms.price);
+        const creditUnits = toMicroUnits(ownTerms.credit);
+        const buyerColUnits = toMicroUnits((ownTerms.price * (ownTerms.buyerCollateralPct || 0)) / 100);
+        const sellerColUnits = toMicroUnits((ownTerms.price * (ownTerms.sellerCollateralPct || 0)) / 100);
+
+        const pendingToast = pushToast({
+          kind: "pending",
+          title: "Creating negotiated deal on NEAR...",
+          body: `Confirm deal creation at negotiated price $${ownTerms.price} USDC.`,
+        });
+
+        try {
+          const beforeDeals = await fetchContractDeals(0, 100);
+          const previousMaxId = Math.max(0, ...beforeDeals.map((item) => Number(item.id) || 0));
+
+          const nearBuyer = toNearAccountId(buyer);
+          const nearSeller = toNearAccountId(seller);
+
+          const params = {
+            buyer: nearBuyer,
+            seller: nearSeller,
+            token: null,
+            price: priceUnits,
+            credit_amount: creditUnits,
+            buyer_collateral: buyerColUnits,
+            seller_collateral: sellerColUnits,
+            tee_pubkey: TEE_SIGNER_PUBLIC_KEY,
+            deposit_duration_sec: DEAL_DEPOSIT_DURATION_SEC,
+            key_duration_sec: DEAL_KEY_DURATION_SEC,
+            tee_liveness_timeout_sec: CONFIG.teeLivenessSec,
+            slash_bps_provider_ban: CONFIG.slashProviderBanBps,
+            slash_bps_revoke: CONFIG.slashRevokeBps,
+            slash_bps_buyer_breach: CONFIG.slashBuyerBreachBps,
+          };
+
+          const outcome: any = await txCreateDeal(params);
+          let newDealId = createdDealIdFromOutcome(outcome);
+          for (let attempt = 0; newDealId === null && attempt < 5; attempt += 1) {
+            await new Promise((resolve) => window.setTimeout(resolve, 1000));
+            const deals = await fetchContractDeals(0, 100);
+            const created = deals
+              .filter((item) => Number(item.id) > previousMaxId && item.buyer === nearBuyer && item.seller === nearSeller)
+              .sort((a, b) => Number(b.id) - Number(a.id))[0];
+            if (created) newDealId = Number(created.id);
+          }
+          if (newDealId === null) throw new Error("The transaction succeeded, but the new on-chain deal ID could not be resolved");
+
+          const newIdStr = String(newDealId);
+          const createdTermsHashHex = await waitForOnChainTermsHash(newDealId);
+
+          // Carry over TEE ticket messages and init ticket for the new deal
+          try {
+            await teeApi.initTicket(newIdStr, newDealId, buyer, seller, createdTermsHashHex);
+            for (const msg of deal.messages) {
+              const enclaveKey = await getVerifiedEncryptionKey();
+              const env = encryptPayloadToEnclave(msg.text, enclaveKey);
+              await teeApi.sendMessage(newIdStr, msg.sender, env);
+            }
+          } catch {}
+
+          replaceToast(pendingToast, {
+            kind: "success",
+            title: `Negotiated Deal #${newIdStr} Created!`,
+            body: `Terms locked at $${ownTerms.price}. Ready for deposit.`,
+          });
+          setTimeout(loadOnChainData, 1500);
+          return newIdStr;
+        } catch (err: any) {
+          replaceToast(pendingToast, {
+            kind: "error",
+            title: "Failed to create negotiated deal",
+            body: err.message,
+          });
+          return null;
+        }
       },
       submitNegotiationTerms: async (dealId) => {
         const deal = stateRef.current.deals.find((item) => item.id === dealId);
@@ -1128,76 +1871,287 @@ export function Providers({ children }: { children: React.ReactNode }) {
 
         try {
           await submitPartyTermsToTee(deal, deal.role);
-          if (deal.token === "NEAR") {
-            let yocto: string;
-            const onChain = await fetchContractDeal(Number(dealId));
-            if (onChain) {
-              if (isBuyer) {
-                const req = BigInt(onChain.price) + BigInt(onChain.buyer_collateral);
-                const cur = BigInt(onChain.buyer_deposited || 0);
-                yocto = (req > cur ? req - cur : BigInt(0)).toString();
-              } else {
-                const req = BigInt(onChain.seller_collateral);
-                const cur = BigInt(onChain.seller_deposited || 0);
-                yocto = (req > cur ? req - cur : BigInt(0)).toString();
-              }
-            } else {
-              const livePrice = (await getLiveNearPrice().catch(() => 4.02)) || 4.02;
-              const priceNear = deal.price / livePrice;
-              const priceYocto = BigInt(toYoctoNear(priceNear));
-              if (isBuyer) {
-                const col = (priceYocto * BigInt(deal.buyerCollateralPct)) / BigInt(100);
-                yocto = (priceYocto + col).toString();
-              } else {
-                yocto = ((priceYocto * BigInt(deal.sellerCollateralPct)) / BigInt(100)).toString();
-              }
-            }
-            const exactNearAmount = (Number(BigInt(yocto) / BigInt(1e15)) / 1e9).toString();
-            const creator = await fetchContractDealCreator(Number(dealId));
-            const currentAccount = stateRef.current.account;
-            const isCounterparty = creator && currentAccount
-              ? creator.trim().toLowerCase() !== currentAccount.trim().toLowerCase()
-              : false;
+          // 100% USDC deposits on NEAR using official Circle Native USDC:
+          const tokenContract = MAKER_VAULT_CONFIG.near.tokenAddress;
+          const vaultAddress = MAKER_VAULT_CONFIG.near.vaultAddress;
+          const rawAmount = Math.round(amount * 1e6).toString();
 
-            let outcome: any;
-            if (isCounterparty && !deal.counterpartyAccepted && deal.termsHash) {
-              const cleanHex = deal.termsHash.replace(/^0x/, "");
-              const hashBytes = Array.from(Buffer.from(cleanHex, "hex"));
-              try {
-                outcome = await txAcceptAndDepositNear(Number(dealId), hashBytes, yocto);
-              } catch {
-                await txAcceptDeal(Number(dealId), hashBytes);
-                outcome = await txDepositNear(Number(dealId), yocto);
-              }
-            } else {
-              outcome = await txDepositNear(Number(dealId), yocto);
-            }
-            const txHash = outcome?.transaction?.hash || outcome?.transaction_outcome?.id;
-            if (!txHash) throw new Error("Deposit transaction was not confirmed");
-
-            patchDeal(dealId, (item) => ({
-              ...item,
-              buyerDeposited: isBuyer ? true : item.buyerDeposited,
-              sellerDeposited: !isBuyer ? true : item.sellerDeposited,
-              step: "key",
-              status: "Funded",
-              activity: [{ id: crypto.randomUUID(), title: "Escrow deposited", detail: `${exactNearAmount} NEAR locked on-chain.`, tx: txHash, time: "Now" }, ...item.activity],
-            }));
-            setTimeout(loadOnChainData, 2000);
-            return { ok: true, title: "Deposit confirmed on NEAR", body: `${exactNearAmount} NEAR locked in escrow.`, href: `https://testnet.nearblocks.io/txns/${txHash}` };
-          } else {
-            const tokenContract = (deal as any).tokenContract || (deal.token && deal.token.includes(".") ? deal.token : null);
-            if (!tokenContract) throw new Error(`FT token contract address required for token: ${deal.token}`);
-            const rawAmount = Math.round(amount * 1e6).toString();
+          let txHash = "";
+          try {
+            const outcome: any = await txFtTransfer(
+              tokenContract,
+              vaultAddress,
+              rawAmount,
+              `Conpi Deal #${dealId} Escrow Deposit`
+            );
+            txHash = outcome?.transaction?.hash || outcome?.transaction_outcome?.id || "";
+          } catch (tErr: any) {
+            console.warn("txFtTransfer error, attempting ft_transfer_call fallback:", tErr);
             const outcome: any = await txDepositFt(tokenContract, Number(dealId), rawAmount);
-            const txHash = outcome?.transaction?.hash || outcome?.transaction_outcome?.id;
-            if (!txHash) throw new Error("FT Deposit transaction was not confirmed");
-
-            setTimeout(loadOnChainData, 2000);
-            return { ok: true, title: "FT Deposit confirmed", body: `${amount} ${deal.token} deposited via ft_transfer_call.`, href: `https://testnet.nearblocks.io/txns/${txHash}` };
+            txHash = outcome?.transaction?.hash || outcome?.transaction_outcome?.id || "";
           }
+
+          if (!txHash) throw new Error("USDC Deposit transaction was not confirmed");
+
+          // Auto-verify and record deposit via Maker Vault API
+          try {
+            await fetch("/api/vault/verify-deposit", {
+              method: "POST",
+              headers: { "Content-Type": "application/json" },
+              body: JSON.stringify({
+                dealId: Number(dealId),
+                chain: "near",
+                txHash,
+                expectedUsdcAmount: amount,
+                buyerAddress: stateRef.current.account || undefined,
+                sellerPayoutChain: deal.seller.startsWith("0x") ? "base" : "solana",
+                sellerPayoutAddress: deal.seller,
+              }),
+            });
+          } catch (vErr) {
+            console.warn("Vault verify-deposit notice:", vErr);
+          }
+
+          try {
+            await txConfirmForeignDeposit(Number(dealId));
+          } catch {}
+
+          patchDeal(dealId, (item) => ({
+            ...item,
+            buyerDeposited: isBuyer ? true : item.buyerDeposited,
+            sellerDeposited: !isBuyer ? true : item.sellerDeposited,
+            step: "key",
+            status: "Funded",
+            activity: [
+              {
+                id: crypto.randomUUID(),
+                title: "USDC Escrow Deposited",
+                detail: `$${amount.toFixed(2)} USDC locked in Conpi Maker Vault (NEAR).`,
+                tx: txHash,
+                time: "Now",
+              },
+              ...item.activity,
+            ],
+          }));
+
+          setTimeout(loadOnChainData, 2000);
+          return {
+            ok: true,
+            title: "USDC Deposit Confirmed on NEAR",
+            body: `$${amount.toFixed(2)} USDC locked in Conpi Maker Vault.`,
+            href: `https://testnet.nearblocks.io/txns/${txHash}`,
+          };
         } catch (err: any) {
           return { ok: false, title: "Deposit failed", body: err.message };
+        }
+      },
+      depositForeignBaseUsdc: async (dealId, evmTxHash, buyerEvmAddress, sellerEvmAddress) => {
+        const deal = stateRef.current.deals.find((item) => item.id === dealId);
+        if (!deal) return { ok: false, title: "Deal not found" };
+
+        try {
+          await submitPartyTermsToTee(deal, deal.role);
+          const termsHashHex = deal.termsHash?.replace(/^0x/, "") || "";
+          const usdcNominal = deal.priceUsd && deal.priceUsd > 0
+            ? deal.priceUsd
+            : deal.price;
+          const expectedUsdcAtomic = Math.round(usdcNominal * 1e6).toString();
+
+          if (!sellerEvmAddress || sellerEvmAddress === "0x0000000000000000000000000000000000000000") {
+            return {
+              ok: false,
+              title: "Seller Address Required",
+              body: "The seller must specify their Base Sepolia payout address before funds can be deposited.",
+            };
+          }
+          if (buyerEvmAddress && sellerEvmAddress.toLowerCase() === buyerEvmAddress.toLowerCase()) {
+            return {
+              ok: false,
+              title: "Invalid Recipient",
+              body: "Seller payout address cannot match the buyer address. Buyer cannot redirect seller payouts to themselves.",
+            };
+          }
+
+          // 1. If buyerEvmAddress is known and valid, register foreign parameters on-chain upfront
+          let onChainForeign = await fetchContractForeignDeal(Number(dealId));
+          if (
+            onChainForeign?.vault_address &&
+            (!onChainForeign.buyer_address || onChainForeign.buyer_address === "0x0000000000000000000000000000000000000000") &&
+            buyerEvmAddress &&
+            buyerEvmAddress !== "0x0000000000000000000000000000000000000000"
+          ) {
+            await txSetForeignBuyerAddress(Number(dealId), buyerEvmAddress);
+            await new Promise((r) => setTimeout(r, 800));
+            onChainForeign = await fetchContractForeignDeal(Number(dealId));
+          }
+          const needsRegistration = !onChainForeign || !onChainForeign.foreign_amount || onChainForeign.foreign_amount === "0" || !onChainForeign.vault_address;
+          if (needsRegistration && buyerEvmAddress && buyerEvmAddress !== "0x0000000000000000000000000000000000000000") {
+            try {
+              const vault = deriveForeignVaultAddress(CONTRACT_ID, Number(dealId)).address;
+              await txRegisterForeignChainDeal(
+                Number(dealId),
+                BASE_SEPOLIA_CHAIN_ID,
+                vault,
+                BASE_SEPOLIA_USDC,
+                buyerEvmAddress,
+                sellerEvmAddress,
+                expectedUsdcAtomic
+              );
+              await new Promise((r) => setTimeout(r, 1200));
+            } catch (regErr) {
+              console.warn("Client registration of foreign deal notice:", regErr);
+            }
+          }
+
+          const result = await teeApi.verifyForeignDeposit({
+            dealId: Number(dealId),
+            txHash: evmTxHash,
+            termsHashHex,
+            expectedAmountAtomic: expectedUsdcAtomic,
+            sellerAddress: sellerEvmAddress,
+            autoRelay: true,
+          });
+
+          if (!result.ok) {
+            throw new Error(result.error || "TEE verification of Base Sepolia deposit failed");
+          }
+
+          // Fallback: If foreign deal was not registered yet, register using verified sender from receipt
+          onChainForeign = await fetchContractForeignDeal(Number(dealId));
+          if (!onChainForeign || !onChainForeign.foreign_amount || onChainForeign.foreign_amount === "0" || !onChainForeign.vault_address) {
+            const verifiedSender = result.verification?.sender;
+            if (verifiedSender && verifiedSender !== "0x0000000000000000000000000000000000000000") {
+              const vault = deriveForeignVaultAddress(CONTRACT_ID, Number(dealId)).address;
+              await txRegisterForeignChainDeal(
+                Number(dealId),
+                BASE_SEPOLIA_CHAIN_ID,
+                vault,
+                BASE_SEPOLIA_USDC,
+                verifiedSender,
+                sellerEvmAddress,
+                expectedUsdcAtomic
+              );
+              await new Promise((r) => setTimeout(r, 1000));
+            }
+          }
+
+          // Fallback to manual on-chain deposit recording if auto-relay failed or was unconfigured
+          if (!result.relayResult?.transactionHash && result.payload?.signatureHex) {
+            try {
+              await txRecordForeignDeposit(
+                Number(dealId),
+                evmTxHash,
+                result.payload.payload,
+                result.payload.signatureHex
+              );
+            } catch (fbErr) {
+              console.warn("Manual fallback txRecordForeignDeposit warning:", fbErr);
+            }
+          }
+
+          patchDeal(dealId, (item) => ({
+            ...item,
+            buyerDeposited: true,
+            step: item.sellerDeposited ? "key" : item.step,
+            status: item.sellerDeposited ? "Funded" : item.status,
+            activity: [
+              {
+                id: crypto.randomUUID(),
+                title: "Base Sepolia Deposit Verified",
+                detail: `Deposited $${deal.price} USDC on Base Sepolia. Attested by TEE.`,
+                tx: evmTxHash,
+                time: "Now",
+              },
+              ...item.activity,
+            ],
+          }));
+
+          setTimeout(loadOnChainData, 2000);
+
+          return {
+            ok: true,
+            title: "Base Sepolia Deposit Verified & Recorded",
+            body: `Transaction confirmed on Base Sepolia and recorded into escrow.`,
+            href: `https://sepolia.basescan.org/tx/${evmTxHash}`,
+          };
+        } catch (err: any) {
+          return { ok: false, title: "Base Deposit Verification Failed", body: err.message };
+        }
+      },
+      depositUsdcViaMakerVault: async (
+        dealId,
+        chain,
+        txHash,
+        amountUsdc,
+        buyerAddress,
+        sellerPayoutChain,
+        sellerPayoutAddress
+      ) => {
+        const deal = stateRef.current.deals.find((item) => item.id === dealId);
+        if (!deal) return { ok: false, title: "Deal not found" };
+
+        try {
+          await submitPartyTermsToTee(deal, deal.role);
+
+          const res = await fetch("/api/vault/verify-deposit", {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({
+              dealId: Number(dealId),
+              chain,
+              txHash,
+              expectedUsdcAmount: amountUsdc,
+              buyerAddress,
+              sellerPayoutChain: sellerPayoutChain || "base",
+              sellerPayoutAddress: sellerPayoutAddress || undefined,
+            }),
+          });
+
+          const result = await res.json();
+          if (!result.ok) {
+            throw new Error(result.error || `Failed to verify USDC deposit on ${chain.toUpperCase()}`);
+          }
+
+          let coordinationConfirmed = false;
+          try {
+            await txConfirmForeignDeposit(Number(dealId));
+            coordinationConfirmed = true;
+          } catch (cfErr) {
+            console.warn("Auto confirm foreign deposit on NEAR contract notice:", cfErr);
+          }
+
+          patchDeal(dealId, (item) => ({
+            ...item,
+            buyerDeposited: true,
+            step: coordinationConfirmed ? "key" : "deposit",
+            status: coordinationConfirmed ? "Funded" : "Created",
+            activity: [
+              {
+                id: crypto.randomUUID(),
+                title: coordinationConfirmed ? "USDC Escrow Funded" : "USDC Deposit Verified",
+                detail: coordinationConfirmed
+                  ? `$${amountUsdc.toFixed(2)} USDC locked in Conpi Maker Vault (${chain.toUpperCase()}).`
+                  : `Deposit verified on ${chain.toUpperCase()}, but the NEAR coordination contract is still awaiting confirmation.`,
+                tx: txHash,
+                time: "Now",
+              },
+              ...item.activity,
+            ],
+          }));
+
+          setTimeout(loadOnChainData, 2000);
+
+          return {
+            ok: true,
+            title: "USDC Deposit Confirmed",
+            body: `$${amountUsdc.toFixed(2)} USDC locked in Conpi Maker Vault (${chain.toUpperCase()}).`,
+          };
+        } catch (err: any) {
+          return {
+            ok: false,
+            title: "Maker Vault Deposit Failed",
+            body: err?.message || "Verification failed",
+          };
         }
       },
       submitSellerKey: async (dealId, plainApiKey) => {
@@ -1210,9 +2164,17 @@ export function Providers({ children }: { children: React.ReactNode }) {
         pushToast({ kind: "pending", title: "Validating key in TEE Enclave..." });
 
         try {
-          const connectedAccount = stateRef.current.account?.trim().toLowerCase();
-          if (!connectedAccount || connectedAccount !== deal.seller.trim().toLowerCase()) {
-            pushToast({ kind: "error", title: "Seller wallet required", body: `Connect ${deal.seller} before submitting the provider key.` });
+          const connectedAccount = (stateRef.current.account || "").trim().toLowerCase();
+          const nearConnected = toNearAccountId(connectedAccount);
+          const sellerAddress = deal.seller.trim().toLowerCase();
+          const isSellerMatch =
+            connectedAccount === sellerAddress ||
+            nearConnected === sellerAddress ||
+            (stateRef.current.solanaAccount && toNearAccountId(stateRef.current.solanaAccount) === sellerAddress) ||
+            (stateRef.current.solanaAccount && stateRef.current.solanaAccount.toLowerCase() === sellerAddress) ||
+            (stateRef.current.nearAccount && stateRef.current.nearAccount.toLowerCase() === sellerAddress);
+          if (!isSellerMatch) {
+            pushToast({ kind: "error", title: "Seller wallet required", body: `Connect seller wallet (${deal.seller}) before submitting the provider key.` });
             return;
           }
           const provider = (deal.provider || "OpenAI").toLowerCase();
@@ -1254,6 +2216,20 @@ export function Providers({ children }: { children: React.ReactNode }) {
             }
           }
 
+          // If foreign deal is in Created status, confirm foreign deposit to transition deal to Funded on NEAR
+          if (onChain && onChain.status === "Created") {
+            try {
+              const foreignInfo = await fetchContractForeignDeal(Number(dealId));
+              if (foreignInfo && foreignInfo.buyer_address && foreignInfo.buyer_address !== "0x0000000000000000000000000000000000000000") {
+                pushToast({ kind: "pending", title: "Confirming Base Sepolia deposit on NEAR..." });
+                await txConfirmForeignDeposit(Number(dealId));
+                await new Promise((r) => setTimeout(r, 1500));
+              }
+            } catch (cfErr: any) {
+              console.warn("Auto confirm_foreign_deposit notice:", cfErr);
+            }
+          }
+
           const ticket = await submitPartyTermsToTee(deal, "seller");
           if (!ticket.matched) {
             pushToast({
@@ -1266,6 +2242,15 @@ export function Providers({ children }: { children: React.ReactNode }) {
 
           const enclaveKey = await getVerifiedEncryptionKey();
           const encryptedEnvelope = encryptApiKeyToEnclave(plainApiKey, enclaveKey);
+          const sellerAuthorization = await signSellerKeyAuthorization(stateRef.current.walletChain, {
+            dealId: Number(dealId),
+            seller: deal.seller,
+            provider,
+            model,
+            models,
+            termsHashHex: deal.termsHash ? deal.termsHash.replace(/^0x/, "") : "00".repeat(32),
+            encryptedEnvelope,
+          });
           const res = await teeApi.submitKey(Number(dealId), {
             provider,
             model,
@@ -1274,6 +2259,7 @@ export function Providers({ children }: { children: React.ReactNode }) {
             priceUsd: deal.sellerTerms.priceUsd ?? deal.buyerTerms.priceUsd ?? deal.priceUsd ?? deal.price,
             termsHashHex: deal.termsHash ? deal.termsHash.replace(/^0x/, "") : "00".repeat(32),
             encryptedEnvelope,
+            sellerAuthorization,
           });
 
           if (!res.ok) {
@@ -1331,6 +2317,91 @@ export function Providers({ children }: { children: React.ReactNode }) {
       releaseStagePayout: async (dealId) => {
         const deal = stateRef.current.deals.find((item) => item.id === dealId);
         if (!deal) return { ok: false, title: "Deal not found" };
+
+        // For active Maker Vault deals
+        if ((deal as any).active_vault_deal || deal.baseUrl?.includes("localhost")) {
+          const currentStage = [100, 75, 50, 25].find((s) => deal.stage >= s) || 0;
+          if (currentStage === 0) {
+            const creditUsd = deal.creditUsd || deal.credit;
+            const target25 = (creditUsd * 0.25).toFixed(4);
+            pushToast({
+              kind: "error",
+              title: "Stage 25% payout not ready",
+              body: `Current usage is $${deal.usedUsd.toFixed(4)}. Payout unlocks once usage reaches 25% ($${target25} USD).`,
+            });
+            return { ok: false, title: "Stage not reached yet" };
+          }
+
+          const unitPrice = deal.priceUsd || deal.price;
+          const milestoneUsdc = Number((unitPrice * 0.25).toFixed(4));
+
+          // Check previous payouts to see if this specific stage is already paid
+          const paidStages = new Set<number>();
+          try {
+            const checkRes = await fetch(`/api/vault/payout?dealId=${dealId}`);
+            if (checkRes.ok) {
+              const checkData = await checkRes.json();
+              const existing = (checkData.payouts || []).filter((p: any) => !p.isRefund);
+              for (const p of existing) {
+                const match = String(p.memo || "").match(/Stage\s*(\d+)%/i);
+                if (match) paidStages.add(Number(match[1]));
+              }
+            }
+          } catch {}
+
+          if (paidStages.has(currentStage)) {
+            pushToast({
+              kind: "info",
+              title: `Stage ${currentStage}% payout already executed`,
+              body: `Stage ${currentStage}% ($${milestoneUsdc} USDC) has already been dispatched. Next release at ${currentStage >= 100 ? "completion" : `${currentStage + 25}%`}.`,
+            });
+            return { ok: true, title: "Already executed" };
+          }
+
+          const payoutRail = (typeof window !== "undefined" && localStorage.getItem(`conpi_seller_payout_rail_${dealId}`)) || "solana";
+          const payoutAddr = (typeof window !== "undefined" && localStorage.getItem(`conpi_seller_payout_addr_${dealId}`)) || "DeEpqiydVZLN7xoFvD6ARyW6bjgum9UUdpK5wWA7UftN";
+
+          pushToast({ kind: "pending", title: `Dispatching Conpi Maker Vault Stage ${currentStage}% payout ($${milestoneUsdc} USDC)...` });
+
+          try {
+            const payoutRes = await fetch("/api/vault/payout", {
+              method: "POST",
+              headers: { "Content-Type": "application/json" },
+              body: JSON.stringify({
+                dealId: Number(dealId),
+                recipientAddress: payoutAddr,
+                payoutChain: payoutRail,
+                amountUsdc: milestoneUsdc,
+                memo: `Stage ${currentStage}% Milestone Payout for Deal #${dealId}`,
+              }),
+            });
+            const payoutData = await payoutRes.json();
+            if (!payoutData.ok) {
+              throw new Error(payoutData.error || "Vault payout dispatch failed");
+            }
+
+            patchDeal(dealId, (item) => ({
+              ...item,
+              releasedUsd: Number(((item.releasedUsd || 0) + milestoneUsdc).toFixed(4)),
+              lastUpdate: `Vault Payout (${new Date().toLocaleTimeString()})`,
+            }));
+
+            pushToast({
+              kind: "success",
+              title: `Stage ${currentStage}% Payout Executed!`,
+              body: `Transferred $${milestoneUsdc.toFixed(4)} USDC to ${payoutRail.toUpperCase()} wallet: ${payoutAddr.slice(0, 8)}... (${payoutData.txHash?.slice(0, 10)}...)`,
+            });
+            return {
+              ok: true,
+              title: `Stage ${currentStage}% Released`,
+              body: `Tx: ${payoutData.txHash}`,
+            };
+          } catch (err: any) {
+            pushToast({ kind: "error", title: "Stage release failed", body: err.message });
+            return { ok: false, title: "Stage release failed", body: err.message };
+          }
+        }
+
         pushToast({ kind: "pending", title: "Querying TEE stage payloads..." });
 
         try {
@@ -1349,10 +2420,15 @@ export function Providers({ children }: { children: React.ReactNode }) {
           });
 
           if (stagePayloads.length === 0) {
-            const mRes = await fetch(`${BASE_URL}/deals/${dealId}/meter`);
-            const mData = mRes.ok ? await mRes.json() : null;
+            let mData: any = null;
+            try {
+              let mRes = await fetch(`${BASE_URL}/deals/${dealId}/meter`);
+              if (!mRes.ok) mRes = await fetch(`/api/vault/meter?dealId=${dealId}`);
+              if (!mRes.ok) mRes = await fetch(`http://localhost:4000/v1/deals/${dealId}/meter`);
+              if (mRes.ok) mData = await mRes.json();
+            } catch {}
             const used = Number(mData?.usedUsd ?? deal.usedUsd ?? 0);
-            const creditUsd = Number(mData?.creditUsd || deal.creditUsd || (deal.token === "NEAR" ? deal.credit * 4.02 : deal.credit));
+            const creditUsd = Number(mData?.creditUsd || deal.creditUsd || deal.credit);
             const pct = creditUsd > 0 ? ((used / creditUsd) * 100).toFixed(1) : "0.0";
             const target25 = (creditUsd * 0.25).toFixed(4);
             pushToast({
@@ -1367,12 +2443,69 @@ export function Providers({ children }: { children: React.ReactNode }) {
             };
           }
 
-          const target = stagePayloads[0];
+          const target = stagePayloads[stagePayloads.length - 1];
           const stg = Number(target.payload.stage);
           pushToast({ kind: "pending", title: `Submitting on-chain release for Stage ${stg}%...` });
 
-          const outcome: any = await txReleaseStage(Number(dealId), stg, target.payload, target.signatureHex);
-          const txHash = outcome?.transaction?.hash || outcome?.transaction_outcome?.id;
+          let txHash: string;
+          const onChainForeign = await fetchContractForeignDeal(Number(dealId));
+          if (onChainForeign) {
+            const foreignAmount = BigInt(onChainForeign.foreign_amount || "0");
+            const stageDelta = BigInt(stg) - BigInt(deal.stage || 0);
+            const payoutAmount = (stageDelta * foreignAmount) / BigInt(100);
+            const { sighashBytes, sighash } = computeForeignTransferSighash({
+              recipient: onChainForeign.seller_address,
+              amountAtomic: payoutAmount,
+              nonce: Number(onChainForeign.evm_nonce || 0),
+              tokenAddress: onChainForeign.token_address,
+              chainId: Number(onChainForeign.chain_id || BASE_SEPOLIA_CHAIN_ID),
+            });
+            const outcome: any = await txReleaseStageForeign(
+              Number(dealId),
+              stg,
+              target.payload,
+              target.signatureHex,
+              {
+                nonce: Number(onChainForeign.evm_nonce || 0),
+                recipient: onChainForeign.seller_address,
+                amount: payoutAmount.toString(),
+                sighash: sighashBytes,
+              }
+            );
+            txHash = outcome?.transaction?.hash || outcome?.transaction_outcome?.id;
+
+            // Auto-broadcast via TEE
+            const receipts = outcome?.receipts_outcome || [];
+            for (const r of receipts) {
+              for (const log of (r?.outcome?.logs || [])) {
+                if (typeof log === "string" && log.startsWith("EVENT_JSON:")) {
+                  try {
+                    const parsed = JSON.parse(log.slice("EVENT_JSON:".length));
+                    const ev = (parsed.standard === "conpi" && parsed.event === "foreign_tx_signed" ? (parsed.data?.[0] || parsed.data) : null)
+                      || (parsed.standard === "foreign_tx_signed" ? parsed.event : null)
+                      || (parsed.event === "foreign_tx_signed" ? (parsed.data?.[0] || parsed.data) : null);
+                    if (ev) {
+                      teeApi.broadcastPayout({
+                        dealId: Number(dealId),
+                        stage: Number(ev.stage || stg),
+                        chainId: Number(ev.chain_id || BASE_SEPOLIA_CHAIN_ID),
+                        recipient: ev.recipient || onChainForeign.seller_address,
+                        amountAtomic: String(ev.amount || payoutAmount.toString()),
+                        sighashHex: (ev.sighash_hex?.startsWith("0x") ? ev.sighash_hex : `0x${ev.sighash_hex}`) || sighash,
+                        rHex: ev.r_hex,
+                        sHex: ev.s_hex,
+                        recoveryId: Number(ev.recovery_id),
+                        nonce: Number(onChainForeign.evm_nonce || 0),
+                      }).catch(() => {});
+                    }
+                  } catch {}
+                }
+              }
+            }
+          } else {
+            const outcome: any = await txReleaseStage(Number(dealId), stg, target.payload, target.signatureHex);
+            txHash = outcome?.transaction?.hash || outcome?.transaction_outcome?.id;
+          }
           if (!txHash) throw new Error("Stage release transaction failed");
 
           setTimeout(loadOnChainData, 2000);
@@ -1436,12 +2569,78 @@ export function Providers({ children }: { children: React.ReactNode }) {
           }
 
           pushToast({ kind: "pending", title: "Submitting default settlement on NEAR..." });
-          const outcome: any = await txSettleDefault(
-            Number(dealId),
-            payloadToSubmit,
-            signatureHexToSubmit
-          );
-          const txHash = outcome?.transaction?.hash || outcome?.transaction_outcome?.id;
+          let txHash: string;
+          const onChainForeign = await fetchContractForeignDeal(Number(dealId));
+          if (onChainForeign) {
+            const onChainDeal = await fetchContractDeal(Number(dealId));
+            const foreignAmount = BigInt(onChainForeign.foreign_amount || "0");
+            let refundAmount = foreignAmount;
+            if (deal.status === "Active" && onChainDeal) {
+              const lastMetered = BigInt(onChainDeal.last_signed?.metered_value || "0");
+              const creditAmount = BigInt(onChainDeal.credit_amount || "1");
+              const fractionBps = creditAmount === BigInt(0) ? BigInt(0) : (lastMetered * BigInt(10000)) / creditAmount;
+              const clampedBps = fractionBps > BigInt(10000) ? BigInt(10000) : fractionBps;
+              const sellerEarned = (clampedBps * foreignAmount) / BigInt(10000);
+              const alreadyReleased = (BigInt(onChainDeal.stage_reached || 0) * foreignAmount) / BigInt(100);
+              const effectiveTaken = sellerEarned > alreadyReleased ? sellerEarned : alreadyReleased;
+              refundAmount = foreignAmount > effectiveTaken ? foreignAmount - effectiveTaken : BigInt(0);
+            }
+            const { sighashBytes, sighash } = computeForeignTransferSighash({
+              recipient: onChainForeign.buyer_address,
+              amountAtomic: refundAmount,
+              nonce: Number(onChainForeign.evm_nonce || 0),
+              tokenAddress: onChainForeign.token_address,
+              chainId: Number(onChainForeign.chain_id || BASE_SEPOLIA_CHAIN_ID),
+            });
+            const outcome: any = await txSettleDefaultForeign(
+              Number(dealId),
+              payloadToSubmit,
+              signatureHexToSubmit,
+              {
+                nonce: Number(onChainForeign.evm_nonce || 0),
+                recipient: onChainForeign.buyer_address,
+                amount: refundAmount.toString(),
+                sighash: sighashBytes,
+              }
+            );
+            txHash = outcome?.transaction?.hash || outcome?.transaction_outcome?.id;
+
+            // Auto-broadcast via TEE
+            const receipts = outcome?.receipts_outcome || [];
+            for (const r of receipts) {
+              for (const log of (r?.outcome?.logs || [])) {
+                if (typeof log === "string" && log.startsWith("EVENT_JSON:")) {
+                  try {
+                    const parsed = JSON.parse(log.slice("EVENT_JSON:".length));
+                    const ev = (parsed.standard === "conpi" && parsed.event === "foreign_tx_signed" ? (parsed.data?.[0] || parsed.data) : null)
+                      || (parsed.standard === "foreign_tx_signed" ? parsed.event : null)
+                      || (parsed.event === "foreign_tx_signed" ? (parsed.data?.[0] || parsed.data) : null);
+                    if (ev) {
+                      teeApi.broadcastPayout({
+                        dealId: Number(dealId),
+                        stage: Number(ev.stage || 0),
+                        chainId: Number(ev.chain_id || BASE_SEPOLIA_CHAIN_ID),
+                        recipient: ev.recipient || onChainForeign.buyer_address,
+                        amountAtomic: String(ev.amount || refundAmount.toString()),
+                        sighashHex: (ev.sighash_hex?.startsWith("0x") ? ev.sighash_hex : `0x${ev.sighash_hex}`) || sighash,
+                        rHex: ev.r_hex,
+                        sHex: ev.s_hex,
+                        recoveryId: Number(ev.recovery_id),
+                        nonce: Number(onChainForeign.evm_nonce || 0),
+                      }).catch(() => {});
+                    }
+                  } catch {}
+                }
+              }
+            }
+          } else {
+            const outcome: any = await txSettleDefault(
+              Number(dealId),
+              payloadToSubmit,
+              signatureHexToSubmit
+            );
+            txHash = outcome?.transaction?.hash || outcome?.transaction_outcome?.id;
+          }
           if (!txHash) throw new Error("Default settlement transaction failed");
 
           setTimeout(loadOnChainData, 2000);
@@ -1455,60 +2654,132 @@ export function Providers({ children }: { children: React.ReactNode }) {
           return { ok: false, title: "Default settlement failed", body: err.message };
         }
       },
-      syncMeterState: async (dealId) => {
+      syncMeterState: async (dealId, silent = false) => {
         const deal = stateRef.current.deals.find((item) => item.id === dealId);
         if (!deal?.proxyKey) {
-          pushToast({ kind: "error", title: "Proxy key required", body: "Import or copy this deal's cpk_live_ key to view its private meter." });
+          if (!silent) {
+            pushToast({ kind: "error", title: "Proxy key required", body: "Import or copy this deal's cpk_live_ key to view its private meter." });
+          }
           return;
         }
-        try {
-          const res = await fetch(`${BASE_URL}/deals/${dealId}/meter`, {
-            headers: { Authorization: `Bearer ${deal.proxyKey}` },
-            cache: "no-store",
-          });
-          if (res.ok) {
-            const data = await res.json();
-            if (typeof window !== "undefined" && data.lockedPricing) {
-              try {
-                localStorage.setItem(`conpi:locked_pricing_${dealId}`, JSON.stringify(data.lockedPricing));
-              } catch {}
-            }
-            patchDeal(dealId, (item) => {
-              const creditUsd = Number(data.creditUsd) || item.creditUsd || (item.token === "NEAR" ? item.credit * 4.02 : item.credit);
-              const priceUsd = Number(data.priceUsd) || item.priceUsd || (item.token === "NEAR" ? item.price * 4.02 : item.price);
-              const usedUsd = Number(data.usedUsd ?? item.usedUsd);
-              const tokens = Number(data.tokensTotal ?? item.tokens);
-              const stage = creditUsd > 0 ? Math.min(100, Math.floor((usedUsd / creditUsd) * 100)) : item.stage;
-              const lockedPriceRows = priceRowsFromLockedPricing(data.lockedPricing);
-              return {
-                ...item,
-                provider: (data.provider || item.provider) as Deal["provider"],
-                model: data.model || item.model,
-                models: Array.isArray(data.models) && data.models.length ? data.models : item.models,
-                usedUsd,
-                tokens,
-                creditUsd,
-                priceUsd,
-                stage,
-                prices: lockedPriceRows.length ? lockedPriceRows : item.prices,
-                pricingSnapshotHash: data.pricingSnapshotHash || item.pricingSnapshotHash,
-                usageReceiptCount: Number(data.usageReceiptCount ?? item.usageReceiptCount ?? 0),
-                lastUsageReceipt: data.lastUsageReceipt ?? item.lastUsageReceipt ?? null,
-                lastUpdate: `TEE Enclave (${new Date().toLocaleTimeString()})`,
-                heartbeat: data.active ? "live" : item.heartbeat,
-              };
+
+        const endpoints = (deal.baseUrl?.includes("localhost") || (deal as any).active_vault_deal)
+          ? [
+              `/api/vault/meter?dealId=${dealId}`,
+              `http://localhost:4000/v1/deals/${dealId}/meter`,
+              `${BASE_URL}/deals/${dealId}/meter`,
+            ]
+          : [
+              `${BASE_URL}/deals/${dealId}/meter`,
+              `/api/vault/meter?dealId=${dealId}`,
+              `http://localhost:4000/v1/deals/${dealId}/meter`,
+            ];
+
+        let data: any = null;
+        let lastStatus = 0;
+
+        for (const url of endpoints) {
+          try {
+            const res = await fetch(url, {
+              headers: { Authorization: `Bearer ${deal.proxyKey}` },
+              cache: "no-store",
             });
+            if (res.ok) {
+              data = await res.json();
+              break;
+            } else {
+              lastStatus = res.status;
+            }
+          } catch {}
+        }
+
+        if (data) {
+          if (typeof window !== "undefined" && data.lockedPricing) {
+            try {
+              localStorage.setItem(`conpi:locked_pricing_${dealId}`, JSON.stringify(data.lockedPricing));
+            } catch {}
+          }
+          patchDeal(dealId, (item) => {
+            const creditUsd = Number(data.creditUsd) || item.creditUsd || item.credit;
+            const priceUsd = Number(data.priceUsd) || item.priceUsd || item.price;
+            const usedUsd = Number(data.usedUsd ?? item.usedUsd);
+            const tokens = Number(data.tokensTotal ?? item.tokens);
+            const stage = creditUsd > 0 ? Math.min(100, Math.floor((usedUsd / creditUsd) * 100)) : item.stage;
+            const lockedPriceRows = priceRowsFromLockedPricing(data.lockedPricing);
+            return {
+              ...item,
+              provider: (data.provider || item.provider) as Deal["provider"],
+              model: data.model || item.model,
+              models: Array.isArray(data.models) && data.models.length ? data.models : item.models,
+              usedUsd,
+              tokens,
+              creditUsd,
+              priceUsd,
+              stage,
+              prices: lockedPriceRows.length ? lockedPriceRows : item.prices,
+              pricingSnapshotHash: data.pricingSnapshotHash || item.pricingSnapshotHash,
+              usageReceiptCount: Number(data.usageReceiptCount ?? item.usageReceiptCount ?? 0),
+              lastUsageReceipt: data.lastUsageReceipt ?? item.lastUsageReceipt ?? null,
+              lastUpdate: `TEE Enclave (${new Date().toLocaleTimeString()})`,
+              heartbeat: data.active ? "live" : item.heartbeat,
+            };
+          });
+
+          // Automatic Milestone Payout Dispatch for Maker Vault deals (25%, 50%, 75%, 100%)
+          const stageVal = Number(data.creditUsd) > 0 ? Math.min(100, Math.floor((Number(data.usedUsd || 0) / Number(data.creditUsd)) * 100)) : deal.stage;
+          if (stageVal >= 25 && ((deal as any).active_vault_deal || deal.baseUrl?.includes("localhost"))) {
+            const maxStagesOwed = Math.floor(stageVal / 25);
+            fetch(`/api/vault/payout?dealId=${dealId}`)
+              .then((r) => r.json())
+              .then(async (pData) => {
+                const paid = (pData.payouts || []).filter((p: any) => !p.isRefund);
+                if (paid.length < maxStagesOwed) {
+                  const targetStage = (paid.length + 1) * 25;
+                  const unitPrice = Number(data.priceUsd) || deal.priceUsd || deal.price || 0.04;
+                  const milestoneUsdc = Number((unitPrice * 0.25).toFixed(4));
+                  const payoutRail = (typeof window !== "undefined" && localStorage.getItem(`conpi_seller_payout_rail_${dealId}`)) || "solana";
+                  const payoutAddr = (typeof window !== "undefined" && localStorage.getItem(`conpi_seller_payout_addr_${dealId}`)) || "DeEpqiydVZLN7xoFvD6ARyW6bjgum9UUdpK5wWA7UftN";
+
+                  const autoRes = await fetch("/api/vault/payout", {
+                    method: "POST",
+                    headers: { "Content-Type": "application/json" },
+                    body: JSON.stringify({
+                      dealId: Number(dealId),
+                      recipientAddress: payoutAddr,
+                      payoutChain: payoutRail,
+                      amountUsdc: milestoneUsdc,
+                      memo: `Stage ${targetStage}% Auto-Release for Deal #${dealId}`,
+                    }),
+                  });
+                  const autoData = await autoRes.json();
+                  if (autoData.ok) {
+                    patchDeal(dealId, (item) => ({
+                      ...item,
+                      releasedUsd: Number(((item.releasedUsd || 0) + milestoneUsdc).toFixed(4)),
+                      lastUpdate: `Auto Payout (${new Date().toLocaleTimeString()})`,
+                    }));
+                    pushToast({
+                      kind: "success",
+                      title: `Stage ${targetStage}% Auto-Released!`,
+                      body: `Transferred $${milestoneUsdc.toFixed(4)} USDC to ${payoutRail.toUpperCase()} wallet: ${payoutAddr.slice(0, 8)}... (${autoData.txHash?.slice(0, 10)}...)`,
+                    });
+                  }
+                }
+              })
+              .catch(() => {});
+          }
+
+          if (!silent) {
             pushToast({
               kind: "success",
               title: "Meter synced with TEE enclave",
               body: `$${Number(data.usedUsd || 0).toFixed(4)} USD · ${Number(data.tokensTotal || 0).toLocaleString()} tokens`,
             });
-          } else {
-            pushToast({ kind: "error", title: "Failed to sync meter", body: `Enclave returned HTTP ${res.status}` });
           }
-        } catch (err: any) {
-          console.warn("Meter sync error:", err);
-          pushToast({ kind: "error", title: "Meter sync failed", body: err.message });
+        } else {
+          if (!silent) {
+            pushToast({ kind: "error", title: "Failed to sync meter", body: lastStatus ? `Enclave returned HTTP ${lastStatus}` : "Enclave unavailable" });
+          }
         }
       },
       importProxyKey: async (dealId, candidate) => {
@@ -1518,12 +2789,25 @@ export function Providers({ children }: { children: React.ReactNode }) {
           return false;
         }
         try {
-          await teeApi.getMeter(Number(dealId), proxyKey);
+          const meterData = await teeApi.getMeter(Number(dealId), proxyKey);
           const raw = localStorage.getItem("conpi:deal_keys");
           const stored = raw ? JSON.parse(raw) : {};
           stored[String(dealId)] = proxyKey;
           localStorage.setItem("conpi:deal_keys", JSON.stringify(stored));
-          patchDeal(dealId, (deal) => ({ ...deal, proxyKey, heartbeat: "live" }));
+          patchDeal(dealId, (deal) => {
+            const creditUsd = Number(meterData?.creditUsd) || deal.creditUsd || deal.credit;
+            const usedUsd = Number(meterData?.usedUsd ?? deal.usedUsd);
+            const tokens = Number(meterData?.tokensTotal ?? deal.tokens);
+            const stage = creditUsd > 0 ? Math.min(100, Math.floor((usedUsd / creditUsd) * 100)) : deal.stage;
+            return {
+              ...deal,
+              proxyKey,
+              heartbeat: "live",
+              usedUsd,
+              tokens,
+              stage,
+            };
+          });
           pushToast({ kind: "success", title: "Private live meter connected", body: "Authenticated WebSocket updates are now enabled for this browser." });
           return true;
         } catch (err: any) {
@@ -1533,8 +2817,8 @@ export function Providers({ children }: { children: React.ReactNode }) {
       },
       applyMeterEvent: (dealId, event) => {
         patchDeal(dealId, (deal) => {
-          const creditUsd = Number(event.creditUsd) || deal.creditUsd || (deal.token === "NEAR" ? deal.credit * 4.02 : deal.credit);
-          const priceUsd = Number(event.priceUsd) || deal.priceUsd || (deal.token === "NEAR" ? deal.price * 4.02 : deal.price);
+          const creditUsd = Number(event.creditUsd) || deal.creditUsd || deal.credit;
+          const priceUsd = Number(event.priceUsd) || deal.priceUsd || deal.price;
           const stage = creditUsd > 0 ? Math.max(deal.stage, ...event.stages, Math.min(100, Math.floor((event.usedUsd / creditUsd) * 100))) : deal.stage;
           const lockedPriceRows = priceRowsFromLockedPricing(event.lockedPricing);
           return {
@@ -1562,14 +2846,14 @@ export function Providers({ children }: { children: React.ReactNode }) {
         const current = stateRef.current;
         if (!current.account) return { ok: false, title: "Connect a wallet to claim" };
         try {
-          const outcome: any = await txClaim(null);
+          const outcome: any = await txClaim(MAKER_VAULT_CONFIG.near.tokenAddress);
           const txHash = outcome?.transaction?.hash || outcome?.transaction_outcome?.id;
           if (!txHash) throw new Error("Claim transaction failed");
           setState((s) => ({
             ...s,
             claims: s.claims.map((item) => (item.id === id ? { ...item, claimed: true, tx: txHash } : item)),
           }));
-          return { ok: true, title: "Payout claimed on-chain", href: `https://testnet.nearblocks.io/txns/${txHash}`, body: "NEAR payout settled to your account." };
+          return { ok: true, title: "Payout claimed on-chain", href: `https://testnet.nearblocks.io/txns/${txHash}`, body: "USDC payout settled to your account." };
         } catch (err: any) {
           return { ok: false, title: "Claim transaction failed", body: err.message };
         }
@@ -1578,7 +2862,7 @@ export function Providers({ children }: { children: React.ReactNode }) {
         const current = stateRef.current;
         if (!current.account) return { ok: false, title: "Connect a wallet to claim" };
         try {
-          const outcome: any = await txClaim(null);
+          const outcome: any = await txClaim(MAKER_VAULT_CONFIG.near.tokenAddress);
           const txHash = outcome?.transaction?.hash || outcome?.transaction_outcome?.id;
           if (!txHash) throw new Error("Batch claim transaction failed");
           setState((s) => ({
@@ -1592,15 +2876,18 @@ export function Providers({ children }: { children: React.ReactNode }) {
       },
       createListing: async (listing) => {
         const current = stateRef.current;
-        if (!current.account) return { ok: false, title: "Connect a wallet first" };
-        if (listing.seller.trim().toLowerCase() !== current.account.trim().toLowerCase()) {
+        const activeAccount = current.account || current.nearAccount || current.evmAccount || current.solanaAccount;
+        if (!activeAccount) return { ok: false, title: "Connect a wallet first" };
+        if (listing.seller && listing.seller.trim().toLowerCase() !== activeAccount.trim().toLowerCase()) {
           return { ok: false, title: "Listing owner mismatch", body: "The connected seller wallet must own the listing." };
         }
 
         const buyer = (listing as any).buyer?.trim();
         // If buyer is explicitly provided and different from seller, create direct deal on-chain
         if (buyer) {
-          if (buyer.toLowerCase() === current.account.toLowerCase()) {
+          const nearBuyer = toNearAccountId(buyer);
+          const nearSeller = toNearAccountId(activeAccount);
+          if (nearBuyer.toLowerCase() === nearSeller.toLowerCase()) {
             return {
               ok: false,
               title: "Buyer and seller must differ",
@@ -1610,14 +2897,14 @@ export function Providers({ children }: { children: React.ReactNode }) {
 
           pushToast({ kind: "pending", title: "Awaiting wallet approval to create deal on NEAR..." });
           try {
-            const params = await dealParamsForListing(listing, buyer, current.account);
+            const params = await dealParamsForListing(listing, buyer, activeAccount);
             const outcome: any = await txCreateDeal(params);
             const txHash = outcome?.transaction?.hash || outcome?.transaction_outcome?.id;
             let dealId = createdDealIdFromOutcome(outcome);
             if (!dealId) {
               await new Promise((r) => setTimeout(r, 1500));
               const deals = await fetchContractDeals(0, 100);
-              const latest = deals.filter((d) => d.buyer === buyer && d.seller === current.account).sort((a, b) => Number(b.id) - Number(a.id))[0];
+              const latest = deals.filter((d) => d.buyer === nearBuyer && d.seller === nearSeller).sort((a, b) => Number(b.id) - Number(a.id))[0];
               if (latest) dealId = Number(latest.id);
             }
 
@@ -1628,7 +2915,27 @@ export function Providers({ children }: { children: React.ReactNode }) {
                 ...s,
                 listings: [boundListing, ...s.listings.filter((item) => item.id !== listing.id)],
               }));
-              await teeApi.initTicket(String(dealId), Number(dealId), buyer, current.account, createdTermsHashHex);
+              await teeApi.initTicket(String(dealId), Number(dealId), buyer, activeAccount, createdTermsHashHex);
+
+              if (listing.token === "USDC" || (listing.token as any) === "USDC.base") {
+                try {
+                  const vault = deriveForeignVaultAddress(CONTRACT_ID, Number(dealId));
+                  const foreignAmount = Math.round(listing.price * 1e6).toString();
+                  const savedSellerEvm = typeof window !== "undefined" ? (localStorage.getItem(`conpi_seller_evm_${dealId}`) || localStorage.getItem("conpi_last_seller_evm") || "0x0000000000000000000000000000000000000000") : "0x0000000000000000000000000000000000000000";
+                  console.log(`[createListing] Auto-registering foreign deal #${dealId} on Base Sepolia... Vault: ${vault.address}`);
+                  await txRegisterForeignChainDeal(
+                    Number(dealId),
+                    BASE_SEPOLIA_CHAIN_ID,
+                    vault.address,
+                    BASE_SEPOLIA_USDC,
+                    buyer.startsWith("0x") ? buyer : "0x0000000000000000000000000000000000000000",
+                    savedSellerEvm,
+                    foreignAmount
+                  );
+                } catch (fErr) {
+                  console.warn("[createListing] Auto-register foreign chain deal failed or already registered:", fErr);
+                }
+              }
             }
 
             setTimeout(loadOnChainData, 2000);
@@ -1645,7 +2952,7 @@ export function Providers({ children }: { children: React.ReactNode }) {
         }
 
         // Public marketplace listing - NO specific buyer needed!
-        const publishedListing: Listing = withExplicitListingUsd({ ...listing, seller: current.account, published: true });
+        const publishedListing: Listing = withExplicitListingUsd({ ...listing, seller: activeAccount, published: true });
         setState((s) => ({ ...s, listings: [publishedListing, ...s.listings.filter((item) => item.id !== listing.id)] }));
         try {
           const saved = JSON.parse(localStorage.getItem(PUBLISHED_LISTINGS_KEY) || "[]");
@@ -1694,13 +3001,295 @@ export function Providers({ children }: { children: React.ReactNode }) {
         const deal = stateRef.current.deals.find((item) => item.id === dealId);
         if (!deal) return { ok: false, title: "Deal not found" };
         try {
-          const outcome: any = await signAndSendCall("timeout_refund", { deal_id: Number(dealId) }, "50000000000000");
-          const txHash = outcome?.transaction?.hash || outcome?.transaction_outcome?.id;
+          const onChainForeign = await fetchContractForeignDeal(Number(dealId));
+          let txHash: string;
+          if (onChainForeign) {
+            const onChainDeal = await fetchContractDeal(Number(dealId));
+            const foreignAmount = BigInt(onChainForeign.foreign_amount || "0");
+            let refundAmount = foreignAmount;
+            if (deal.status === "Active" && onChainDeal) {
+              const lastMetered = BigInt(onChainDeal.last_signed?.metered_value || "0");
+              const creditAmount = BigInt(onChainDeal.credit_amount || "1");
+              const fractionBps = creditAmount === BigInt(0) ? BigInt(0) : (lastMetered * BigInt(10000)) / creditAmount;
+              const clampedBps = fractionBps > BigInt(10000) ? BigInt(10000) : fractionBps;
+              const sellerEarned = (clampedBps * foreignAmount) / BigInt(10000);
+              const alreadyReleased = (BigInt(onChainDeal.stage_reached || 0) * foreignAmount) / BigInt(100);
+              const effectiveTaken = sellerEarned > alreadyReleased ? sellerEarned : alreadyReleased;
+              refundAmount = foreignAmount > effectiveTaken ? foreignAmount - effectiveTaken : BigInt(0);
+            }
+            const { sighashBytes, sighash: sighashHex } = computeForeignTransferSighash({
+              recipient: onChainForeign.buyer_address,
+              amountAtomic: refundAmount,
+              nonce: Number(onChainForeign.evm_nonce || 0),
+              tokenAddress: onChainForeign.token_address,
+              chainId: Number(onChainForeign.chain_id || BASE_SEPOLIA_CHAIN_ID),
+            });
+            const outcome: any = await txTimeoutRefundForeign(Number(dealId), {
+              nonce: Number(onChainForeign.evm_nonce || 0),
+              recipient: onChainForeign.buyer_address,
+              amount: refundAmount.toString(),
+              sighash: sighashBytes,
+            });
+            txHash = outcome?.transaction?.hash || outcome?.transaction_outcome?.id;
+
+            // Auto-broadcast payout signature to Base Sepolia via enclave relayer
+            const receipts = outcome?.receipts_outcome || [];
+            for (const r of receipts) {
+              for (const log of (r?.outcome?.logs || [])) {
+                if (typeof log === "string" && log.startsWith("EVENT_JSON:")) {
+                  try {
+                    const parsed = JSON.parse(log.slice("EVENT_JSON:".length));
+                    const ev = (parsed.standard === "conpi" && parsed.event === "foreign_tx_signed" ? (parsed.data?.[0] || parsed.data) : null)
+                      || (parsed.standard === "foreign_tx_signed" ? parsed.event : null)
+                      || (parsed.event === "foreign_tx_signed" ? (parsed.data?.[0] || parsed.data) : null);
+                    if (ev) {
+                      teeApi.broadcastPayout({
+                        dealId: Number(dealId),
+                        stage: Number(ev.stage || 0),
+                        chainId: Number(ev.chain_id || BASE_SEPOLIA_CHAIN_ID),
+                        recipient: ev.recipient || onChainForeign.buyer_address,
+                        amountAtomic: String(ev.amount || refundAmount.toString()),
+                        sighashHex: (ev.sighash_hex?.startsWith("0x") ? ev.sighash_hex : `0x${ev.sighash_hex}`) || sighashHex,
+                        rHex: ev.r_hex,
+                        sHex: ev.s_hex,
+                        recoveryId: Number(ev.recovery_id),
+                        nonce: Number(onChainForeign.evm_nonce || 0),
+                      }).catch(() => {});
+                    }
+                  } catch {}
+                }
+              }
+            }
+          } else {
+            const outcome: any = await signAndSendCall("timeout_refund", { deal_id: Number(dealId) }, "50000000000000");
+            txHash = outcome?.transaction?.hash || outcome?.transaction_outcome?.id;
+          }
           if (!txHash) throw new Error("Timeout refund transaction failed");
           setTimeout(loadOnChainData, 2000);
           return { ok: true, title: "Deal refunded on NEAR", href: `https://testnet.nearblocks.io/txns/${txHash}`, body: "Timeout refund executed." };
         } catch (err: any) {
           return { ok: false, title: "Timeout refund failed", body: err.message };
+        }
+      },
+      claimSellerForeignPayout: async (dealId) => {
+        const deal = stateRef.current.deals.find((item) => item.id === dealId);
+        if (!deal) return { ok: false, title: "Deal not found" };
+        try {
+          const onChainForeign = await fetchContractForeignDeal(Number(dealId));
+          if (!onChainForeign) throw new Error("Not a registered foreign deal");
+          const onChainDeal = await fetchContractDeal(Number(dealId));
+          const foreignAmount = BigInt(onChainForeign.foreign_amount || "0");
+          const lastMetered = BigInt(onChainDeal?.last_signed?.metered_value || "0");
+          const creditAmount = BigInt(onChainDeal?.credit_amount || "1");
+          const isCompleted = onChainDeal?.status === "Completed";
+          const foreignReleasedAlready = Number(onChainForeign.evm_nonce || 0) === 0
+            ? BigInt(0)
+            : (BigInt(onChainDeal?.stage_reached || 0) * foreignAmount) / BigInt(100);
+          const fractionBps = isCompleted
+            ? BigInt(10000)
+            : (creditAmount === BigInt(0) ? BigInt(0) : (lastMetered * BigInt(10000)) / creditAmount);
+          const clampedBps = fractionBps > BigInt(10000) ? BigInt(10000) : fractionBps;
+          const sellerEarned = (clampedBps * foreignAmount) / BigInt(10000);
+          const sellerOwed = sellerEarned > foreignReleasedAlready ? sellerEarned - foreignReleasedAlready : BigInt(0);
+          if (sellerOwed === BigInt(0)) throw new Error("No remaining foreign payout owed to seller");
+
+          const { sighashBytes, sighash: sighashHex } = computeForeignTransferSighash({
+            recipient: onChainForeign.seller_address,
+            amountAtomic: sellerOwed,
+            nonce: Number(onChainForeign.evm_nonce || 0),
+            tokenAddress: onChainForeign.token_address,
+            chainId: Number(onChainForeign.chain_id || BASE_SEPOLIA_CHAIN_ID),
+          });
+
+          const outcome: any = await txClaimSellerForeignPayout(Number(dealId), {
+            nonce: Number(onChainForeign.evm_nonce || 0),
+            recipient: onChainForeign.seller_address,
+            amount: sellerOwed.toString(),
+            sighash: sighashBytes,
+          });
+          const txHash = outcome?.transaction?.hash || outcome?.transaction_outcome?.id;
+          if (!txHash) throw new Error("Claim seller foreign payout transaction failed");
+
+          // Auto-broadcast payout signature to Base Sepolia via enclave relayer
+          const receipts = outcome?.receipts_outcome || [];
+          for (const r of receipts) {
+            for (const log of (r?.outcome?.logs || [])) {
+              if (typeof log === "string" && log.startsWith("EVENT_JSON:")) {
+                try {
+                  const parsed = JSON.parse(log.slice("EVENT_JSON:".length));
+                  const ev = (parsed.standard === "conpi" && parsed.event === "foreign_tx_signed" ? (parsed.data?.[0] || parsed.data) : null)
+                    || (parsed.standard === "foreign_tx_signed" ? parsed.event : null)
+                    || (parsed.event === "foreign_tx_signed" ? (parsed.data?.[0] || parsed.data) : null);
+                  if (ev) {
+                    teeApi.broadcastPayout({
+                      dealId: Number(dealId),
+                      stage: Number(ev.stage || 0),
+                      chainId: Number(ev.chain_id || BASE_SEPOLIA_CHAIN_ID),
+                      recipient: ev.recipient || onChainForeign.seller_address,
+                      amountAtomic: String(ev.amount || sellerOwed.toString()),
+                      sighashHex: (ev.sighash_hex?.startsWith("0x") ? ev.sighash_hex : `0x${ev.sighash_hex}`) || sighashHex,
+                      rHex: ev.r_hex,
+                      sHex: ev.s_hex,
+                      recoveryId: Number(ev.recovery_id),
+                      nonce: Number(onChainForeign.evm_nonce || 0),
+                    }).catch(() => {});
+                  }
+                } catch {}
+              }
+            }
+          }
+
+          setTimeout(loadOnChainData, 2000);
+          return { ok: true, title: "Seller payout initiated on Base Sepolia", href: `https://testnet.nearblocks.io/txns/${txHash}`, body: "MPC signature requested." };
+        } catch (err: any) {
+          return { ok: false, title: "Claim failed", body: err.message };
+        }
+      },
+      setForeignSellerAddress: async (dealId, sellerAddress) => {
+        try {
+          if (typeof window !== "undefined") {
+            try {
+              localStorage.setItem(`conpi_seller_evm_${dealId}`, sellerAddress);
+            } catch {}
+          }
+          let outcome: any;
+          try {
+            outcome = await txSetForeignSellerAddress(Number(dealId), sellerAddress);
+          } catch (err: any) {
+            // Fallback: If foreign parameters not registered yet on contract, register them
+            const vault = deriveForeignVaultAddress(CONTRACT_ID, Number(dealId)).address;
+            const deal = stateRef.current.deals.find((d) => d.id === dealId);
+            const expectedAmount = deal?.priceUsd ? Math.round(deal.priceUsd * 1_000_000).toString() : "40000";
+            outcome = await txRegisterForeignChainDeal(
+              Number(dealId),
+              BASE_SEPOLIA_CHAIN_ID,
+              vault,
+              BASE_SEPOLIA_USDC,
+              "0x0000000000000000000000000000000000000000",
+              sellerAddress,
+              expectedAmount
+            );
+          }
+          const txHash = outcome?.transaction?.hash || outcome?.transaction_outcome?.id;
+          if (!txHash) throw new Error("Set foreign seller address transaction failed");
+          setTimeout(loadOnChainData, 2000);
+          return { ok: true, title: "Seller EVM address updated", href: `https://testnet.nearblocks.io/txns/${txHash}`, body: sellerAddress };
+        } catch (err: any) {
+          return { ok: false, title: "Update address failed", body: err.message };
+        }
+      },
+      setForeignBuyerAddress: async (dealId, buyerAddress) => {
+        try {
+          if (typeof window !== "undefined") {
+            try {
+              localStorage.setItem(`conpi_buyer_evm_${dealId}`, buyerAddress);
+            } catch {}
+          }
+          const outcome: any = await txSetForeignBuyerAddress(Number(dealId), buyerAddress);
+          const txHash = outcome?.transaction?.hash || outcome?.transaction_outcome?.id;
+          if (!txHash) throw new Error("Set foreign buyer address transaction failed");
+          setTimeout(loadOnChainData, 2000);
+          return { ok: true, title: "Buyer EVM refund address updated", href: `https://testnet.nearblocks.io/txns/${txHash}`, body: buyerAddress };
+        } catch (err: any) {
+          return { ok: false, title: "Update address failed", body: err.message };
+        }
+      },
+      requestAutoRelease: async (dealId) => {
+        try {
+          const outcome: any = await txRequestAutoRelease(Number(dealId));
+          const txHash = outcome?.transaction?.hash || outcome?.transaction_outcome?.id;
+          if (!txHash) throw new Error("Request auto release transaction failed");
+          setTimeout(loadOnChainData, 2000);
+          return { ok: true, title: "Auto-release notice initiated", href: `https://testnet.nearblocks.io/txns/${txHash}`, body: `24-hour notice period active for Deal #${dealId}.` };
+        } catch (err: any) {
+          return { ok: false, title: "Request auto release failed", body: err.message };
+        }
+      },
+      finalizeAutoRelease: async (dealId) => {
+        const deal = stateRef.current.deals.find((item) => item.id === dealId);
+        if (!deal) return { ok: false, title: "Deal not found" };
+
+        try {
+          const onChainForeign = await fetchContractForeignDeal(Number(dealId));
+          let txHash: string;
+          if (onChainForeign) {
+            const foreignAmount = BigInt(onChainForeign.foreign_amount || "0");
+            const alreadyReleased = (BigInt(deal.stage || 0) * foreignAmount) / BigInt(100);
+            const payoutAmount = foreignAmount - alreadyReleased;
+            if (payoutAmount <= BigInt(0)) {
+              return { ok: false, title: "No remaining payout owed" };
+            }
+            const { sighashBytes, sighash } = computeForeignTransferSighash({
+              recipient: onChainForeign.seller_address,
+              amountAtomic: payoutAmount,
+              nonce: Number(onChainForeign.evm_nonce || 0),
+              tokenAddress: onChainForeign.token_address,
+              chainId: Number(onChainForeign.chain_id || BASE_SEPOLIA_CHAIN_ID),
+            });
+            const outcome: any = await txFinalizeAutoReleaseForeign(Number(dealId), {
+              nonce: Number(onChainForeign.evm_nonce || 0),
+              recipient: onChainForeign.seller_address,
+              amount: payoutAmount.toString(),
+              sighash: sighashBytes,
+            });
+            txHash = outcome?.transaction?.hash || outcome?.transaction_outcome?.id;
+
+            // Auto-broadcast payout if event emitted
+            const receipts = outcome?.receipts_outcome || [];
+            for (const r of receipts) {
+              for (const log of (r?.outcome?.logs || [])) {
+                if (typeof log === "string" && log.startsWith("EVENT_JSON:")) {
+                  try {
+                    const parsed = JSON.parse(log.slice("EVENT_JSON:".length));
+                    const ev = (parsed.standard === "conpi" && parsed.event === "foreign_tx_signed" ? (parsed.data?.[0] || parsed.data) : null)
+                      || (parsed.standard === "foreign_tx_signed" ? parsed.event : null)
+                      || (parsed.event === "foreign_tx_signed" ? (parsed.data?.[0] || parsed.data) : null);
+                    if (ev) {
+                      teeApi.broadcastPayout({
+                        dealId: Number(dealId),
+                        stage: 100,
+                        chainId: Number(ev.chain_id || BASE_SEPOLIA_CHAIN_ID),
+                        recipient: ev.recipient || onChainForeign.seller_address,
+                        amountAtomic: String(ev.amount || payoutAmount.toString()),
+                        sighashHex: (ev.sighash_hex?.startsWith("0x") ? ev.sighash_hex : `0x${ev.sighash_hex}`) || sighash,
+                        rHex: ev.r_hex,
+                        sHex: ev.s_hex,
+                        recoveryId: Number(ev.recovery_id ?? 0),
+                        nonce: Number(onChainForeign.evm_nonce || 0),
+                      }).catch((e: any) => console.warn("Relay broadcast notice:", e));
+                    }
+                  } catch {}
+                }
+              }
+            }
+          } else {
+            const outcome: any = await txFinalizeAutoRelease(Number(dealId));
+            txHash = outcome?.transaction?.hash || outcome?.transaction_outcome?.id;
+          }
+
+          if (!txHash) throw new Error("Finalize auto release transaction failed");
+          setTimeout(loadOnChainData, 2000);
+          return { ok: true, title: "Deal auto-released and completed", href: `https://testnet.nearblocks.io/txns/${txHash}`, body: `Deal #${dealId} finalized.` };
+        } catch (err: any) {
+          return { ok: false, title: "Auto release failed", body: err.message };
+        }
+      },
+      confirmForeignDeposit: async (dealId) => {
+        pushToast({ kind: "pending", title: "Confirming Base Sepolia deposit on NEAR..." });
+        try {
+          const outcome: any = await txConfirmForeignDeposit(Number(dealId));
+          const txHash = outcome?.transaction?.hash || outcome?.transaction_outcome?.id;
+          pushToast({
+            kind: "success",
+            title: "Deposit Confirmed on NEAR!",
+            body: "Escrow is 100% funded. Proceeding to Key Activation.",
+            href: txHash ? `https://testnet.nearblocks.io/txns/${txHash}` : undefined,
+          });
+          setTimeout(loadOnChainData, 1500);
+          return { ok: true, title: "Deposit Confirmed", dealId };
+        } catch (err: any) {
+          pushToast({ kind: "error", title: "Confirm deposit failed", body: err.message });
+          return { ok: false, title: "Confirm Failed", body: err.message };
         }
       },
       confirmProposal: (id) => {
@@ -1730,6 +3319,7 @@ export function Providers({ children }: { children: React.ReactNode }) {
       markAllNotices: () => setState((s) => ({ ...s, notices: s.notices.map((notice) => ({ ...notice, read: true })) })),
       clearPulse: (dealId) => patchDeal(dealId, (deal) => ({ ...deal, pulseStage: null })),
       refreshOnChain: loadOnChainData,
+      pushToast,
     };
   }, []);
 

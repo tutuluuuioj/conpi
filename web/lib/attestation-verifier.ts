@@ -26,20 +26,28 @@ export interface AttestationVerificationResult {
   errors: string[];
 }
 
-export async function verifyLiveAttestation(cvmBaseUrl = BASE_URL): Promise<AttestationVerificationResult> {
-  // Generate random 16-byte nonce
-  const nonceBytes = new Uint8Array(16);
-  if (typeof window !== "undefined" && window.crypto) {
-    window.crypto.getRandomValues(nonceBytes);
-  } else {
-    for (let i = 0; i < 16; i++) nonceBytes[i] = Math.floor(Math.random() * 256);
-  }
-  const nonceHex = Array.from(nonceBytes)
-    .map((b) => b.toString(16).padStart(2, "0"))
-    .join("");
+export async function verifyLiveAttestation(
+  cvmBaseUrl = BASE_URL,
+  options: { fresh?: boolean } = {}
+): Promise<AttestationVerificationResult> {
+  let url = typeof window !== "undefined" ? "/api/verify-attestation" : `${cvmBaseUrl}/attestation`;
 
-  // Query server-side verification endpoint
-  const url = typeof window !== "undefined" ? `/api/verify-attestation?nonce=${nonceHex}` : `${cvmBaseUrl}/attestation?nonce=${nonceHex}`;
+  if (options.fresh) {
+    // Generate fresh random 16-byte nonce when explicitly requested
+    const nonceBytes = new Uint8Array(16);
+    if (typeof window !== "undefined" && window.crypto) {
+      window.crypto.getRandomValues(nonceBytes);
+    } else {
+      for (let i = 0; i < 16; i++) nonceBytes[i] = Math.floor(Math.random() * 256);
+    }
+    const nonceHex = Array.from(nonceBytes)
+      .map((b) => b.toString(16).padStart(2, "0"))
+      .join("");
+
+    url = typeof window !== "undefined"
+      ? `/api/verify-attestation?nonce=${nonceHex}&force=true`
+      : `${cvmBaseUrl}/attestation?nonce=${nonceHex}`;
+  }
 
   const res = await fetch(url, { cache: "no-store" });
   if (!res.ok) {

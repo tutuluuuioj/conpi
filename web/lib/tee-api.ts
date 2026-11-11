@@ -1,9 +1,10 @@
 import { CONTRACT_ID } from "./chain";
+import type { SellerKeyAuthorization } from "./seller-key-auth";
 
 const TEE_BASE_URL =
   process.env.NEXT_PUBLIC_TEE_URL ||
   "https://b1b35377079ac7b7937afc607481587bc6d22665-3000.dstack-pha-prod9.phala.network";
-const NEAR_RPC_URL = process.env.NEXT_PUBLIC_NEAR_RPC || "https://rpc.testnet.near.org";
+const NEAR_RPC_URL = process.env.NEXT_PUBLIC_NEAR_RPC || "https://archival-rpc.testnet.near.org";
 
 export interface TeeAttestation {
   inEnclave: boolean;
@@ -189,6 +190,7 @@ export const teeApi = {
     termsHashHex: string;
     plainApiKey?: string;
     encryptedEnvelope?: any;
+    sellerAuthorization: SellerKeyAuthorization;
   }): Promise<KeyCheckApiResponse> {
     const res = await fetch(`${TEE_BASE_URL}/v1/deals/${dealId}/key`, {
       method: "POST",
@@ -199,31 +201,63 @@ export const teeApi = {
   },
 
   async getMeter(dealId: number, proxyKey: string): Promise<MeterResponse> {
-    const res = await fetch(`${TEE_BASE_URL}/v1/deals/${dealId}/meter`, {
-      headers: { Authorization: `Bearer ${proxyKey}` },
-      cache: "no-store",
-    });
-    if (!res.ok) throw new Error(`Failed to get meter: ${res.statusText}`);
-    return res.json();
+    const endpoints = [
+      `${TEE_BASE_URL}/v1/deals/${dealId}/meter`,
+      `/api/vault/meter?dealId=${dealId}`,
+      `http://localhost:4000/v1/deals/${dealId}/meter`,
+    ];
+
+    let lastError: Error | null = null;
+    for (const url of endpoints) {
+      try {
+        const res = await fetch(url, {
+          headers: { Authorization: `Bearer ${proxyKey}` },
+          cache: "no-store",
+        });
+        if (res.ok) {
+          return await res.json();
+        }
+        if (res.status === 403 || res.status === 404) {
+          lastError = new Error(res.statusText || `Enclave returned HTTP ${res.status}`);
+          continue;
+        }
+      } catch (err: any) {
+        lastError = err;
+      }
+    }
+    throw lastError || new Error("Failed to get meter: Forbidden");
   },
 
   async testCompletion(proxyKey: string, prompt: string, model: string = "gpt-4o"): Promise<any> {
-    const res = await fetch(`${TEE_BASE_URL}/v1/chat/completions`, {
-      method: "POST",
-      headers: {
-        "Content-Type": "application/json",
-        Authorization: `Bearer ${proxyKey}`,
-      },
-      body: JSON.stringify({
-        model,
-        messages: [{ role: "user", content: prompt }],
-      }),
-    });
-    if (!res.ok) {
-      const err = await res.json().catch(() => ({ error: res.statusText }));
-      throw new Error(err.error || "Failed to call proxy completion");
+    const endpoints = [
+      `${TEE_BASE_URL}/v1/chat/completions`,
+      `http://localhost:4000/v1/chat/completions`,
+    ];
+
+    let lastErr = "Failed to call proxy completion";
+    for (const url of endpoints) {
+      try {
+        const res = await fetch(url, {
+          method: "POST",
+          headers: {
+            "Content-Type": "application/json",
+            Authorization: `Bearer ${proxyKey}`,
+          },
+          body: JSON.stringify({
+            model,
+            messages: [{ role: "user", content: prompt }],
+          }),
+        });
+        if (res.ok) {
+          return await res.json();
+        }
+        const err = await res.json().catch(() => ({ error: res.statusText }));
+        lastErr = err.error || res.statusText;
+      } catch (err: any) {
+        lastErr = err.message;
+      }
     }
-    return res.json();
+    throw new Error(lastErr);
   },
 
   async getNearContractConfig(): Promise<any> {
@@ -283,5 +317,86 @@ export const teeApi = {
     } catch {
       return null;
     }
+  },
+
+  async getForeignVault(dealId: number): Promise<any> {
+    const res = await fetch(`${TEE_BASE_URL}/v1/foreign/vault/${dealId}`, {
+      cache: "no-store",
+    });
+    if (!res.ok) throw new Error(`Failed to fetch foreign vault: ${res.statusText}`);
+    return res.json();
+  },
+
+  async verifyForeignDeposit(params: {
+    dealId: number;
+    txHash: string;
+    termsHashHex: string;
+    expectedAmountAtomic: string;
+    sellerAddress?: string;
+    autoRelay?: boolean;
+  }): Promise<any> {
+    try {
+      const res = await fetch(`${TEE_BASE_URL}/v1/foreign/verify-deposit`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(params),
+      });
+      if (res.ok) {
+        return await res.json();
+      }
+      if (res.status !== 404) {
+        const data = await res.json().catch(() => ({}));
+        throw new Error(data.error || "Deposit verification failed");
+      }
+    } catch (remoteErr: any) {
+      if (remoteErr.message && !remoteErr.message.includes("404") && !remoteErr.message.includes("Not Found")) {
+        throw remoteErr;
+      }
+    }
+
+    // Fallback: If remote TEE instance does not have the route deployed yet,
+    // verify on-chain via Next.js backend API
+    const localRes = await fetch("/api/foreign/verify-deposit", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(params),
+    });
+    const localData = await localRes.json();
+    if (!localRes.ok) throw new Error(localData.error || "Deposit verification failed");
+    return localData;
+  },
+
+  async broadcastPayout(params: {
+    dealId: number;
+    stage: number;
+    chainId?: number;
+    recipient: string;
+    amountAtomic: string;
+    sighashHex: string;
+    rHex: string;
+    sHex: string;
+    recoveryId: number;
+    nonce?: number;
+  }): Promise<any> {
+    try {
+      const localRes = await fetch("/api/foreign/broadcast-payout", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(params),
+      });
+      if (localRes.ok) {
+        const localData = await localRes.json();
+        return localData;
+      }
+    } catch {}
+
+    const res = await fetch(`${TEE_BASE_URL}/v1/foreign/broadcast-payout`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(params),
+    });
+    const data = await res.json();
+    if (!res.ok) throw new Error(data.error || "Payout broadcast failed");
+    return data;
   },
 };

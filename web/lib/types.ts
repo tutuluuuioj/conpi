@@ -1,8 +1,19 @@
 export type Provider = "OpenAI" | "Anthropic" | "OpenRouter";
-export type Asset = "NEAR" | "USDC" | "USDT";
+export type Asset = "USDC";
 export type ListingType = "sell" | "buy";
 export type ThemeMode = "dark" | "light" | "system";
-export type WalletName = "MyNearWallet" | "Meteor" | "HERE" | "Sender" | "Ledger";
+export type WalletName =
+  | "MyNearWallet"
+  | "Meteor"
+  | "HERE"
+  | "Sender"
+  | "Ledger"
+  | "MetaMask"
+  | "Coinbase"
+  | "Phantom"
+  | "Solflare";
+
+export type WalletChain = "near" | "evm" | "solana";
 
 export type DealStatus =
   | "Created"
@@ -133,6 +144,7 @@ export interface Deal {
   seller: string;
   deadline: string;
   termsHash: string | null;
+  matched?: boolean;
   counterpartyAccepted?: boolean;
   buyerSubmitted: boolean;
   sellerSubmitted: boolean;
@@ -162,8 +174,13 @@ export interface Deal {
   activity: Activity[];
   prices: PriceRow[];
   pricingSnapshotHash?: string;
+  foreignInfo?: any;
   usageReceiptCount?: number;
   lastUsageReceipt?: UsageReceiptSummary | null;
+  vault_buyer_deposited?: boolean;
+  vault_seller_deposited?: boolean;
+  vault_deposits?: any[];
+  active_vault_deal?: boolean;
   steps: Partial<Record<DealStep, StepMark>>;
   createdAt: string;
   pulseStage: number | null;

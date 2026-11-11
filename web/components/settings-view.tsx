@@ -25,10 +25,8 @@ export function SettingsView() {
       </Card>
       <Card className="space-y-4">
         <FieldLike label="Default token">
-          <select className={fieldClass} value={app.defaultToken} onChange={(event) => app.setDefaultToken(event.target.value as Asset)}>
-            <option>USDC</option>
-            <option>USDT</option>
-            <option>NEAR</option>
+          <select className={fieldClass} value="USDC" disabled>
+            <option value="USDC">USDC (Multi-Chain)</option>
           </select>
         </FieldLike>
         <FieldLike label="Display currency">

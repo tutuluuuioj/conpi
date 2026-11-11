@@ -7,8 +7,8 @@ import { MODELS } from "@/lib/data";
 import { ratioOf, usd, middle } from "@/lib/format";
 import { marketOpenEscrow, useApp } from "@/lib/store";
 import type { Listing, Provider } from "@/lib/types";
-import { MARKET_SNAPSHOT } from "@/lib/chain";
-import { Badge, Button, Card, DualRange, EmptyState, Modal, SingleRange, fieldClass } from "./ui";
+
+import { Badge, Button, Card, DualRange, EmptyState, Modal, ProviderLogo, SingleRange, fieldClass } from "./ui";
 
 const PROVIDERS: Provider[] = ["OpenAI", "Anthropic", "OpenRouter"];
 
@@ -84,9 +84,11 @@ export function MarketView() {
 
   const visible = filtered.slice(0, shown);
   const medians = PROVIDERS.map((provider) => {
-    const rows = app.listings.filter((listing) => listing.provider === provider && listing.type === "sell");
-    if (!rows.length) return null;
-    const ratios = rows.map((listing) => listing.price / listing.credit).sort((a, b) => a - b);
+    const rows = app.deals.filter((d) => d.provider === provider && d.credit > 0 && d.price > 0);
+    const source = rows.length > 0 ? rows : app.listings.filter((l) => l.provider === provider && l.credit > 0 && l.price > 0);
+    if (!source.length) return null;
+    const ratios = source.map((item) => item.price / item.credit).filter((r) => r > 0 && isFinite(r)).sort((a, b) => a - b);
+    if (!ratios.length) return null;
     const mid = ratios[Math.floor(ratios.length / 2)];
     return `${provider} ${mid.toFixed(2)}×`;
   }).filter(Boolean);
@@ -103,8 +105,16 @@ export function MarketView() {
         {PROVIDERS.map((provider) => {
           const on = filters.providers.includes(provider);
           return (
-            <button key={provider} type="button" className={`focus-ring rounded-sm border px-2.5 py-1 text-xs font-semibold ${on ? "border-brand bg-brand/10 text-brand" : "border-line text-muted"}`} onClick={() => write({ providers: on ? filters.providers.filter((item) => item !== provider) : [...filters.providers, provider] })}>
-              {provider}
+            <button
+              key={provider}
+              type="button"
+              className={`focus-ring inline-flex items-center gap-1.5 rounded-sm border px-2.5 py-1 text-xs font-semibold transition-colors ${
+                on ? "border-brand bg-brand/10 text-brand" : "border-line text-muted hover:text-ink hover:border-line-hover"
+              }`}
+              onClick={() => write({ providers: on ? filters.providers.filter((item) => item !== provider) : [...filters.providers, provider] })}
+            >
+              <ProviderLogo provider={provider} className="h-3.5 w-3.5 shrink-0" />
+              <span>{provider}</span>
             </button>
           );
         })}
@@ -124,11 +134,8 @@ export function MarketView() {
       </div>
       <div className="grid grid-cols-2 gap-3">
         <label className="text-[13px] font-medium">Token
-          <select className={`${fieldClass} mt-1.5`} value={filters.token} onChange={(event) => write({ token: event.target.value })}>
-            <option value="">Any</option>
-            <option>NEAR</option>
-            <option>USDC</option>
-            <option>USDT</option>
+          <select className={`${fieldClass} mt-1.5`} value={filters.token || "USDC"} onChange={(event) => write({ token: event.target.value })}>
+            <option value="USDC">USDC (Multi-Chain)</option>
           </select>
         </label>
         <label className="text-[13px] font-medium">Sort
@@ -175,7 +182,9 @@ export function MarketView() {
               <Card key={listing.id} interactive>
                 <div className="flex items-center justify-between gap-2">
                   <div className="flex items-center gap-2">
-                    <Badge>{listing.provider}</Badge>
+                    <Badge icon={<ProviderLogo provider={listing.provider} className="h-3 w-3 shrink-0" />}>
+                      {listing.provider}
+                    </Badge>
                     <span className="truncate text-sm text-muted">{listing.model}</span>
                   </div>
                   <span className="inline-flex items-center gap-1 text-xs font-medium text-mint"><span className="h-1.5 w-1.5 rounded-full bg-mint" /> TEE</span>
@@ -207,7 +216,7 @@ export function MarketView() {
 
       <div className="flex flex-wrap gap-x-6 gap-y-2 border-t border-line pt-4 text-sm text-muted">
         <span>Open escrow <span className="tabular font-semibold text-ink">{usd(marketOpenEscrow(app.deals))}</span></span>
-        <span>Deals settled <span className="tabular font-semibold text-ink">{MARKET_SNAPSHOT.settled + app.deals.filter((deal) => deal.outcome === "completed" && deal.id !== "1038").length}</span></span>
+        <span>Deals settled <span className="tabular font-semibold text-ink">{app.deals.filter((deal) => ["Completed", "Defaulted", "Timeout settled", "Auto-released"].includes(deal.status) || deal.outcome === "completed" || deal.outcome === "revoked").length}</span></span>
         <span>Median ratio {medians.join(" · ")}</span>
       </div>
     </div>

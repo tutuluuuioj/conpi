@@ -13,10 +13,12 @@ export function TrustView() {
   const [loading, setLoading] = useState(true);
   const [reverifying, setReverifying] = useState(false);
 
-  const runVerification = async () => {
+  const runVerification = async (fresh = false) => {
     try {
-      setReverifying(true);
-      const res = await verifyLiveAttestation();
+      if (fresh) {
+        setReverifying(true);
+      }
+      const res = await verifyLiveAttestation(undefined, { fresh });
       setResult(res);
     } catch (err: any) {
       console.warn("Live attestation verification error:", err);
@@ -27,7 +29,7 @@ export function TrustView() {
   };
 
   useEffect(() => {
-    runVerification();
+    runVerification(false);
   }, []);
 
   const isVerified = result?.verified === true;
@@ -51,7 +53,7 @@ export function TrustView() {
           variant="secondary"
           disabled={reverifying}
           icon={reverifying ? <Loader2 className="h-4 w-4 animate-spin" /> : <RefreshCw className="h-4 w-4" />}
-          onClick={runVerification}
+          onClick={() => runVerification(true)}
         >
           {reverifying ? "Verifying fresh nonce..." : "Re-verify Attestation"}
         </Button>

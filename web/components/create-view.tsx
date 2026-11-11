@@ -6,7 +6,6 @@ import { modelsForProvider } from "@/lib/data";
 import { ratioOf, usd } from "@/lib/format";
 import { escrowOf } from "@/lib/money";
 import { useApp } from "@/lib/store";
-import { getLiveNearPrice } from "@/lib/oracle";
 import type { Asset, Provider } from "@/lib/types";
 import { Button, Card, Field, Overline, fieldClass } from "./ui";
 
@@ -24,22 +23,15 @@ export function CreateView() {
   const [credit, setCredit] = useState(MIN_CREDIT_USD);
   const [price, setPrice] = useState(0.04);
   const [collateral, setCollateral] = useState(20);
-  const [token, setToken] = useState<Asset>("NEAR");
+  const [token, setToken] = useState<Asset>("USDC");
   const [buyerAccount, setBuyerAccount] = useState("");
   const [error, setError] = useState("");
-  const [nearPrice, setNearPrice] = useState(4.02);
   const availableModels = modelsForProvider(provider);
-
-  useEffect(() => {
-    getLiveNearPrice().then(setNearPrice).catch(() => {});
-    const interval = setInterval(() => {
-      getLiveNearPrice().then(setNearPrice).catch(() => {});
-    }, 30000);
-    return () => clearInterval(interval);
-  }, []);
 
   const ratio = credit ? price / credit : 0;
   const escrow = escrowOf({ price, buyerCollateralPct: 10, sellerCollateralPct: collateral, releasedUsd: 0 });
+
+  const sellerAccount = app.account || app.nearAccount || app.evmAccount || app.solanaAccount;
 
   const toggle = (model: string) => {
     setModels((current) => current.includes(model) ? current.filter((item) => item !== model) : [...current, model]);
@@ -81,8 +73,8 @@ export function CreateView() {
       return;
     }
     if (step === 1) {
-      if (buyerAccount.trim() && app.account && buyerAccount.trim().toLowerCase() === app.account.toLowerCase()) {
-        setError(`Buyer wallet must be different from your connected seller wallet (${app.account}).`);
+      if (buyerAccount.trim() && sellerAccount && buyerAccount.trim().toLowerCase() === sellerAccount.toLowerCase()) {
+        setError(`Buyer wallet must be different from your connected seller wallet (${sellerAccount}).`);
         return;
       }
       if (ratio < 0.5 || ratio > 1 || collateral < 10 || collateral > 50) {
@@ -95,10 +87,13 @@ export function CreateView() {
   };
 
   const sign = () => {
-    if (!app.account) return;
+    if (!sellerAccount) {
+      app.openConnectModal();
+      return;
+    }
     const buyerTrimmed = buyerAccount.trim();
-    if (buyerTrimmed && buyerTrimmed.toLowerCase() === app.account.toLowerCase()) {
-      setError(`Buyer wallet must be different from your connected seller wallet (${app.account}).`);
+    if (buyerTrimmed && buyerTrimmed.toLowerCase() === sellerAccount.toLowerCase()) {
+      setError(`Buyer wallet must be different from your connected seller wallet (${sellerAccount}).`);
       setStep(1);
       return;
     }
@@ -114,7 +109,7 @@ export function CreateView() {
       priceUsd: price,
       collateralPct: collateral,
       buyerCollateralPct: 10,
-      seller: app.account,
+      seller: sellerAccount,
       buyer: buyerTrimmed || undefined,
       reputation: 0,
       tee: true,
@@ -126,8 +121,8 @@ export function CreateView() {
     app.ask({
       title: buyerTrimmed ? "Create Deal on NEAR" : "Publish Public Listing",
       body: buyerTrimmed
-        ? `Create direct on-chain deal on NEAR: ${usd(credit)}${token === "NEAR" ? ` (≈ ${(credit / nearPrice).toFixed(4)} NEAR @ $${nearPrice.toFixed(2)}/NEAR)` : ""} of ${provider} credit at ${usd(price)}${token === "NEAR" ? ` (≈ ${(price / nearPrice).toFixed(4)} NEAR)` : ""} (${ratioOf(price, credit)}) with buyer ${buyerTrimmed}. Your wallet will open for approval.`
-        : `Publish ${usd(credit)}${token === "NEAR" ? ` (≈ ${(credit / nearPrice).toFixed(4)} NEAR)` : ""} of ${provider} credit at ${usd(price)}${token === "NEAR" ? ` (≈ ${(price / nearPrice).toFixed(4)} NEAR)` : ""} on the public Marketplace. You will deposit ${token === "NEAR" ? `${(escrow.sellerDeposit / nearPrice).toFixed(4)} NEAR (${usd(escrow.sellerDeposit)})` : `${usd(escrow.sellerDeposit)} ${token}`} only after a buyer funds the deal.`,
+        ? `Create direct on-chain deal: ${usd(credit)} of ${provider} credit at ${usd(price)} USDC (${ratioOf(price, credit)}) with buyer ${buyerTrimmed}. Your wallet will open for approval.`
+        : `Publish ${usd(credit)} of ${provider} credit at ${usd(price)} USDC on the public Marketplace. You will deposit ${usd(escrow.sellerDeposit)} USDC collateral only after a buyer funds the deal.`,
       confirm: buyerTrimmed ? "Approve in Wallet" : "Publish to Market",
       run: async () => {
         const result: any = await app.createListing(listing);
@@ -197,11 +192,7 @@ export function CreateView() {
             </div>
             <Field
               label="Credit amount"
-              hint={
-                token === "NEAR"
-                  ? `USD value of prepaid credit (min $0.05). ≈ ${(credit / nearPrice).toFixed(4)} NEAR @ $${nearPrice.toFixed(2)}/NEAR`
-                  : "USD value of prepaid credit (min $0.05)."
-              }
+              hint="USD value of prepaid credit (min $0.05)."
             >
               <input
                 className={`${fieldClass} tabular text-right`}
@@ -226,11 +217,7 @@ export function CreateView() {
           <div className="space-y-4">
             <Field
               label="Price"
-              hint={
-                token === "NEAR"
-                  ? `Ratio ${ratioOf(price, credit)}. ≈ ${(price / nearPrice).toFixed(4)} NEAR @ $${nearPrice.toFixed(2)}/NEAR`
-                  : `Ratio ${ratioOf(price, credit)}.`
-              }
+              hint={`Ratio ${ratioOf(price, credit)} (100% USDC).`}
             >
               <input
                 className={`${fieldClass} tabular text-right`}
@@ -245,41 +232,34 @@ export function CreateView() {
             <Field label="Seller collateral %" hint="Locked until the deal settles. Returned in full if the credit is delivered.">
               <input className={`${fieldClass} tabular text-right`} type="number" min={10} max={50} value={collateral} onChange={(event) => setCollateral(Number(event.target.value))} />
             </Field>
-            <Field label="Accepted token">
-              <select className={fieldClass} value={token} onChange={(event) => setToken(event.target.value as Asset)}>
-                <option>NEAR</option>
-                <option>USDC</option>
-                <option>USDT</option>
+            <Field label="Accepted token" hint="CONPI runs exclusively on USDC across Base, Solana, and NEAR.">
+              <select className={fieldClass} value="USDC" disabled>
+                <option value="USDC">USDC (Multi-Chain Maker Vault)</option>
               </select>
             </Field>
             <ul className="rounded-md border border-line bg-surface-2 p-3 text-sm">
               <li className="flex justify-between">
                 <span>Buyer pays</span>
-                <span className="tabular">
-                  {usd(escrow.buyerDeposit)}
-                  {token === "NEAR" ? <span className="ml-1 text-xs text-muted">({(escrow.buyerDeposit / nearPrice).toFixed(4)} NEAR)</span> : null}
+                <span className="tabular font-medium text-brand">
+                  ${price.toFixed(2)} USDC
                 </span>
               </li>
               <li className="mt-1 flex justify-between">
-                <span>You lock</span>
-                <span className="tabular">
-                  {usd(escrow.sellerDeposit)}
-                  {token === "NEAR" ? <span className="ml-1 text-xs text-muted">({(escrow.sellerDeposit / nearPrice).toFixed(4)} NEAR)</span> : null}
+                <span>You lock (Collateral)</span>
+                <span className="tabular font-medium text-ink">
+                  ${escrow.sellerDeposit.toFixed(2)} USDC
                 </span>
               </li>
-              <li className="mt-1 flex justify-between font-semibold">
+              <li className="mt-1 flex justify-between font-semibold border-t border-line/60 pt-1">
                 <span>Total escrow</span>
-                <span className="tabular">
-                  {usd(escrow.total)}
-                  {token === "NEAR" ? <span className="ml-1 text-xs text-muted">({(escrow.total / nearPrice).toFixed(4)} NEAR)</span> : null}
+                <span className="tabular font-bold text-emerald-400">
+                  ${(price + escrow.sellerDeposit).toFixed(2)} USDC
                 </span>
               </li>
-              {token === "NEAR" ? (
-                <li className="mt-2 border-t border-line/60 pt-2 text-[11px] text-mint flex items-center justify-between">
-                  <span>● Live Oracle Feed</span>
-                  <span className="font-mono font-medium">1 NEAR = ${nearPrice.toFixed(2)} USD</span>
-                </li>
-              ) : null}
+              <li className="mt-2 border-t border-line/60 pt-2 text-[11px] text-mint flex items-center justify-between">
+                <span>● Conpi Maker Vault</span>
+                <span className="font-mono font-medium">Multi-Chain (Base · Solana · NEAR)</span>
+              </li>
             </ul>
             <div className="border-t border-line/60 pt-3">
               <Field label="Direct counterparty (optional)" hint="Leave blank to list publicly on the Market so ANY buyer can purchase.">
@@ -297,26 +277,44 @@ export function CreateView() {
           <dl className="space-y-3 text-sm">
             <div className="flex justify-between gap-4">
               <dt className="text-muted">Credit</dt>
-              <dd className="text-right">
-                {provider} · {models.join(", ")} · {usd(credit)}
-                {token === "NEAR" ? <span className="block text-xs text-muted">≈ {(credit / nearPrice).toFixed(4)} NEAR on-chain</span> : null}
+              <dd className="text-right font-medium">
+                {provider} · {models.join(", ")} · ${credit.toFixed(2)} USD
               </dd>
             </div>
             <div className="flex justify-between gap-4">
               <dt className="text-muted">Price</dt>
-              <dd className="tabular">
-                {usd(price)} · {ratioOf(price, credit)}
-                {token === "NEAR" ? <span className="block text-xs text-muted">≈ {(price / nearPrice).toFixed(4)} NEAR</span> : null}
+              <dd className="tabular font-medium text-brand">
+                ${price.toFixed(2)} USDC · {ratioOf(price, credit)}
               </dd>
             </div>
             <div className="flex justify-between gap-4">
               <dt className="text-muted">Collateral</dt>
-              <dd className="tabular">
-                {collateral}% · {token === "NEAR" ? `${(escrow.sellerDeposit / nearPrice).toFixed(4)} NEAR` : `${usd(escrow.sellerDeposit)} ${token}`}
-                {token === "NEAR" ? <span className="block text-xs text-muted">≈ {usd(escrow.sellerDeposit)}</span> : null}
+              <dd className="tabular font-medium">
+                {collateral}% · ${escrow.sellerDeposit.toFixed(2)} USDC
               </dd>
             </div>
-            <div className="flex justify-between gap-4"><dt className="text-muted">Seller</dt><dd className="font-mono">{app.account}</dd></div>
+            <div className="flex justify-between items-center gap-4">
+              <dt className="text-muted">Seller</dt>
+              {sellerAccount ? (
+                <dd className="font-mono text-xs flex items-center gap-2">
+                  <span className="rounded bg-surface-2 border border-line px-1.5 py-0.5 text-[10px] uppercase font-semibold text-brand">
+                    {app.nearAccount && sellerAccount === app.nearAccount ? "NEAR" : app.evmAccount && sellerAccount === app.evmAccount ? "Base EVM" : app.solanaAccount && sellerAccount === app.solanaAccount ? "Solana" : "Connected"}
+                  </span>
+                  <span>{sellerAccount}</span>
+                </dd>
+              ) : (
+                <dd className="flex items-center gap-2">
+                  <span className="text-amber-400 text-xs font-sans">Wallet not connected</span>
+                  <button
+                    type="button"
+                    onClick={() => app.openConnectModal()}
+                    className="rounded bg-brand/10 border border-brand/30 px-2 py-0.5 text-xs font-semibold text-brand hover:bg-brand/20 transition-all"
+                  >
+                    Connect
+                  </button>
+                </dd>
+              )}
+            </div>
             <div className="flex justify-between gap-4">
               <dt className="text-muted">Target</dt>
               <dd className="font-medium text-mint">
@@ -325,13 +323,28 @@ export function CreateView() {
             </div>
           </dl>
         ) : null}
+        {step === 2 && !sellerAccount ? (
+          <div className="mt-4 flex items-center justify-between gap-3 rounded-lg border border-amber-500/30 bg-amber-500/10 p-3 text-xs text-amber-200">
+            <div className="flex items-center gap-2">
+              <span className="text-base">⚠️</span>
+              <span>Connect your wallet (Base EVM, Solana, or NEAR) to publish this listing on the marketplace.</span>
+            </div>
+            <Button size="sm" onClick={() => app.openConnectModal()}>
+              Connect
+            </Button>
+          </div>
+        ) : null}
         {error ? <p className="mt-3 text-xs font-medium text-danger">{error}</p> : null}
-        <div className="mt-5 flex justify-between">
+        <div className="mt-5 flex justify-between items-center">
           <Button variant="ghost" onClick={() => setStep((value) => Math.max(0, value - 1))} disabled={step === 0}>Back</Button>
           {step < 2 ? (
             <Button onClick={next}>Continue</Button>
+          ) : !sellerAccount ? (
+            <Button onClick={() => app.openConnectModal()}>
+              Connect Wallet to Publish
+            </Button>
           ) : (
-            <Button onClick={sign} disabled={!app.account}>
+            <Button onClick={sign}>
               {buyerAccount.trim() ? "Create deal on NEAR" : "Publish to Market"}
             </Button>
           )}

@@ -115,13 +115,15 @@ export function Badge({
   children,
   tone = "neutral",
   icon,
+  className,
 }: {
   children: React.ReactNode;
   tone?: keyof typeof TONE;
   icon?: React.ReactNode;
+  className?: string;
 }) {
   return (
-    <span className={cn("inline-flex items-center gap-1 rounded-sm border px-2 py-0.5 text-xs font-semibold", TONE[tone])}>
+    <span className={cn("inline-flex items-center gap-1 rounded-sm border px-2 py-0.5 text-xs font-semibold", TONE[tone], className)}>
       {icon}
       {children}
     </span>
@@ -320,7 +322,6 @@ export function Meter({
 export function StageTicks({
   price,
   priceUsd,
-  token,
   stage,
   pulse,
 }: {
@@ -330,9 +331,7 @@ export function StageTicks({
   stage: number;
   pulse?: number | null;
 }) {
-  const isNear = token === "NEAR";
-  const amountNear = price / 4;
-  const amountUsd = priceUsd ? priceUsd / 4 : amountNear * 4.02;
+  const amountUsd = priceUsd ? priceUsd / 4 : price / 4;
 
   return (
     <div className="mt-2 grid grid-cols-2 gap-2 sm:grid-cols-4">
@@ -345,16 +344,7 @@ export function StageTicks({
               {tick}%
             </div>
             <div className="tabular mt-0.5">
-              {isNear ? (
-                <span>
-                  {amountNear.toFixed(4)} NEAR
-                  <span className="block text-[11px] opacity-75">
-                    ({usd(amountUsd)}) {done ? "released" : "pending"}
-                  </span>
-                </span>
-              ) : (
-                <span>{usd(amountNear)} {done ? "released" : "pending"}</span>
-              )}
+              <span>{usd(amountUsd)} {done ? "released" : "pending"}</span>
             </div>
           </div>
         );
@@ -363,28 +353,133 @@ export function StageTicks({
   );
 }
 
-export function EscrowTable({ deal }: { deal: Deal }) {
+export function EscrowTable({ deal, foreignInfo }: { deal: Deal; foreignInfo?: any }) {
   const escrow = escrowOf(deal);
   const live = deal.status === "Active" || deal.step === "live";
   const settled = deal.status === "Completed" || deal.step === "settled" || !!deal.split;
-  const isNear = deal.token === "NEAR";
-  const fmtAsset = (amount: number) =>
-    isNear ? `${amount.toFixed(4)} NEAR` : usd(amount);
+  const effectiveForeignInfo = foreignInfo || (deal as any).foreignInfo;
+  const isForeign = Boolean(
+    (effectiveForeignInfo && Number(effectiveForeignInfo.foreign_amount) > 0) ||
+    deal.token === "USDC"
+  );
+  const foreignUsdcAmount = isForeign
+    ? (effectiveForeignInfo && Number(effectiveForeignInfo.foreign_amount) > 0
+        ? Number(effectiveForeignInfo.foreign_amount) / 1e6
+        : (deal.priceUsd || deal.price || 0.04))
+    : 0;
+  const sellerColUsdc = (deal.price * deal.sellerCollateralPct) / 100;
+  const fmtAsset = (amount: number) => usd(amount);
 
-  const priceState = settled ? "Released to seller" : "Locked";
-  const buyerColState = settled ? "Refunded to buyer" : "Locked, refunded on completion";
-  const sellerColState = settled ? "Returned to seller" : "Locked, returned on completion";
-  const escrowState = settled ? "Settled (0.0000 in escrow)" : "NEAR contract";
+  let rows: [string, string, string][];
 
-  const rows = [
-    ["Buyer price", fmtAsset(deal.price), priceState],
-    [`Buyer collateral (${deal.buyerCollateralPct}%)`, fmtAsset(escrow.buyerCollateral), buyerColState],
-    [`Seller collateral (${deal.sellerCollateralPct}%)`, fmtAsset(escrow.sellerCollateral), sellerColState],
-    ["Total in escrow", settled ? fmtAsset(0) : fmtAsset(escrow.total), escrowState],
-  ];
-  if (live || settled) {
-    rows.push(["Released", fmtAsset(settled ? deal.price : deal.releasedUsd), "Paid to the seller"]);
-    rows.push(["Remaining", fmtAsset(settled ? 0 : Math.max(0, escrow.total - (deal.split ? deal.split.seller + (deal.outcome === "completed" ? 0 : deal.split.buyer) : deal.releasedUsd))), settled ? "All funds settled" : "Still in the contract"]);
+  if (isForeign) {
+    const isClaimedOnBase = Boolean(effectiveForeignInfo?.seller_claimed);
+    const priceState = settled
+      ? (isClaimedOnBase ? "Paid to seller on Base Sepolia" : "Settling on Base Sepolia")
+      : deal.buyerDeposited
+        ? "Locked in Base Sepolia Vault"
+        : "Awaiting buyer USDC deposit";
+
+    const buyerColState = "Waived in Maker Vault";
+    const sellerColState = settled
+      ? "Returned to seller in USDC"
+      : deal.sellerDeposited
+        ? "Locked in USDC escrow, returned on completion"
+        : "Awaiting seller USDC deposit";
+
+    const totalDeposited = settled
+      ? "$0.00 USDC"
+      : (deal.buyerDeposited && deal.sellerDeposited)
+        ? `$${(foreignUsdcAmount + sellerColUsdc).toFixed(2)} USDC`
+        : deal.buyerDeposited
+          ? `$${foreignUsdcAmount.toFixed(2)} USDC (in Vault)`
+          : deal.sellerDeposited
+            ? `$${sellerColUsdc.toFixed(2)} USDC (Collateral)`
+            : "$0.00 USDC";
+
+    const escrowState = settled
+      ? "Settled (0.0000 in escrow)"
+      : (deal.buyerDeposited && deal.sellerDeposited)
+        ? "Locked in Vault & NEAR contract"
+        : "Partial deposit";
+
+    const releasedAmount = settled
+      ? foreignUsdcAmount
+      : (foreignUsdcAmount * (deal.stage || 0)) / 100;
+    const remainingAmount = settled
+      ? 0
+      : Math.max(0, foreignUsdcAmount - releasedAmount);
+
+    rows = [
+      ["Buyer price", `$${foreignUsdcAmount.toFixed(4)} USDC`, priceState],
+      [`Buyer collateral (${deal.buyerCollateralPct}%)`, "$0.0000 USDC", buyerColState],
+      [`Seller collateral (${deal.sellerCollateralPct}%)`, `$${sellerColUsdc.toFixed(4)} USDC`, sellerColState],
+      ["Total in escrow", totalDeposited, escrowState],
+    ];
+
+    if (live || settled) {
+      rows.push([
+        "Released",
+        `$${releasedAmount.toFixed(4)} USDC`,
+        isClaimedOnBase ? "Paid to seller on Base Sepolia" : "Settling on Base Sepolia",
+      ]);
+      rows.push([
+        "Remaining",
+        `$${remainingAmount.toFixed(4)} USDC`,
+        settled ? "All funds settled" : "Still in Base Sepolia Vault",
+      ]);
+    }
+  } else {
+    const priceState = settled
+      ? "Released to seller"
+      : deal.buyerDeposited
+        ? "Locked in contract"
+        : "Awaiting buyer deposit";
+
+    const buyerColState = settled
+      ? "Refunded to buyer"
+      : deal.buyerDeposited
+        ? "Locked, refunded on completion"
+        : "Awaiting buyer deposit";
+
+    const sellerColState = settled
+      ? "Returned to seller"
+      : deal.sellerDeposited
+        ? "Locked, returned on completion"
+        : "Awaiting seller deposit";
+
+    const buyerDepositedAmount = deal.buyerDeposited
+      ? escrow.buyerDeposit
+      : Math.max(0, escrow.buyerDeposit - (deal.buyerDepositRemaining ?? escrow.buyerDeposit));
+
+    const sellerDepositedAmount = deal.sellerDeposited
+      ? escrow.sellerDeposit
+      : Math.max(0, escrow.sellerDeposit - (deal.sellerDepositRemaining ?? escrow.sellerDeposit));
+
+    const totalDeposited = settled
+      ? 0
+      : (deal.buyerDeposited && deal.sellerDeposited)
+        ? escrow.total
+        : (buyerDepositedAmount + sellerDepositedAmount);
+
+    const escrowState = settled
+      ? "Settled (0.0000 in escrow)"
+      : (deal.buyerDeposited && deal.sellerDeposited)
+        ? "Locked in NEAR contract"
+        : (deal.buyerDeposited || deal.sellerDeposited)
+          ? "Partial deposit in contract"
+          : "Awaiting deposits (0 in contract)";
+
+    rows = [
+      ["Buyer price", fmtAsset(deal.price), priceState],
+      [`Buyer collateral (${deal.buyerCollateralPct}%)`, fmtAsset(escrow.buyerCollateral), buyerColState],
+      [`Seller collateral (${deal.sellerCollateralPct}%)`, fmtAsset(escrow.sellerCollateral), sellerColState],
+      ["Total in escrow", fmtAsset(totalDeposited), escrowState],
+    ];
+    if (live || settled) {
+      rows.push(["Released", fmtAsset(settled ? deal.price : deal.releasedUsd), "Paid to the seller"]);
+      rows.push(["Remaining", fmtAsset(settled ? 0 : Math.max(0, escrow.total - (deal.split ? deal.split.seller + (deal.outcome === "completed" ? 0 : deal.split.buyer) : deal.releasedUsd))), settled ? "All funds settled" : "Still in the contract"]);
+    }
   }
   return (
     <div>
@@ -419,7 +514,67 @@ export function EscrowTable({ deal }: { deal: Deal }) {
           </li>
         ))}
       </ul>
-      {settled && deal.split ? <SplitBar deal={deal} /> : live ? <LiveBar released={deal.releasedUsd} total={escrow.total} token={deal.token} /> : <LockedBar />}
+      {settled && deal.split ? (
+        <SplitBar deal={deal} foreignInfo={foreignInfo} />
+      ) : live ? (
+        <LiveBar released={deal.releasedUsd} total={escrow.total} token={deal.token} />
+      ) : (deal.buyerDeposited && deal.sellerDeposited) ? (
+        <LockedBar />
+      ) : (
+        <DepositStatusBar
+          buyerDeposited={deal.buyerDeposited}
+          sellerDeposited={deal.sellerDeposited}
+          buyerPct={escrow.total > 0 ? (escrow.buyerDeposit / escrow.total) * 100 : 80}
+          sellerPct={escrow.total > 0 ? (escrow.sellerDeposit / escrow.total) * 100 : 20}
+        />
+      )}
+      {deal.matched && deal.buyerTerms?.price && Math.abs(deal.buyerTerms.price - (deal.priceUsd ?? deal.price)) > 0.0001 ? (
+        <p className="mt-2 text-[11px] text-muted italic">
+          * This table shows Deal #{deal.id}&apos;s on-chain escrow (${(deal.priceUsd ?? deal.price).toFixed(3)}). New terms (${deal.buyerTerms.price}) are verified in TEE and apply when created on NEAR.
+        </p>
+      ) : null}
+    </div>
+  );
+}
+
+function DepositStatusBar({
+  buyerDeposited,
+  sellerDeposited,
+  buyerPct,
+  sellerPct,
+}: {
+  buyerDeposited: boolean;
+  sellerDeposited: boolean;
+  buyerPct: number;
+  sellerPct: number;
+}) {
+  const noneDeposited = !buyerDeposited && !sellerDeposited;
+  return (
+    <div className="mt-3">
+      <div className="flex h-3 overflow-hidden rounded-full bg-surface-2 border border-line" aria-hidden>
+        {buyerDeposited ? (
+          <div className="bg-violet transition-all" style={{ width: `${buyerPct}%` }} />
+        ) : null}
+        {sellerDeposited ? (
+          <div className="bg-violet/70 transition-all" style={{ width: `${sellerPct}%` }} />
+        ) : null}
+      </div>
+      <div className="mt-2 flex flex-wrap gap-3 text-[11px] text-muted">
+        {noneDeposited ? (
+          <Legend swatch="bg-surface-3 border border-line" label="Awaiting deposits (0% in contract)" />
+        ) : (
+          <>
+            <Legend
+              swatch={buyerDeposited ? "bg-violet" : "bg-surface-3 border border-line"}
+              label={buyerDeposited ? "Buyer deposited" : "Buyer awaiting deposit"}
+            />
+            <Legend
+              swatch={sellerDeposited ? "bg-violet/70" : "bg-surface-3 border border-line"}
+              label={sellerDeposited ? "Seller deposited" : "Seller awaiting deposit"}
+            />
+          </>
+        )}
+      </div>
     </div>
   );
 }
@@ -437,7 +592,7 @@ function LockedBar() {
 
 function LiveBar({ released, total, token }: { released: number; total: number; token: Asset }) {
   const rel = total ? (released / total) * 100 : 0;
-  const amount = (value: number) => token === "NEAR" ? assetAmount(value, "NEAR") : usd(value);
+  const amount = (value: number) => usd(value);
   return (
     <div className="mt-3">
       <div className="flex h-3 overflow-hidden rounded-full bg-violet" role="img" aria-label={`${amount(released)} released, ${amount(Math.max(0, total - released))} still locked`}>
@@ -451,11 +606,14 @@ function LiveBar({ released, total, token }: { released: number; total: number; 
   );
 }
 
-export function SplitBar({ deal }: { deal: Deal }) {
+export function SplitBar({ deal, foreignInfo }: { deal: Deal; foreignInfo?: any }) {
   const escrow = escrowOf(deal);
   const split = deal.split;
   if (!split || escrow.total <= 0) return null;
-  const amount = (value: number) => deal.token === "NEAR" ? assetAmount(value, "NEAR") : usd(value);
+  const isForeign = Boolean(foreignInfo && Number(foreignInfo.foreign_amount) > 0);
+  const foreignUsdcAmount = isForeign ? Number(foreignInfo.foreign_amount) / 1e6 : 0;
+  const sellerColUsdc = (deal.price * deal.sellerCollateralPct) / 100;
+  const amount = (value: number) => usd(value);
   const refunded = Math.max(0, split.buyer - split.slashed);
   const parts = [
     { key: "released", width: (split.seller / escrow.total) * 100, className: "bg-mint" },
@@ -476,8 +634,16 @@ export function SplitBar({ deal }: { deal: Deal }) {
         <Legend swatch="pattern-refund" label="Refunded" />
       </div>
       <p className="mt-2 text-[13px] text-muted">
-        Seller {amount(split.seller)} · Buyer {amount(split.buyer)}
-        {split.slashed ? ` · ${amount(split.slashed)} slashed` : ""}
+        {isForeign ? (
+          <>
+            Seller <strong className="text-ink">${foreignUsdcAmount.toFixed(4)} USDC</strong> + <strong className="text-ink">${sellerColUsdc.toFixed(4)} USDC</strong> (Collateral returned) · Buyer Collateral waived
+          </>
+        ) : (
+          <>
+            Seller {amount(split.seller)} · Buyer {amount(split.buyer)}
+            {split.slashed ? ` · ${amount(split.slashed)} slashed` : ""}
+          </>
+        )}
       </p>
     </div>
   );
@@ -534,10 +700,35 @@ export function Stepper({ deal, onPick }: { deal: Deal; onPick: (step: DealStep)
   );
 }
 
-export function OutcomeBanner({ deal }: { deal: Deal }) {
+export function OutcomeBanner({ deal, foreignInfo }: { deal: Deal; foreignInfo?: any }) {
   if (!deal.outcome) return null;
+  const effectiveForeignInfo = foreignInfo || (deal as any).foreignInfo;
+  const isForeign = Boolean(
+    (effectiveForeignInfo && Number(effectiveForeignInfo.foreign_amount) > 0) ||
+    deal.token === "USDC"
+  );
+  const foreignUsdc = isForeign
+    ? (effectiveForeignInfo && Number(effectiveForeignInfo.foreign_amount) > 0
+        ? Number(effectiveForeignInfo.foreign_amount) / 1e6
+        : (deal.priceUsd || deal.price || 0.04))
+    : 0;
+  const sellerColUsdc = Number(((deal.price * deal.sellerCollateralPct) / 100).toFixed(4));
+
+  const copy = () => {
+    if (deal.outcome === "completed") {
+      if (isForeign) {
+        if (effectiveForeignInfo?.seller_claimed) {
+          return `Deal completed. $${foreignUsdc.toFixed(4)} USDC paid to the seller, $${sellerColUsdc.toFixed(4)} USDC collateral returned.`;
+        }
+        return `Deal completed. Payout ($${foreignUsdc.toFixed(4)} USDC) settling... $${sellerColUsdc.toFixed(4)} USDC collateral returned.`;
+      }
+      return outcomeCopy(deal);
+    }
+    return outcomeCopy(deal);
+  };
+
   const tone = deal.outcome === "completed" ? "mint" : deal.outcome === "revoked" || deal.outcome === "quota" || deal.outcome === "provider_ban" ? "danger" : deal.outcome === "deposit_timeout" ? "neutral" : "warning";
-  return <div className={cn("rounded-lg border px-4 py-3 text-sm", TONE[tone])}>{outcomeCopy(deal)}</div>;
+  return <div className={cn("rounded-lg border px-4 py-3 text-sm", TONE[tone])}>{copy()}</div>;
 }
 
 export function Countdown({ until }: { until: string }) {
@@ -697,4 +888,51 @@ export function accountHref(account: string) {
 
 export function txHref(tx: string) {
   return explorerTx(tx);
+}
+
+export function OpenAILogo({ className = "h-3.5 w-3.5 shrink-0" }: { className?: string }) {
+  return (
+    <svg role="img" viewBox="0 0 24 24" fill="currentColor" className={className} xmlns="http://www.w3.org/2000/svg">
+      <path d="M22.2819 9.8211a5.9847 5.9847 0 0 0-.5157-4.9108 6.0462 6.0462 0 0 0-6.5098-2.9A6.0651 6.0651 0 0 0 4.9807 4.1818a5.9847 5.9847 0 0 0-3.9977 2.9 6.0462 6.0462 0 0 0 .7427 7.0966 5.98 5.98 0 0 0 .511 4.9107 6.051 6.051 0 0 0 6.5146 2.9001A5.9847 5.9847 0 0 0 13.2599 24a6.0557 6.0557 0 0 0 5.7718-4.2058 5.9894 5.9894 0 0 0 3.9977-2.9001 6.0557 6.0557 0 0 0-.7475-7.0729zm-9.022 12.6081a4.4755 4.4755 0 0 1-2.8764-1.0408l.1419-.0804 4.7783-2.7582a.7948.7948 0 0 0 .3927-.6813v-6.7369l2.02 1.1686a.071.071 0 0 1 .038.052v5.5826a4.504 4.504 0 0 1-4.4945 4.4944zm-9.6607-4.1254a4.4708 4.4708 0 0 1-.5346-3.0137l.142.0852 4.783 2.7582a.7712.7712 0 0 0 .7806 0l5.8428-3.3685v2.3324a.0804.0804 0 0 1-.0332.0615L9.74 19.9502a4.4992 4.4992 0 0 1-6.1408-1.6464zM2.3408 7.8956a4.485 4.485 0 0 1 2.3655-1.9728V11.6a.7664.7664 0 0 0 .3879.6765l5.8144 3.3543-2.0201 1.1685a.0757.0757 0 0 1-.071 0l-4.8303-2.7865A4.504 4.504 0 0 1 2.3408 7.872zm16.5963 3.8558L13.1038 8.364 15.1192 7.2a.0757.0757 0 0 1 .071 0l4.8303 2.7913a4.4944 4.4944 0 0 1-.6765 8.1042v-5.6772a.79.79 0 0 0-.407-.667zm2.0107-3.0231l-.142-.0852-4.7735-2.7818a.7759.7759 0 0 0-.7854 0L9.409 9.2297V6.8974a.0662.0662 0 0 1 .0284-.0615l4.8303-2.7866a4.4992 4.4992 0 0 1 6.6802 4.66zM8.3065 12.863l-2.02-1.1638a.0804.0804 0 0 1-.038-.0567V6.0742a4.4992 4.4992 0 0 1 7.3757-3.4537l-.142.0805L8.704 5.459a.7948.7948 0 0 0-.3927.6813zm1.0976-2.3654l2.602-1.4998 2.6069 1.4998v2.9994l-2.5974 1.4997-2.6067-1.4997Z" />
+    </svg>
+  );
+}
+
+export function AnthropicLogo({ className = "h-3.5 w-3.5 shrink-0" }: { className?: string }) {
+  return (
+    <svg role="img" viewBox="0 0 24 24" fill="currentColor" className={className} xmlns="http://www.w3.org/2000/svg">
+      <path d="M17.304 3.541h-3.672l6.696 16.918H24Zm-10.608 0L0 20.459h3.744l1.37-3.553h7.005l1.369 3.553h3.744L10.536 3.541Zm-.371 10.223L8.616 7.82l2.291 5.945Z" />
+    </svg>
+  );
+}
+
+export function OpenRouterLogo({ className = "h-3.5 w-3.5 shrink-0" }: { className?: string }) {
+  return (
+    <svg role="img" viewBox="0 0 24 24" fill="currentColor" className={className} xmlns="http://www.w3.org/2000/svg">
+      <path d="M16.778 1.844v1.919q-.569-.026-1.138-.032q-.708-.008-1.415.037c-1.93.126-4.023.728-6.149 2.237c-2.911 2.066-2.731 1.95-4.14 2.75c-.396.223-1.342.574-2.185.798c-.841.225-1.753.333-1.751.333v4.229s.768.108 1.61.333c.842.224 1.789.575 2.185.799c1.41.798 1.228.683 4.14 2.75c2.126 1.509 4.22 2.11 6.148 2.236c.88.058 1.716.041 2.555.005v1.918l7.222-4.168l-7.222-4.17v2.176c-.86.038-1.611.065-2.278.021c-1.364-.09-2.417-.357-3.979-1.465c-2.244-1.593-2.866-2.027-3.68-2.508c.889-.518 1.449-.906 3.822-2.59c1.56-1.109 2.614-1.377 3.978-1.466c.667-.044 1.418-.017 2.278.02v2.176L24 6.014Z" />
+    </svg>
+  );
+}
+
+export function DeepSeekLogo({ className = "h-3.5 w-3.5 shrink-0" }: { className?: string }) {
+  return (
+    <svg role="img" viewBox="0 0 24 24" fill="currentColor" className={className} xmlns="http://www.w3.org/2000/svg">
+      <path d="M23.748 4.651c-.254-.124-.364.113-.512.233-.051.04-.094.09-.137.137-.372.397-.806.657-1.373.626-.829-.046-1.537.214-2.163.848-.133-.782-.575-1.248-1.247-1.548-.352-.155-.708-.311-.955-.65-.172-.24-.219-.509-.305-.774-.055-.16-.11-.323-.293-.35-.2-.031-.278.136-.356.276-.313.572-.434 1.202-.422 1.84.027 1.436.633 2.58 1.838 3.393.137.094.172.187.129.323-.082.28-.18.553-.266.833-.055.179-.137.218-.328.14a5.5 5.5 0 0 1-1.737-1.179c-.857-.828-1.631-1.743-2.597-2.46a12 12 0 0 0-.689-.47c-.985-.957.13-1.743.387-1.836.27-.098.094-.433-.778-.428-.872.003-1.67.295-2.687.685a3 3 0 0 1-.465.136 9.6 9.6 0 0 0-2.883-.101c-1.885.21-3.39 1.1-4.497 2.622C.082 8.776-.231 10.854.152 13.02c.403 2.284 1.568 4.175 3.36 5.653 1.857 1.533 3.997 2.284 6.438 2.14 1.482-.085 3.132-.284 4.994-1.86.47.234.962.327 1.78.397.63.059 1.236-.03 1.705-.128.735-.156.684-.837.419-.961-2.155-1.004-1.682-.595-2.113-.926 1.096-1.296 2.746-2.642 3.392-7.003.05-.347.007-.565 0-.845-.004-.17.035-.237.23-.256a4.17 4.17 0 0 0 1.545-.475c1.396-.763 1.96-2.015 2.093-3.517.02-.23-.004-.467-.247-.588zM11.581 18c-2.089-1.642-3.102-2.183-3.52-2.16-.392.024-.321.471-.235.763.09.288.207.486.371.739.114.167.192.416-.113.603-.673.416-1.842-.14-1.897-.167-1.361-.802-2.5-1.86-3.301-3.307-.774-1.393-1.224-2.887-1.298-4.482-.02-.386.093-.522.477-.592a4.696 4.696 0 0 1 1.529-.039c2.132.312 3.946 1.265 5.468 2.774.868.86 1.525 1.887 2.202 2.891.72 1.066 1.494 2.082 2.48 2.914.348.292.625.514.891.677-.802.09-2.14.11-3.054-.614zm1-6.44a.306.306 0 0 1 .415-.287.302.302 0 0 1 .2.288.306.306 0 0 1-.31.307.303.303 0 0 1-.304-.308zm3.11 1.596c-.2.081-.399.151-.59.16a1.245 1.245 0 0 1-.951-.306c-.328-.314-.403-.787-.196-1.157.208-.37.606-.593 1.026-.563.42.03.784.309.923.708.139.399.022.846-.202 1.158z" />
+    </svg>
+  );
+}
+
+export function ProviderLogo({
+  provider,
+  className = "h-3.5 w-3.5 shrink-0",
+}: {
+  provider?: string | null;
+  className?: string;
+}) {
+  const norm = (provider || "").toLowerCase();
+  if (norm.includes("openai")) return <OpenAILogo className={className} />;
+  if (norm.includes("anthropic") || norm.includes("claude")) return <AnthropicLogo className={className} />;
+  if (norm.includes("openrouter")) return <OpenRouterLogo className={className} />;
+  if (norm.includes("deepseek")) return <DeepSeekLogo className={className} />;
+  return null;
 }

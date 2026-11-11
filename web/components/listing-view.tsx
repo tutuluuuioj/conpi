@@ -4,7 +4,7 @@ import { useRouter } from "next/navigation";
 import { ratioOf, usd, middle } from "@/lib/format";
 import { escrowOf } from "@/lib/money";
 import { useApp } from "@/lib/store";
-import { Button, Card, EmptyState, Overline } from "./ui";
+import { Button, Card, EmptyState, Overline, ProviderLogo } from "./ui";
 import { Store } from "lucide-react";
 
 export function ListingView({ id }: { id: string }) {
@@ -25,7 +25,10 @@ export function ListingView({ id }: { id: string }) {
       <div className="space-y-6 lg:col-span-8">
         <div>
           <Overline>{listing.type === "sell" ? "Sell listing" : "Buy request"}</Overline>
-          <h1 className="mt-2 text-2xl font-semibold tracking-tight md:text-[32px] md:leading-10">{listing.provider} · {listing.model}</h1>
+          <h1 className="mt-2 flex items-center gap-2 text-2xl font-semibold tracking-tight md:text-[32px] md:leading-10">
+            <ProviderLogo provider={listing.provider} className="h-6 w-6 shrink-0" />
+            <span>{listing.provider} · {listing.model}</span>
+          </h1>
           <p className="mt-2 text-muted">{usd(listing.credit)} credit at {usd(listing.price)} · {ratioOf(listing.price, listing.credit)}</p>
         </div>
         <Card>

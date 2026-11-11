@@ -1,5 +1,6 @@
 "use client";
 
+import "@/lib/polyfill";
 import Link from "next/link";
 import { usePathname } from "next/navigation";
 import { useEffect, useRef, useState } from "react";
@@ -15,11 +16,14 @@ import {
   Store,
   Wallet,
   X,
+  Loader2,
+  Plus,
+  Check,
 } from "lucide-react";
 import { CODE_HASH, CONTRACT_ID, DAO_ID, NETWORK, explorerAccount } from "@/lib/chain";
 import { assetAmount, middle } from "@/lib/format";
 import { pendingClaimTotal, unreadCount, useApp } from "@/lib/store";
-import type { WalletName } from "@/lib/types";
+import type { WalletName, WalletChain } from "@/lib/types";
 import { Button, HashChip, Modal } from "./ui";
 import { AttestationBadge } from "./attestation-badge";
 
@@ -39,12 +43,83 @@ function LandmarkIcon(props: { className?: string }) {
   );
 }
 
-const WALLETS: { name: WalletName; detail: string }[] = [
-  { name: "MyNearWallet", detail: "Browser wallet" },
-  { name: "Meteor", detail: "Browser wallet" },
-  { name: "HERE", detail: "Mobile wallet" },
-  { name: "Sender", detail: "Browser extension" },
-  { name: "Ledger", detail: "Hardware wallet" },
+interface MultiWalletOption {
+  id: string;
+  name: string;
+  chain: "evm" | "solana" | "near";
+  chainName: string;
+  detail: string;
+  tag: string;
+}
+
+const MULTI_WALLETS: MultiWalletOption[] = [
+  // EVM (Base Sepolia)
+  {
+    id: "metamask",
+    name: "MetaMask",
+    chain: "evm",
+    chainName: "Base Sepolia",
+    detail: "Pay or receive in Base Sepolia USDC & ETH",
+    tag: "EVM",
+  },
+  {
+    id: "coinbase",
+    name: "Coinbase Wallet",
+    chain: "evm",
+    chainName: "Base Sepolia",
+    detail: "Smart Wallet & browser extension",
+    tag: "EVM",
+  },
+  // Solana (Solana Devnet)
+  {
+    id: "phantom",
+    name: "Phantom",
+    chain: "solana",
+    chainName: "Solana Devnet",
+    detail: "Pay or receive in Devnet SOL & SPL-USDC",
+    tag: "Solana",
+  },
+  {
+    id: "solflare",
+    name: "Solflare",
+    chain: "solana",
+    chainName: "Solana Devnet",
+    detail: "Solana browser extension & web wallet",
+    tag: "Solana",
+  },
+  // NEAR Protocol (NEAR Testnet)
+  {
+    id: "mynearwallet",
+    name: "MyNearWallet",
+    chain: "near",
+    chainName: "NEAR Testnet",
+    detail: "Web-based testnet wallet account",
+    tag: "NEAR",
+  },
+  {
+    id: "meteor",
+    name: "Meteor",
+    chain: "near",
+    chainName: "NEAR Testnet",
+    detail: "Browser extension & web wallet",
+    tag: "NEAR",
+  },
+  {
+    id: "here",
+    name: "HERE",
+    chain: "near",
+    chainName: "NEAR Testnet",
+    detail: "Mobile & Telegram wallet",
+    tag: "NEAR",
+  },
+  {
+    id: "sender",
+    name: "Sender",
+    chain: "near",
+    chainName: "NEAR Testnet",
+    detail: "Browser extension",
+    tag: "NEAR",
+  },
 ];
 
 function active(pathname: string, href: string) {
@@ -60,6 +135,8 @@ export function Shell({ children }: { children: React.ReactNode }) {
   const [menu, setMenu] = useState(false);
   const [bell, setBell] = useState(false);
   const [connect, setConnect] = useState(false);
+  const [walletTab, setWalletTab] = useState<"all" | "evm" | "solana" | "near">("all");
+  const [connectingWalletId, setConnectingWalletId] = useState<string | null>(null);
   const [more, setMore] = useState(false);
   const menuRef = useRef<HTMLDivElement>(null);
   const bellRef = useRef<HTMLDivElement>(null);
@@ -135,27 +212,127 @@ export function Shell({ children }: { children: React.ReactNode }) {
             </div>
             {app.account ? (
               <div className="relative" ref={menuRef}>
-                <button type="button" className="focus-ring flex h-10 items-center gap-2 rounded-md border border-line bg-surface-2 px-2.5" onClick={() => { setMenu((v) => !v); setBell(false); }}>
-                  <span className="grid h-6 w-6 place-items-center rounded-full bg-brand text-[11px] font-semibold text-brand-ink">B</span>
-                  <span className="hidden font-mono text-[13px] sm:inline">{middle(app.account, 10, 4)}</span>
+                <button
+                  type="button"
+                  className="focus-ring flex h-10 items-center gap-2 rounded-md border border-line bg-surface-2 px-2.5 hover:border-brand/40"
+                  onClick={() => { setMenu((v) => !v); setBell(false); }}
+                >
+                  <span className={`grid h-6 w-6 place-items-center rounded-full text-[11px] font-bold ${
+                    app.walletChain === "evm"
+                      ? "bg-blue-500/20 text-blue-400"
+                      : app.walletChain === "solana"
+                      ? "bg-purple-500/20 text-purple-400"
+                      : "bg-emerald-500/20 text-emerald-400"
+                  }`}>
+                    {app.walletChain === "evm" ? "🔷" : app.walletChain === "solana" ? "🟣" : "Ⓝ"}
+                  </span>
+                  <span className="hidden font-mono text-[13px] sm:inline">{middle(app.account, 8, 4)}</span>
                 </button>
                 {menu ? (
-                  <div className="absolute right-0 z-50 mt-2 w-64 rounded-lg border border-line bg-surface p-2 shadow-2">
-                    <div className="px-2 py-2">
-                      <div className="font-mono text-[13px]">{app.account}</div>
-                      <div className="mt-1 text-xs text-muted">{app.wallet}</div>
-                      <div className="mt-2 space-y-1 text-sm tabular">
-                        <div className="flex justify-between"><span className="text-muted">NEAR</span><span>{assetAmount(app.near, "")}</span></div>
-                        <div className="flex justify-between"><span className="text-muted">USDC</span><span>{assetAmount(app.usdc, "")}</span></div>
-                        <div className="flex justify-between"><span className="text-muted">USDT</span><span>{assetAmount(app.usdt, "")}</span></div>
+                  <div className="absolute right-0 z-50 mt-2 w-72 rounded-lg border border-line bg-surface p-2 shadow-2">
+                    <div className="px-2 py-2 border-b border-line">
+                      <div className="flex items-center justify-between text-xs text-muted mb-1">
+                        <span>Active Identity</span>
+                        <span className={`text-[10px] uppercase font-semibold tracking-wider font-mono px-1.5 py-0.5 rounded ${
+                          app.walletChain === "evm"
+                            ? "bg-blue-500/10 text-blue-400"
+                            : app.walletChain === "solana"
+                            ? "bg-purple-500/10 text-purple-400"
+                            : "bg-emerald-500/10 text-emerald-400"
+                        }`}>
+                          {(app.walletChain || "near").toUpperCase()}
+                        </span>
                       </div>
+                      <div className="font-mono text-xs break-all text-ink font-semibold">{app.account}</div>
+                      <div className="mt-0.5 text-[11px] text-muted">{app.wallet}</div>
                     </div>
-                    <Link href="/history" className="flex items-center gap-2 rounded-md px-2 py-2 text-sm hover:bg-surface-2">Receipts</Link>
-                    <Link href="/claims" className="flex items-center gap-2 rounded-md px-2 py-2 text-sm hover:bg-surface-2">Claims</Link>
-                    <button type="button" className="flex w-full items-center gap-2 rounded-md px-2 py-2 text-sm hover:bg-surface-2" onClick={() => app.copy(app.account!)}><Copy className="h-4 w-4" /> Copy address</button>
-                    <a className="flex items-center gap-2 rounded-md px-2 py-2 text-sm hover:bg-surface-2" href={explorerAccount(app.account)} target="_blank" rel="noreferrer"><ExternalLink className="h-4 w-4" /> Explorer</a>
-                    <Link href="/settings" className="flex items-center gap-2 rounded-md px-2 py-2 text-sm hover:bg-surface-2">Settings</Link>
-                    <button type="button" className="flex w-full items-center gap-2 rounded-md px-2 py-2 text-sm text-danger hover:bg-surface-2" onClick={() => { app.disconnect(); setMenu(false); }}><LogOut className="h-4 w-4" /> Disconnect</button>
+
+                    {/* Multi-Chain Connected Accounts List */}
+                    <div className="px-2 py-2 border-b border-line space-y-1.5">
+                      <div className="flex items-center justify-between">
+                        <span className="text-[10px] font-semibold uppercase tracking-wider text-muted">Connected Chains</span>
+                        <span className="text-[10px] text-muted">Click to switch</span>
+                      </div>
+                      {app.nearAccount && (
+                        <div className={`flex items-center justify-between text-xs p-1.5 rounded border transition-colors ${
+                          app.walletChain === "near"
+                            ? "bg-emerald-500/10 border-emerald-500/40 text-emerald-300"
+                            : "bg-surface-2 border-line/60 hover:bg-surface-3 text-muted hover:text-ink cursor-pointer"
+                        }`} onClick={() => app.switchActiveChain("near")}>
+                          <span className="flex items-center gap-1.5 font-medium">
+                            <span>Ⓝ NEAR</span>
+                            {app.walletChain === "near" && (
+                              <span className="text-[9px] uppercase px-1 py-0.2 bg-emerald-500/20 text-emerald-400 rounded font-semibold">Active</span>
+                            )}
+                          </span>
+                          <span className="font-mono text-[11px]">{middle(app.nearAccount, 6, 4)}</span>
+                        </div>
+                      )}
+                      {app.evmAccount && (
+                        <div className={`flex items-center justify-between text-xs p-1.5 rounded border transition-colors ${
+                          app.walletChain === "evm"
+                            ? "bg-blue-500/10 border-blue-500/40 text-blue-300"
+                            : "bg-surface-2 border-line/60 hover:bg-surface-3 text-muted hover:text-ink cursor-pointer"
+                        }`} onClick={() => app.switchActiveChain("evm")}>
+                          <span className="flex items-center gap-1.5 font-medium">
+                            <span>🔷 Base EVM</span>
+                            {app.walletChain === "evm" && (
+                              <span className="text-[9px] uppercase px-1 py-0.2 bg-blue-500/20 text-blue-400 rounded font-semibold">Active</span>
+                            )}
+                          </span>
+                          <span className="font-mono text-[11px]">{middle(app.evmAccount, 6, 4)}</span>
+                        </div>
+                      )}
+                      {app.solanaAccount && (
+                        <div className={`flex items-center justify-between text-xs p-1.5 rounded border transition-colors ${
+                          app.walletChain === "solana"
+                            ? "bg-purple-500/10 border-purple-500/40 text-purple-300"
+                            : "bg-surface-2 border-line/60 hover:bg-surface-3 text-muted hover:text-ink cursor-pointer"
+                        }`} onClick={() => app.switchActiveChain("solana")}>
+                          <span className="flex items-center gap-1.5 font-medium">
+                            <span>🟣 Solana</span>
+                            {app.walletChain === "solana" && (
+                              <span className="text-[9px] uppercase px-1 py-0.2 bg-purple-500/20 text-purple-400 rounded font-semibold">Active</span>
+                            )}
+                          </span>
+                          <span className="font-mono text-[11px]">{middle(app.solanaAccount, 6, 4)}</span>
+                        </div>
+                      )}
+                      <button
+                        type="button"
+                        className="w-full text-left flex items-center gap-1 text-xs text-brand hover:underline pt-1 font-medium"
+                        onClick={() => { setMenu(false); setConnect(true); }}
+                      >
+                        <Plus className="h-3.5 w-3.5" /> Connect another wallet / chain
+                      </button>
+                    </div>
+
+                    <div className="px-2 py-2 border-b border-line space-y-1 text-xs tabular">
+                      <div className="flex justify-between font-medium"><span className="text-muted">USDC Balance</span><span className="text-emerald-400 font-semibold">{assetAmount(app.usdc, "")} USDC</span></div>
+                    </div>
+
+                    <div className="py-1">
+                      <Link href="/history" className="flex items-center gap-2 rounded-md px-2 py-1.5 text-xs hover:bg-surface-2">Receipts</Link>
+                      <Link href="/claims" className="flex items-center gap-2 rounded-md px-2 py-1.5 text-xs hover:bg-surface-2">Claims</Link>
+                      <button type="button" className="flex w-full items-center gap-2 rounded-md px-2 py-1.5 text-xs hover:bg-surface-2" onClick={() => app.copy(app.account!)}><Copy className="h-3.5 w-3.5" /> Copy active address</button>
+                      {app.walletChain === "near" && (
+                        <a className="flex items-center gap-2 rounded-md px-2 py-1.5 text-xs hover:bg-surface-2" href={explorerAccount(app.account)} target="_blank" rel="noreferrer"><ExternalLink className="h-3.5 w-3.5" /> NEAR Explorer</a>
+                      )}
+                      {app.walletChain === "evm" && (
+                        <a className="flex items-center gap-2 rounded-md px-2 py-1.5 text-xs hover:bg-surface-2" href={`https://sepolia.basescan.org/address/${app.account}`} target="_blank" rel="noreferrer"><ExternalLink className="h-3.5 w-3.5" /> BaseScan</a>
+                      )}
+                      {app.walletChain === "solana" && (
+                        <a className="flex items-center gap-2 rounded-md px-2 py-1.5 text-xs hover:bg-surface-2" href={`https://explorer.solana.com/address/${app.account}?cluster=devnet`} target="_blank" rel="noreferrer"><ExternalLink className="h-3.5 w-3.5" /> Solana Explorer</a>
+                      )}
+                      <Link href="/settings" className="flex items-center gap-2 rounded-md px-2 py-1.5 text-xs hover:bg-surface-2">Settings</Link>
+                      {app.walletChain === "evm" && app.solanaAccount && (
+                        <button type="button" className="flex w-full items-center gap-2 rounded-md px-2 py-1.5 text-xs text-muted hover:text-ink hover:bg-surface-2" onClick={() => { app.disconnectEvm(); setMenu(false); }}><LogOut className="h-3.5 w-3.5" /> Disconnect EVM only</button>
+                      )}
+                      {app.walletChain === "solana" && app.evmAccount && (
+                        <button type="button" className="flex w-full items-center gap-2 rounded-md px-2 py-1.5 text-xs text-muted hover:text-ink hover:bg-surface-2" onClick={() => { void app.disconnectSolana(); setMenu(false); }}><LogOut className="h-3.5 w-3.5" /> Disconnect Solana only</button>
+                      )}
+                      <button type="button" className="flex w-full items-center gap-2 rounded-md px-2 py-1.5 text-xs text-danger hover:bg-surface-2" onClick={() => { void app.disconnect(); setMenu(false); }}><LogOut className="h-3.5 w-3.5" /> Disconnect All</button>
+                    </div>
                   </div>
                 ) : null}
               </div>
@@ -239,20 +416,145 @@ export function Shell({ children }: { children: React.ReactNode }) {
         </div>
       ) : null}
 
-      <Modal open={connect} title="Connect a wallet" onClose={() => setConnect(false)}>
-        <ul className="space-y-2">
-          {WALLETS.map((wallet) => (
-            <li key={wallet.name}>
-              <button type="button" className="focus-ring flex w-full items-center justify-between rounded-lg border border-line px-3 py-3 text-left hover:border-brand/40" onClick={() => { app.connect(wallet.name); setConnect(false); }}>
-                <span>
-                  <span className="block text-sm font-semibold text-ink">{wallet.name}</span>
-                  <span className="text-xs text-muted">{wallet.detail}</span>
-                </span>
-                <Wallet className="h-4 w-4" />
-              </button>
-            </li>
-          ))}
-        </ul>
+      <Modal open={connect || app.isConnectModalOpen} title="Connect a wallet" onClose={() => { setConnect(false); app.closeConnectModal(); }}>
+        <div className="space-y-4">
+          <p className="text-xs text-muted">
+            Connect your wallet to trade, deposit escrow funds, or receive milestone payouts on your preferred chain.
+          </p>
+
+          {/* Chain Tabs */}
+          <div className="grid grid-cols-4 gap-1 p-1 rounded-lg border border-line bg-surface-2">
+            <button
+              type="button"
+              className={`py-1.5 text-xs font-medium rounded-md transition-all text-center ${
+                walletTab === "all" ? "bg-surface shadow text-ink font-semibold" : "text-muted hover:text-ink"
+              }`}
+              onClick={() => setWalletTab("all")}
+            >
+              All
+            </button>
+            <button
+              type="button"
+              className={`py-1.5 text-xs font-medium rounded-md transition-all flex items-center justify-center gap-1.5 ${
+                walletTab === "evm" ? "bg-surface shadow text-brand font-semibold" : "text-muted hover:text-ink"
+              }`}
+              onClick={() => setWalletTab("evm")}
+            >
+              <span className="h-2 w-2 rounded-full bg-blue-500" />
+              Base EVM
+            </button>
+            <button
+              type="button"
+              className={`py-1.5 text-xs font-medium rounded-md transition-all flex items-center justify-center gap-1.5 ${
+                walletTab === "solana" ? "bg-surface shadow text-purple-400 font-semibold" : "text-muted hover:text-ink"
+              }`}
+              onClick={() => setWalletTab("solana")}
+            >
+              <span className="h-2 w-2 rounded-full bg-purple-500" />
+              Solana
+            </button>
+            <button
+              type="button"
+              className={`py-1.5 text-xs font-medium rounded-md transition-all flex items-center justify-center gap-1.5 ${
+                walletTab === "near" ? "bg-surface shadow text-emerald-400 font-semibold" : "text-muted hover:text-ink"
+              }`}
+              onClick={() => setWalletTab("near")}
+            >
+              <span className="h-2 w-2 rounded-full bg-emerald-500" />
+              NEAR
+            </button>
+          </div>
+
+          {/* Wallets List */}
+          <ul className="space-y-2 max-h-[360px] overflow-y-auto pr-1">
+            {MULTI_WALLETS.filter((w) => walletTab === "all" || w.chain === walletTab).map((wallet) => {
+              const isConnecting = connectingWalletId === wallet.id;
+              const isConnected =
+                (wallet.chain === "near" && app.nearAccount && (app.wallet === wallet.name || app.account === app.nearAccount)) ||
+                (wallet.chain === "evm" && app.evmAccount && (app.wallet === wallet.name || app.account === app.evmAccount)) ||
+                (wallet.chain === "solana" && app.solanaAccount && (app.wallet === wallet.name || app.account === app.solanaAccount));
+
+              return (
+                <li key={wallet.id}>
+                  <button
+                    type="button"
+                    disabled={isConnecting}
+                    className="focus-ring flex w-full items-center justify-between rounded-lg border border-line p-3 text-left hover:border-brand/50 hover:bg-surface-2/60 transition-all disabled:opacity-60"
+                    onClick={async () => {
+                      setConnectingWalletId(wallet.id);
+                      try {
+                        if (wallet.chain === "evm") {
+                          await app.connectEvm(wallet.name as any);
+                          setConnect(false);
+                          app.closeConnectModal();
+                        } else if (wallet.chain === "solana") {
+                          await app.connectSolana(wallet.name as any);
+                          setConnect(false);
+                          app.closeConnectModal();
+                        } else {
+                          setConnect(false);
+                          app.closeConnectModal();
+                          const { connectWalletModal } = await import("@/lib/wallet");
+                          await connectWalletModal();
+                        }
+                      } catch (err) {
+                        console.warn("Wallet connect failed:", err);
+                      } finally {
+                        setConnectingWalletId(null);
+                      }
+                    }}
+                  >
+                    <div className="flex items-center gap-3">
+                      <div className={`grid h-9 w-9 shrink-0 place-items-center rounded-lg text-base font-bold ${
+                        wallet.chain === "evm"
+                          ? "bg-blue-500/10 text-blue-400 border border-blue-500/20"
+                          : wallet.chain === "solana"
+                          ? "bg-purple-500/10 text-purple-400 border border-purple-500/20"
+                          : "bg-emerald-500/10 text-emerald-400 border border-emerald-500/20"
+                      }`}>
+                        {wallet.chain === "evm" ? "🔷" : wallet.chain === "solana" ? "🟣" : "Ⓝ"}
+                      </div>
+                      <div>
+                        <div className="flex items-center gap-2">
+                          <span className="text-sm font-semibold text-ink">{wallet.name}</span>
+                          <span className={`text-[10px] px-1.5 py-0.5 rounded font-medium ${
+                            wallet.chain === "evm"
+                              ? "bg-blue-500/10 text-blue-400 border border-blue-500/20"
+                              : wallet.chain === "solana"
+                              ? "bg-purple-500/10 text-purple-400 border border-purple-500/20"
+                              : "bg-emerald-500/10 text-emerald-400 border border-emerald-500/20"
+                          }`}>
+                            {wallet.chainName}
+                          </span>
+                        </div>
+                        <p className="text-xs text-muted mt-0.5">{wallet.detail}</p>
+                      </div>
+                    </div>
+
+                    <div className="shrink-0 pl-2">
+                      {isConnecting ? (
+                        <Loader2 className="h-4 w-4 animate-spin text-brand" />
+                      ) : isConnected ? (
+                        <span className="flex items-center gap-1 text-xs text-mint font-medium">
+                          <Check className="h-3.5 w-3.5" /> Connected
+                        </span>
+                      ) : (
+                        <span className="text-xs text-muted hover:text-ink">Connect →</span>
+                      )}
+                    </div>
+                  </button>
+                </li>
+              );
+            })}
+          </ul>
+
+          <div className="rounded-md border border-line bg-surface-2 p-2.5 text-[11px] text-muted space-y-1">
+            <span className="font-semibold text-ink block">Omnichain Settlement</span>
+            <p>
+              Conpi uses <strong>NEAR Chain Signatures</strong> & <strong>MPC</strong> to connect Base Sepolia (EVM), Solana Devnet (SVM), and NEAR Testnet into one seamless market.
+            </p>
+          </div>
+        </div>
       </Modal>
 
       <Modal

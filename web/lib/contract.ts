@@ -1,7 +1,11 @@
+import { Buffer } from "buffer";
+if (typeof window !== "undefined") {
+  (window as any).Buffer = (window as any).Buffer || Buffer;
+}
 import { CONTRACT_ID } from "./chain";
 
 export const NEAR_RPC_URL = process.env.NEXT_PUBLIC_NEAR_RPC || "https://test.rpc.fastnear.com";
-const FALLBACK_RPC_URL = "https://rpc.testnet.near.org";
+const FALLBACK_RPC_URL = "https://test.rpc.fastnear.com";
 
 function parseNearResult<T>(value: string): T {
   // Contract view methods currently serialize u128 balances as JSON numbers.
@@ -80,9 +84,8 @@ export async function callNearRpc<T>(methodName: string, args: Record<string, an
   // set to the official endpoint. A transient failure must not make the UI
   // replace real on-chain deals with an empty list.
   const urls = Array.from(new Set([
-    NEAR_RPC_URL,
     "https://test.rpc.fastnear.com",
-    FALLBACK_RPC_URL,
+    NEAR_RPC_URL,
   ].filter(Boolean)));
 
   let lastError: any = null;
@@ -93,6 +96,7 @@ export async function callNearRpc<T>(methodName: string, args: Record<string, an
           method: "POST",
           headers: { "Content-Type": "application/json" },
           cache: "no-store",
+          signal: AbortSignal.timeout(8000),
           body: JSON.stringify({
             jsonrpc: "2.0",
             id: `query_${methodName}_${Date.now()}_${attempt}`,
@@ -133,10 +137,35 @@ export async function callNearRpc<T>(methodName: string, args: Record<string, an
 }
 
 export async function fetchContractDeals(fromIndex = 0, limit = 100): Promise<OnChainDeal[]> {
+  if (typeof window !== "undefined") {
+    try {
+      const res = await fetch("/api/deals", { cache: "no-store", signal: AbortSignal.timeout(6000) });
+      if (res.ok) {
+        const data = await res.json();
+        if (data.ok && Array.isArray(data.deals) && data.deals.length > 0) {
+          return data.deals as OnChainDeal[];
+        }
+      }
+    } catch (err) {
+      console.warn("Client /api/deals route error, falling back to direct NEAR RPC:", err);
+    }
+  }
   return callNearRpc<OnChainDeal[]>("list_deals", { from_index: fromIndex, limit });
 }
 
 export async function fetchContractDeal(dealId: number): Promise<OnChainDeal | null> {
+  if (typeof window !== "undefined") {
+    try {
+      const res = await fetch("/api/deals", { cache: "no-store", signal: AbortSignal.timeout(6000) });
+      if (res.ok) {
+        const data = await res.json();
+        if (data.ok && Array.isArray(data.deals)) {
+          const match = data.deals.find((d: any) => Number(d.id) === Number(dealId));
+          if (match) return match as OnChainDeal;
+        }
+      }
+    } catch {}
+  }
   try {
     return await callNearRpc<OnChainDeal | null>("get_deal", { deal_id: dealId });
   } catch (err) {
@@ -194,6 +223,7 @@ export async function fetchContractDealCreator(dealId: number): Promise<string |
         const response = await fetch(url, {
           method: "POST",
           headers: { "Content-Type": "application/json" },
+          signal: AbortSignal.timeout(8000),
           body: JSON.stringify({
             jsonrpc: "2.0",
             id: `creator_${dealId}`,
@@ -217,4 +247,29 @@ export async function fetchContractDealCreator(dealId: number): Promise<string |
     }
   } catch {}
   return null;
+}
+
+export async function fetchContractForeignDeal(dealId: number): Promise<any | null> {
+  if (typeof window !== "undefined") {
+    try {
+      const res = await fetch(`/api/foreign-deal?id=${dealId}`, {
+        cache: "no-store",
+        signal: AbortSignal.timeout(6000),
+      });
+      if (res.ok) {
+        const json = await res.json();
+        if (json.ok && json.foreignDeal) {
+          return json.foreignDeal;
+        }
+      }
+    } catch (e) {
+      console.warn(`[fetchContractForeignDeal] API route fallback to direct RPC for ${dealId}:`, e);
+    }
+  }
+
+  try {
+    return await callNearRpc<any>("get_foreign_deal", { deal_id: dealId });
+  } catch {
+    return null;
+  }
 }

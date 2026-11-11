@@ -31,7 +31,7 @@ export function HistoryView() {
           <tbody>
             {deals.map((deal) => {
               const net = netFor(deal);
-              const amount = (value: number) => deal.token === "NEAR" ? assetAmount(value, "NEAR") : usd(value);
+              const amount = (value: number) => usd(value);
               return (
                 <tr key={deal.id} className="border-t border-line hover:bg-surface-2">
                   <td className="px-4 py-3"><Link className="font-semibold" href={`/history/${deal.id}`}>{deal.id}</Link></td>
@@ -51,7 +51,7 @@ export function HistoryView() {
       <div className="space-y-3 md:hidden">
         {deals.map((deal) => {
           const net = netFor(deal);
-          const amount = (value: number) => deal.token === "NEAR" ? assetAmount(value, "NEAR") : usd(value);
+          const amount = (value: number) => usd(value);
           return (
             <Link key={deal.id} href={`/history/${deal.id}`}>
               <Card>
