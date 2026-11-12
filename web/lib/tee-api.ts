@@ -4,7 +4,10 @@ import type { SellerKeyAuthorization } from "./seller-key-auth";
 const TEE_BASE_URL =
   process.env.NEXT_PUBLIC_TEE_URL ||
   "https://ce5044ca834d2da5bb1252706bfa3b2c91d7d934-3000.dstack-pha1-prod5.phala.network";
-const NEAR_RPC_URL = process.env.NEXT_PUBLIC_NEAR_RPC || "https://archival-rpc.testnet.near.org";
+// The legacy NEAR testnet RPCs have been retired. Keep the browser fallback on
+// the same maintained endpoint used by the enclave so cross-chain acceptance
+// does not fail just because one public RPC hostname disappeared.
+const NEAR_RPC_URL = process.env.NEXT_PUBLIC_NEAR_RPC || "https://test.rpc.fastnear.com";
 
 export interface TeeAttestation {
   inEnclave: boolean;
@@ -290,6 +293,19 @@ export const teeApi = {
   },
 
   async getNearDeal(dealId: number): Promise<any> {
+    // Prefer the enclave's chain view. Apart from avoiding a second browser-side
+    // RPC dependency, this guarantees the seller signs the same deal state that
+    // the enclave will validate and relay.
+    try {
+      const enclaveRes = await fetch(`${TEE_BASE_URL}/v1/chain/deal/${dealId}`, {
+        cache: "no-store",
+      });
+      if (enclaveRes.ok) return await enclaveRes.json();
+    } catch {
+      // Fall back to a direct read so a transient enclave route failure does not
+      // block the seller before the signed acceptance is submitted.
+    }
+
     try {
       const argsBase64 = btoa(JSON.stringify({ deal_id: dealId }));
       const res = await fetch(NEAR_RPC_URL, {
@@ -309,6 +325,7 @@ export const teeApi = {
         }),
       });
       const data = await res.json();
+      if (!res.ok || data?.error) return null;
       if (data?.result?.result) {
         const text = new TextDecoder().decode(new Uint8Array(data.result.result));
         return JSON.parse(text);

@@ -493,7 +493,13 @@ export class NearRelayer {
       seller_address: params.sellerAddress,
       public_key: Array.from(params.publicKey),
       nonce: params.nonce,
-      expires_at: params.expiresAtNs.toString(),
+      // The deployed contract accepts a plain Rust `u64`, so NEAR JSON must
+      // contain a number here. A string is only valid when the contract uses
+      // `near_sdk::json_types::U64` and causes deserialization to fail before
+      // signature verification. Nanosecond timestamps are larger than JS's
+      // exact integer range, but IEEE-754 rounding is sub-microsecond and does
+      // not affect the contract's five-minute expiry window.
+      expires_at: Number(params.expiresAtNs),
       signature: Array.from(params.signature),
     });
   }
