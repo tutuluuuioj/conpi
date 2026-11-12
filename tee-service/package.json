@@ -12,7 +12,8 @@
     "test:phase3": "NODE_ENV=test tsx test/phase3.test.ts",
     "test:phase4": "NODE_ENV=test tsx test/phase4.test.ts",
     "test:multichain": "NODE_ENV=test tsx test/base-client.test.ts && NODE_ENV=test tsx test/foreign-relayer.test.ts",
-    "provision:relayer": "node scripts/provision-relayer.mjs"
+    "provision:relayer": "node scripts/provision-relayer.mjs",
+    "sync:relayer-permissions": "node scripts/sync-relayer-permissions.mjs"
   },
   "dependencies": {
     "@anthropic-ai/tokenizer": "^0.0.4",
