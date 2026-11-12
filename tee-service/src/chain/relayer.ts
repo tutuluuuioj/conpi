@@ -110,6 +110,52 @@ export class NearRelayer {
     return null;
   }
 
+  private extractSolanaTxSignedEvent(receiptsOutcome?: any[]): any {
+    if (!Array.isArray(receiptsOutcome)) return null;
+    for (const receipt of receiptsOutcome) {
+      const logs = receipt?.outcome?.logs || [];
+      for (const log of logs) {
+        if (typeof log !== "string" || !log.startsWith("EVENT_JSON:")) continue;
+        try {
+          const parsed = JSON.parse(log.slice("EVENT_JSON:".length));
+          if (parsed.standard === "conpi" && parsed.event === "solana_tx_signed") {
+            return parsed.data?.[0] || parsed.data || null;
+          }
+        } catch {
+          // A malformed log cannot make the relayer trust a payout event.
+        }
+      }
+    }
+    return null;
+  }
+
+  private payloadForContract(payloadDto: any, kind: string, stage = 0, reason: string | null = null) {
+    const termsHash = payloadDto.termsHash || payloadDto.termsHashHex;
+    const termsHashBytes = Array.from(
+      Buffer.isBuffer(termsHash) ? termsHash : Buffer.from(String(termsHash).replace(/^0x/, ""), "hex")
+    );
+    const sighash = payloadDto.foreignTxSighash || payloadDto.foreign_tx_sighash;
+    const foreignTxSighash = !sighash
+      ? null
+      : Array.isArray(sighash)
+        ? sighash
+        : Array.from(Buffer.from(String(sighash).replace(/^0x/, ""), "hex"));
+    return {
+      domain: payloadDto.domain,
+      contract_id: payloadDto.contractId,
+      chain_id: payloadDto.chainId,
+      deal_id: Number(payloadDto.dealId),
+      terms_hash: termsHashBytes,
+      kind,
+      stage: Number(stage),
+      metered_value: payloadDto.meteredValueYocto ? payloadDto.meteredValueYocto.toString() : "0",
+      reason,
+      nonce: Number(payloadDto.nonce),
+      issued_at: Number(payloadDto.issuedAtNs),
+      foreign_tx_sighash: foreignTxSighash,
+    };
+  }
+
   public async submitActivate(dealId: number, payloadDto: any, signatureHex: string) {
     const termsHashBytes = Array.from(
       Buffer.isBuffer(payloadDto.termsHash) ? payloadDto.termsHash : Buffer.from(payloadDto.termsHashHex, "hex")
@@ -432,6 +478,114 @@ export class NearRelayer {
     });
   }
 
+  public async submitAcceptDealSolana(params: {
+    dealId: number;
+    expectedHashHex: string;
+    sellerAddress: string;
+    publicKey: Uint8Array | number[];
+    nonce: number;
+    expiresAtNs: bigint | number | string;
+    signature: Uint8Array | number[];
+  }) {
+    return this.submitFunctionCall("accept_deal_solana", {
+      deal_id: params.dealId,
+      expected_hash: Array.from(Buffer.from(params.expectedHashHex.replace(/^0x/, ""), "hex")),
+      seller_address: params.sellerAddress,
+      public_key: Array.from(params.publicKey),
+      nonce: params.nonce,
+      expires_at: params.expiresAtNs.toString(),
+      signature: Array.from(params.signature),
+    });
+  }
+
+  public async submitRecordSolanaCollateral(
+    dealId: number,
+    txSignature: string,
+    payloadDto: any,
+    signatureHex: string,
+  ) {
+    return this.submitFunctionCall("record_solana_collateral", {
+      deal_id: dealId,
+      tx_signature: txSignature,
+      payload: this.payloadForContract(payloadDto, "ForeignDeposit"),
+      sig: Array.from(Buffer.from(signatureHex, "hex")),
+    });
+  }
+
+  public async submitRequestSolanaStagePayout(
+    dealId: number,
+    stage: number,
+    payloadDto: any,
+    signatureHex: string,
+    solanaTx: {
+      messageHex: string;
+      messageHashHex: string;
+      recipient: string;
+      amountAtomic: bigint | string;
+      lastValidBlockHeight: number;
+    },
+  ) {
+    let result: { transactionHash: string; status: any; receiptsOutcome?: any[] };
+    try {
+      result = await this.submitFunctionCall(
+        "request_solana_stage_payout",
+        {
+        deal_id: dealId,
+        stage,
+        payload: this.payloadForContract(payloadDto, "Stage", stage),
+        sig: Array.from(Buffer.from(signatureHex, "hex")),
+        solana_tx: {
+          message_hex: solanaTx.messageHex,
+          message_hash: Array.from(Buffer.from(solanaTx.messageHashHex.replace(/^0x/, ""), "hex")),
+          recipient: solanaTx.recipient,
+          amount: solanaTx.amountAtomic.toString(),
+          last_valid_block_height: solanaTx.lastValidBlockHeight,
+        },
+        },
+        "290000000000000",
+      );
+    } catch (error) {
+      // A lost RPC response can happen after the contract saved the pending
+      // transaction. Read that state instead of generating another payout.
+      const pending = await this.getSolanaPendingPayout(dealId).catch(() => null);
+      if (!pending?.signature_hex || Number(pending.stage) !== stage) throw error;
+      return {
+        transactionHash: "",
+        status: "recovered_pending_solana_payout",
+        solanaTxSigned: {
+          deal_id: dealId,
+          stage,
+          recipient: pending.recipient,
+          amount: pending.amount,
+          message_hex: pending.message_hex,
+          message_hash_hex: Buffer.from(pending.message_hash).toString("hex"),
+          signature_hex: pending.signature_hex,
+          last_valid_block_height: Number(pending.last_valid_block_height),
+        },
+      };
+    }
+    const solanaTxSigned = this.extractSolanaTxSignedEvent(result.receiptsOutcome)
+      || await this.getSolanaPendingPayout(dealId).catch(() => null);
+    if (!solanaTxSigned?.signature_hex) {
+      throw new Error("NEAR Chain Signatures did not return a Solana payout signature");
+    }
+    return { ...result, solanaTxSigned };
+  }
+
+  public async submitConfirmSolanaStagePayout(
+    dealId: number,
+    txSignature: string,
+    payloadDto: any,
+    signatureHex: string,
+  ) {
+    return this.submitFunctionCall("confirm_solana_stage_payout", {
+      deal_id: dealId,
+      tx_signature: txSignature,
+      payload: this.payloadForContract(payloadDto, "ForeignPayout", Number(payloadDto.stage || 0)),
+      sig: Array.from(Buffer.from(signatureHex, "hex")),
+    });
+  }
+
   public async submitRegisterForeignChainDeal(params: {
     dealId: number;
     chainId: number;
@@ -454,6 +608,14 @@ export class NearRelayer {
 
   public async getForeignDeal(dealId: number): Promise<any> {
     return this.callView("get_foreign_deal", { deal_id: dealId });
+  }
+
+  public async getSolanaDeal(dealId: number): Promise<any> {
+    return this.callView("get_solana_deal", { deal_id: dealId });
+  }
+
+  public async getSolanaPendingPayout(dealId: number): Promise<any> {
+    return this.callView("get_solana_pending_payout", { deal_id: dealId });
   }
 
   public async getDeal(dealId: number): Promise<any> {

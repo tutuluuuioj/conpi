@@ -46,7 +46,7 @@ import { verifyLiveAttestation } from "./attestation-verifier";
 import { getLiveNearPrice } from "./oracle";
 import { deriveForeignVaultAddress, BASE_SEPOLIA_CHAIN_ID, BASE_SEPOLIA_USDC, computeForeignTransferSighash } from "./chain-signatures";
 import { connectMetaMask, disconnectEvmWallet } from "./evm-wallet";
-import { connectSolanaWallet, disconnectSolanaWallet } from "./solana-wallet";
+import { connectSolanaWallet, disconnectSolanaWallet, signSolanaDealAcceptance } from "./solana-wallet";
 import { toNearAccountId, fromNearAccountId, isValidNearAccountId } from "./near-account";
 import { MAKER_VAULT_CONFIG } from "./maker-vault";
 import { signSellerKeyAuthorization } from "./seller-key-auth";
@@ -176,6 +176,7 @@ interface Api {
     buyerEvmAddress?: string,
     sellerEvmAddress?: string
   ) => Promise<SignResult>;
+  depositSolanaCollateral: (dealId: string, solanaTxSignature: string) => Promise<SignResult>;
   depositUsdcViaMakerVault: (
     dealId: string,
     chain: "base" | "solana" | "near",
@@ -331,7 +332,7 @@ function teeTermSheetForDeal(deal: Deal, party: "buyer" | "seller") {
     priceUsd: Number(priceUsd),
     buyerCollateralPct: terms.buyerCollateralPct,
     sellerCollateralPct: terms.sellerCollateralPct,
-    token: "USDC",
+    token: MAKER_VAULT_CONFIG.near.tokenAddress,
     depositDurationSec: DEAL_DEPOSIT_DURATION_SEC,
     keyDurationSec: DEAL_KEY_DURATION_SEC,
     teeLivenessTimeoutSec: CONFIG.teeLivenessSec,
@@ -340,16 +341,6 @@ function teeTermSheetForDeal(deal: Deal, party: "buyer" | "seller") {
     slashBpsBuyerBreach: CONFIG.slashBuyerBreachBps,
     deadline: (terms.deadline && terms.deadline.length >= 10) ? terms.deadline.slice(0, 10) : "2026-12-02",
   };
-}
-
-function toYoctoNear(nearAmount: number): string {
-  if (!nearAmount || isNaN(nearAmount) || nearAmount <= 0) return "0";
-  // Safe 12-decimal string parsing into 24-decimal yocto to prevent IEEE 754 precision loss
-  const fixed = nearAmount.toFixed(12);
-  const [whole, dec = ""] = fixed.split(".");
-  const wholePart = BigInt(whole) * BigInt("1000000000000000000000000");
-  const decPart = BigInt(dec.padEnd(24, "0").slice(0, 24));
-  return (wholePart + decPart).toString();
 }
 
 function toMicroUnits(tokenAmount: number): string {
@@ -364,34 +355,15 @@ async function dealParamsForListing(listing: Listing, buyer: string, seller: str
     throw new Error("Buyer and seller must use different accounts");
   }
 
-  const isNear = (listing.token as any) === "NEAR" || !(listing as any).tokenContract || !(listing as any).token;
-  let priceUnits: string;
-  let creditUnits: string;
-  let buyerCollateralUnits: string;
-  let sellerCollateralUnits: string;
-
-  if (isNear) {
-    const nearPrice = await getLiveNearPrice();
-    const priceNear = listing.price / nearPrice;
-    const creditNear = listing.credit / nearPrice;
-    const buyerCollateralNear = (listing.price * (listing.buyerCollateralPct || 0)) / (100 * nearPrice);
-    const sellerCollateralNear = (listing.price * (listing.collateralPct || 0)) / (100 * nearPrice);
-
-    priceUnits = toYoctoNear(priceNear);
-    creditUnits = toYoctoNear(creditNear);
-    buyerCollateralUnits = toYoctoNear(buyerCollateralNear);
-    sellerCollateralUnits = toYoctoNear(sellerCollateralNear);
-  } else {
-    priceUnits = toMicroUnits(listing.price);
-    creditUnits = toMicroUnits(listing.credit);
-    buyerCollateralUnits = toMicroUnits((listing.price * (listing.buyerCollateralPct || 0)) / 100);
-    sellerCollateralUnits = toMicroUnits((listing.price * (listing.collateralPct || 0)) / 100);
-  }
+  const priceUnits = toMicroUnits(listing.price);
+  const creditUnits = toMicroUnits(listing.credit);
+  const buyerCollateralUnits = toMicroUnits((listing.price * (listing.buyerCollateralPct || 0)) / 100);
+  const sellerCollateralUnits = toMicroUnits((listing.price * (listing.collateralPct || 0)) / 100);
 
   return {
     buyer: nearBuyer,
     seller: nearSeller,
-    token: null,
+    token: MAKER_VAULT_CONFIG.near.tokenAddress,
     price: priceUnits,
     credit_amount: creditUnits,
     buyer_collateral: buyerCollateralUnits,
@@ -1709,9 +1681,9 @@ export function Providers({ children }: { children: React.ReactNode }) {
         const buyer = deal.buyer;
         const seller = deal.seller;
 
-        // 100% USDC-Only:
-        // Micro-units: 6 decimals (1 USDC = 1,000,000)
-        // Multi-chain Maker Vault specifies token: null for foreign settlement
+        // 100% USDC-only: store six-decimal amounts and bind the NEAR-side
+        // escrow to its canonical NEP-141 USDC contract. Foreign rails keep
+        // their chain-specific token address in ForeignDeal.
         const priceUnits = toMicroUnits(ownTerms.price);
         const creditUnits = toMicroUnits(ownTerms.credit);
         const buyerColUnits = toMicroUnits((ownTerms.price * (ownTerms.buyerCollateralPct || 0)) / 100);
@@ -1733,7 +1705,7 @@ export function Providers({ children }: { children: React.ReactNode }) {
           const params = {
             buyer: nearBuyer,
             seller: nearSeller,
-            token: null,
+            token: MAKER_VAULT_CONFIG.near.tokenAddress,
             price: priceUnits,
             credit_amount: creditUnits,
             buyer_collateral: buyerColUnits,
@@ -1826,6 +1798,43 @@ export function Providers({ children }: { children: React.ReactNode }) {
           const hashBytes = Array.from(Buffer.from(cleanHex, "hex"));
           if (hashBytes.length !== 32) throw new Error("Deal terms_hash missing or invalid");
 
+          const solanaAddress = stateRef.current.solanaAccount;
+          const solanaSeller = solanaAddress && toNearAccountId(solanaAddress).toLowerCase() === deal.seller.toLowerCase();
+          if (solanaSeller) {
+            // Submit the seller's encrypted term sheet now, so the key
+            // activation screen cannot proceed until the buyer has supplied
+            // their matching term sheet as well.
+            await submitPartyTermsToTee(deal, "seller");
+            const [onChain, vault] = await Promise.all([
+              teeApi.getNearDeal(Number(dealId)),
+              teeApi.getSolanaVaultConfig(),
+            ]);
+            if (!onChain) throw new Error("The on-chain deal could not be loaded");
+            const acceptance = await signSolanaDealAcceptance({
+              contractId: CONTRACT_ID,
+              network: "testnet",
+              dealId: Number(dealId),
+              termsHashHex: cleanHex,
+              vaultAddress: String(vault?.vault_address || ""),
+              tokenMint: String(vault?.token_mint || ""),
+              sellerCollateralAtomic: String(onChain.seller_collateral || "0"),
+              sellerCanonicalAddress: toNearAccountId(solanaAddress),
+            });
+            const result = await teeApi.acceptSolanaDeal(Number(dealId), {
+              expectedHashHex: cleanHex,
+              ...acceptance,
+              sellerAddress: toNearAccountId(acceptance.sellerAddress),
+            });
+            if (!result.ok) throw new Error(result.error || "Solana seller acceptance was rejected");
+            setTimeout(loadOnChainData, 1_500);
+            return {
+              ok: true,
+              title: "Deal accepted by Solana seller",
+              body: "The Solana wallet signature and payout vault are now locked on the NEAR escrow.",
+              href: result.transactionHash ? `https://testnet.nearblocks.io/txns/${result.transactionHash}` : undefined,
+            };
+          }
+
           const outcome: any = await txAcceptDeal(Number(dealId), hashBytes);
           const txHash = outcome?.transaction?.hash || outcome?.transaction_outcome?.id;
           if (!txHash) throw new Error("Accept deal transaction was not confirmed");
@@ -1849,9 +1858,14 @@ export function Providers({ children }: { children: React.ReactNode }) {
         const amount = isBuyer ? escrow.buyerDeposit : escrow.sellerDeposit;
 
         try {
+          const tokenContract = MAKER_VAULT_CONFIG.near.tokenAddress;
+          const initialDeal = await fetchContractDeal(Number(dealId));
+          if (!initialDeal) throw new Error(`Deal #${dealId} was not found on-chain`);
+          if (initialDeal.token !== tokenContract) {
+            throw new Error(`Deal #${dealId} was created with legacy native-NEAR terms and cannot accept USDC. Create a new deal before depositing.`);
+          }
           await submitPartyTermsToTee(deal, deal.role);
           // 100% USDC deposits on NEAR using official Circle Native USDC:
-          const tokenContract = MAKER_VAULT_CONFIG.near.tokenAddress;
           const rawAmount = Math.round(amount * 1e6).toString();
 
           const outcome: any = await txDepositFt(tokenContract, Number(dealId), rawAmount);
@@ -2024,6 +2038,46 @@ export function Providers({ children }: { children: React.ReactNode }) {
           return { ok: false, title: "Base Deposit Verification Failed", body: err.message };
         }
       },
+      depositSolanaCollateral: async (dealId, solanaTxSignature) => {
+        const deal = stateRef.current.deals.find((item) => item.id === dealId);
+        if (!deal) return { ok: false, title: "Deal not found" };
+        try {
+          const solanaAccount = stateRef.current.solanaAccount;
+          if (!solanaAccount || toNearAccountId(solanaAccount).toLowerCase() !== deal.seller.toLowerCase()) {
+            throw new Error("Connect the Solana seller wallet before recording collateral");
+          }
+          await submitPartyTermsToTee(deal, "seller");
+          const termsHashHex = deal.termsHash?.replace(/^0x/, "") || "";
+          if (termsHashHex.length !== 64) throw new Error("Deal terms hash is missing");
+          const result = await teeApi.verifySolanaCollateral(Number(dealId), {
+            txSignature: solanaTxSignature,
+            termsHashHex,
+          });
+          if (!result.ok) throw new Error(result.error || "TEE rejected the Solana collateral transfer");
+          patchDeal(dealId, (item) => ({
+            ...item,
+            sellerDeposited: true,
+            status: item.buyerDeposited ? "Funded" : "Created",
+            step: item.buyerDeposited ? "key" : "deposit",
+            activity: [{
+              id: crypto.randomUUID(),
+              title: "Solana seller collateral verified",
+              detail: "The TEE verified the exact USDC transfer to the Chain Signatures vault.",
+              tx: solanaTxSignature,
+              time: "Now",
+            }, ...item.activity],
+          }));
+          setTimeout(loadOnChainData, 1_500);
+          return {
+            ok: true,
+            title: "Solana collateral recorded",
+            body: "The NEAR escrow has recorded the verified seller collateral.",
+            href: `https://explorer.solana.com/tx/${solanaTxSignature}?cluster=devnet`,
+          };
+        } catch (err: any) {
+          return { ok: false, title: "Solana collateral failed", body: err?.message || String(err) };
+        }
+      },
       depositUsdcViaMakerVault: async (
         dealId,
         chain,
@@ -2096,7 +2150,28 @@ export function Providers({ children }: { children: React.ReactNode }) {
 
           // If counterparty hasn't accepted yet on-chain, accept first to transition deal to Funded
           const onChain = await fetchContractDeal(Number(dealId));
+          const liveAttestation = await verifyLiveAttestation();
+          if (!liveAttestation.verified || !liveAttestation.signerPublicKeyNear) {
+            pushToast({
+              kind: "error",
+              title: "TEE verification failed",
+              body: liveAttestation.errors?.join("; ") || "The current enclave identity could not be verified.",
+            });
+            return;
+          }
+          const dealTeeSigner = String(onChain?.tee_pubkey || "").trim();
+          if (dealTeeSigner && dealTeeSigner !== liveAttestation.signerPublicKeyNear) {
+            pushToast({
+              kind: "error",
+              title: "Deal uses the retired TEE",
+              body: `Deal #${dealId} was created for the previous enclave and cannot be activated by the current Phala CVM. Create a new deal; do not resubmit the provider key here.`,
+            });
+            return;
+          }
           if (onChain && !onChain.counterparty_accepted && deal.termsHash) {
+            if (stateRef.current.solanaAccount && toNearAccountId(stateRef.current.solanaAccount).toLowerCase() === deal.seller.toLowerCase()) {
+              throw new Error("Accept the deal with the Solana seller wallet before submitting the provider key.");
+            }
             pushToast({ kind: "pending", title: "Accepting deal on NEAR to fund escrow..." });
             const cleanHex = deal.termsHash.replace(/^0x/, "");
             const hashBytes = Array.from(Buffer.from(cleanHex, "hex"));

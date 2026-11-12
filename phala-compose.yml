@@ -30,6 +30,13 @@ services:
       - BASE_SEPOLIA_RPC
       - OPERATOR_EVM_PRIVATE_KEY
       - BASE_SEPOLIA_RELAYER_KEY
+      # Public configuration for the Chain-Signatures-controlled Solana vault.
+      # No wallet private key is supplied: payouts are authorized by NEAR MPC.
+      - SOLANA_RPC
+      - SOLANA_USDC_MINT
+      - SOLANA_MPC_VAULT
+      - SOLANA_MPC_PATH
+      - MPC_EDDSA_DOMAIN_ID
 
 volumes:
   conpi-meter-state:

@@ -8,6 +8,7 @@ import {
   createAssociatedTokenAccountInstruction,
   createTransferCheckedInstruction,
 } from "@solana/spl-token";
+import { Buffer } from "buffer";
 
 export const SOLANA_DEVNET_RPC = process.env.NEXT_PUBLIC_SOLANA_RPC || "https://api.devnet.solana.com";
 export const SOLANA_DEVNET_USDC_MINT = "4zMMC9srt5Ri5X14GAgXhaHii3GnPAEERYPJgZJDncDU"; // Official Devnet USDC mint
@@ -140,6 +141,63 @@ export async function getSolanaUsdcBalance(addressStr: string): Promise<string> 
   } catch {
     return "0.00";
   }
+}
+
+/**
+ * Creates the seller's domain-separated acceptance signature for a NEAR
+ * escrow deal. It is intentionally a wallet message rather than a Solana
+ * transaction, because the NEAR contract verifies it before accepting the
+ * cross-chain counterparty.
+ */
+export async function signSolanaDealAcceptance(params: {
+  contractId: string;
+  network: string;
+  dealId: number;
+  termsHashHex: string;
+  vaultAddress: string;
+  tokenMint: string;
+  sellerCollateralAtomic: string;
+  sellerCanonicalAddress?: string;
+}): Promise<{
+  sellerAddress: string;
+  publicKeyBase58: string;
+  nonce: number;
+  expiresAtNs: string;
+  signatureBase64: string;
+}> {
+  const provider = getSolanaProvider();
+  if (!provider) throw new Error("No Solana wallet found. Please connect Phantom or Solflare.");
+  if (!provider.publicKey) await provider.connect();
+  const sellerAddress = provider.publicKey?.toString();
+  if (!sellerAddress || typeof provider.signMessage !== "function") {
+    throw new Error("The connected Solana wallet cannot sign the deal acceptance message.");
+  }
+  const nonce = Date.now();
+  const expiresAtNs = (BigInt(Date.now() + 5 * 60_000) * BigInt(1_000_000)).toString();
+  const termsHashHex = params.termsHashHex.replace(/^0x/, "").toLowerCase();
+  const message = [
+    "CONPI_SOLANA_ACCEPT_V1",
+    `contract:${params.contractId}`,
+    `network:${params.network}`,
+    `deal:${params.dealId}`,
+    `terms:${termsHashHex}`,
+    `seller:${params.sellerCanonicalAddress || sellerAddress}`,
+    `vault:${params.vaultAddress}`,
+    `mint:${params.tokenMint}`,
+    `collateral:${params.sellerCollateralAtomic}`,
+    `nonce:${nonce}`,
+    `expires_at:${expiresAtNs}`,
+  ].join("\n");
+  const signed = await provider.signMessage(new TextEncoder().encode(message), "utf8");
+  const signature = signed?.signature || signed;
+  if (!signature) throw new Error("Solana deal acceptance was cancelled.");
+  return {
+    sellerAddress,
+    publicKeyBase58: sellerAddress,
+    nonce,
+    expiresAtNs,
+    signatureBase64: Buffer.from(signature).toString("base64"),
+  };
 }
 
 /**

@@ -565,10 +565,12 @@ async function runPhase3Tests() {
   const sellerAccount = privateKeyToAccount(`0x${"34".repeat(32)}`);
   const seller = canonicalSellerAccount("base", sellerAccount.address);
   let mockDealStatus = "Created";
+  let mockTeeSigner = enclaveKeys.getSignerPublicKeyNear();
   (nearRelayer as any).getDeal = async (dealId: number) => ({
     id: dealId,
     seller,
     status: mockDealStatus,
+    tee_pubkey: mockTeeSigner,
     token: "usdc.testnet",
     credit_amount: "100000000",
     price: "80000000",
@@ -615,6 +617,11 @@ async function runPhase3Tests() {
   const unfundedResponse = await app.inject({ method: "POST", url: "/v1/deals/3004/key", payload: keyPayload });
   assert(unfundedResponse.statusCode === 409 && unfundedResponse.body.includes("only be submitted for funded deals"), "Created deal was allowed to inject a key");
   mockDealStatus = "Funded";
+
+  mockTeeSigner = "ed25519:11111111111111111111111111111111";
+  const retiredSignerResponse = await app.inject({ method: "POST", url: "/v1/deals/3004/key", payload: keyPayload });
+  assert(retiredSignerResponse.statusCode === 409 && retiredSignerResponse.body.includes("tee_signer_mismatch"), "A deal bound to a retired TEE signer reached key injection");
+  mockTeeSigner = enclaveKeys.getSignerPublicKeyNear();
 
   const relayedResponse = await app.inject({
     method: "POST",

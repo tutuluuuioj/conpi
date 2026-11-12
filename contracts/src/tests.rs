@@ -9,7 +9,7 @@ mod tests {
     use near_sdk::json_types::U128;
     use near_sdk::test_utils::VMContextBuilder;
     use near_sdk::testing_env;
-    use near_sdk::{AccountId, NearToken, PublicKey};
+    use near_sdk::{AccountId, NearToken, PromiseOrValue, PublicKey};
     use rand::rngs::OsRng;
 
     const REAL_CVM_MEASUREMENT: &str = "mrtd:7fe60787222bd394cb516abca2435f22f035ab2cc9c0a4b4b3b148e46297f3d931a237b72f359052c6e657d8c1409173|compose:c847677bcdbe7d532fa96beabe82cb19e5c7ae44feed9e2c0d941660257d4ed0";
@@ -63,6 +63,102 @@ mod tests {
             seller_address,
             foreign_amount,
         );
+    }
+
+    #[test]
+    fn test_solana_seller_acceptance_is_signed_and_cannot_redirect_payout() {
+        let owner: AccountId = "owner.testnet".parse().unwrap();
+        let buyer: AccountId = "buyer.testnet".parse().unwrap();
+        let solana_key = SigningKey::generate(&mut OsRng);
+        let seller_hex = hex::encode(solana_key.verifying_key().as_bytes());
+        let seller: AccountId = seller_hex.parse().unwrap();
+        let (_tee_sk, tee_pk) = generate_tee_keypair();
+        let mut context = get_context(owner, NearToken::from_yoctonear(0));
+        testing_env!(context.build());
+        let mut contract = ConpiEscrow::new(
+            "owner.testnet".parse().unwrap(),
+            None,
+            None,
+            Some((tee_pk.clone(), REAL_CVM_MEASUREMENT.to_string())),
+            None,
+        );
+
+        testing_env!(context
+            .predecessor_account_id(buyer.clone())
+            .attached_deposit(STORAGE_DEPOSIT)
+            .build());
+        let deal_id = contract.create_deal(CreateDealParams {
+            buyer,
+            seller: seller.clone(),
+            token: Some("usdc.testnet".parse().unwrap()),
+            price: U128(40_000),
+            credit_amount: U128(50_000),
+            buyer_collateral: U128(4_000),
+            seller_collateral: U128(8_000),
+            tee_pubkey: tee_pk,
+            deposit_duration_sec: 3600,
+            key_duration_sec: 3600,
+            tee_liveness_timeout_sec: 3600,
+            slash_bps_provider_ban: 5000,
+            slash_bps_revoke: 8000,
+            slash_bps_buyer_breach: 5000,
+        });
+        let terms_hash = contract.get_deal(deal_id).unwrap().terms_hash.unwrap();
+        let nonce = 1u64;
+        let expires_at = 1_000_000_000_000u64 + 60_000_000_000;
+        let seller_hex = hex::encode(solana_key.verifying_key().as_bytes());
+        let message = format!(
+            "CONPI_SOLANA_ACCEPT_V1\ncontract:conpi.testnet\nnetwork:testnet\ndeal:{}\nterms:{}\nseller:{}\nvault:CtHaZkSC8e58VGtUmggu8WiH6fJ7RvUgiZNJtXu6SGp6\nmint:4zMMC9srt5Ri5X14GAgXhaHii3GnPAEERYPJgZJDncDU\ncollateral:8000\nnonce:{}\nexpires_at:{}",
+            deal_id,
+            hex::encode(terms_hash),
+            seller_hex,
+            nonce,
+            expires_at,
+        );
+        let signature = solana_key.sign(message.as_bytes()).to_bytes().to_vec();
+        testing_env!(context
+            .predecessor_account_id("relayer.testnet".parse().unwrap())
+            .attached_deposit(NearToken::from_yoctonear(0))
+            .build());
+        contract.accept_deal_solana(
+            deal_id,
+            terms_hash,
+            seller_hex.clone(),
+            solana_key.verifying_key().as_bytes().to_vec(),
+            nonce,
+            expires_at,
+            signature,
+        );
+        let locked = contract.get_solana_deal(deal_id).unwrap();
+        assert_eq!(locked.seller_address, seller_hex);
+        assert_eq!(locked.vault_address, "CtHaZkSC8e58VGtUmggu8WiH6fJ7RvUgiZNJtXu6SGp6");
+        assert_eq!(locked.token_mint, "4zMMC9srt5Ri5X14GAgXhaHii3GnPAEERYPJgZJDncDU");
+        assert_eq!(locked.mpc_path, "conpi-solana-maker-v1");
+        assert_eq!(locked.mpc_domain_id, 1);
+        assert!(contract.get_deal(deal_id).unwrap().counterparty_accepted);
+
+        // The seller's implicit NEAR account must never be able to bypass the
+        // TEE's verified Solana collateral path with an FT transfer.
+        testing_env!(context
+            .predecessor_account_id("usdc.testnet".parse().unwrap())
+            .attached_deposit(NearToken::from_yoctonear(0))
+            .build());
+        let returned = contract.ft_on_transfer(seller.clone(), U128(8_000), deal_id.to_string());
+        assert!(matches!(returned, PromiseOrValue::Value(U128(8_000))));
+        assert_eq!(contract.get_deal(deal_id).unwrap().seller_deposited, 0);
+
+        let redirect = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            contract.accept_deal_solana(
+                deal_id,
+                terms_hash,
+                "00".repeat(32),
+                solana_key.verifying_key().as_bytes().to_vec(),
+                nonce + 1,
+                expires_at,
+                solana_key.sign(b"irrelevant").to_bytes().to_vec(),
+            );
+        }));
+        assert!(redirect.is_err(), "the payout address must be the signing Solana key");
     }
 
     // -------------------------------------------------------------------------

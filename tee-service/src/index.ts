@@ -27,6 +27,8 @@ import { settlementEngine } from "./settlement/engine.js";
 import { foreignVaultManager } from "./chain/foreign-vault.js";
 import { foreignRelayer } from "./chain/foreign-relayer.js";
 import { baseClient, BASE_SEPOLIA_USDC, BASE_SEPOLIA_CHAIN_ID } from "./chain/base-client.js";
+import { SolanaClient } from "./chain/solana-client.js";
+import bs58 from "bs58";
 import {
   verifySellerKeyAuthorization,
   consumeSellerKeyAuthorizationNonce,
@@ -168,6 +170,15 @@ export async function buildApp() {
         return reply.status(409).send({
           ok: false,
           error: `Deal #${dealId} is ${onChainDeal.status || "not funded"}; provider keys can only be submitted for funded deals`,
+        });
+      }
+      const dealTeeSigner = String(onChainDeal.tee_pubkey || "").trim();
+      const currentTeeSigner = enclaveKeys.getSignerPublicKeyNear();
+      if (dealTeeSigner && dealTeeSigner !== currentTeeSigner) {
+        return reply.status(409).send({
+          ok: false,
+          code: "tee_signer_mismatch",
+          error: `Deal #${dealId} is bound to retired TEE signer ${dealTeeSigner}; recreate the deal for current signer ${currentTeeSigner}`,
         });
       }
       if (keyInjectionLocks.has(dealId)) {
@@ -539,6 +550,138 @@ export async function buildApp() {
   app.get("/v1/chain/deal/:id", async (req) => {
     const { id } = req.params as { id: string };
     return nearRelayer.getDeal(parseInt(id, 10));
+  });
+
+  app.get("/v1/solana/vault", async () => {
+    return nearRelayer.callView("get_solana_vault_config", {});
+  });
+
+  // These are public, already-on-chain deal terms.  The frontend needs the
+  // locked vault rather than the mutable default when asking a seller to make
+  // their collateral transfer.
+  app.get("/v1/deals/:id/solana", async (req, reply) => {
+    const dealId = Number((req.params as { id: string }).id);
+    if (!Number.isSafeInteger(dealId) || dealId <= 0) {
+      return reply.status(400).send({ error: "Invalid deal id" });
+    }
+    const locked = await nearRelayer.getSolanaDeal(dealId);
+    if (!locked) return reply.status(404).send({ error: "No Solana terms for this deal" });
+    return locked;
+  });
+
+  // Solana seller acceptance. The relayer only transports the signed message:
+  // the escrow verifies it against the seller's 32-byte Solana public key.
+  app.post("/v1/deals/:id/accept-solana", async (req, reply) => {
+    const dealId = Number((req.params as { id: string }).id);
+    const body = req.body as {
+      expectedHashHex: string;
+      sellerAddress: string;
+      publicKeyBase58?: string;
+      nonce: number;
+      expiresAtNs: string | number;
+      signatureBase64: string;
+    };
+    if (!Number.isSafeInteger(dealId) || dealId <= 0 || !body?.expectedHashHex || !body?.sellerAddress || !body?.signatureBase64) {
+      return reply.status(400).send({ error: "Missing or invalid Solana acceptance parameters" });
+    }
+    if (!nearRelayer.isConfigured()) {
+      return reply.status(503).send({ error: "TEE relayer credentials are not configured" });
+    }
+    try {
+      const [deal, existing] = await Promise.all([
+        nearRelayer.getDeal(dealId),
+        nearRelayer.getSolanaDeal(dealId).catch(() => null),
+      ]);
+      if (!deal) return reply.status(404).send({ error: "Deal does not exist" });
+      if (existing) return reply.status(409).send({ error: "This deal already has a Solana seller acceptance" });
+      const publicKey = bs58.decode(body.publicKeyBase58 || body.sellerAddress);
+      if (publicKey.length !== 32) return reply.status(400).send({ error: "Solana public key must be 32 bytes" });
+      if (Buffer.from(publicKey).toString("hex") !== String(deal.seller || "").toLowerCase()) {
+        return reply.status(403).send({ error: "The connected Solana wallet is not this deal's seller" });
+      }
+      if (String(body.sellerAddress).toLowerCase() !== Buffer.from(publicKey).toString("hex")) {
+        return reply.status(400).send({ error: "Solana payout address must match the signing wallet" });
+      }
+      const expectedHash = body.expectedHashHex.replace(/^0x/, "").toLowerCase();
+      const onChainHash = Array.isArray(deal.terms_hash) ? Buffer.from(deal.terms_hash).toString("hex") : "";
+      if (expectedHash.length !== 64 || expectedHash !== onChainHash) {
+        return reply.status(409).send({ error: "Acceptance terms hash does not match the on-chain deal" });
+      }
+      const signature = Buffer.from(body.signatureBase64, "base64");
+      if (signature.length !== 64) return reply.status(400).send({ error: "Solana acceptance signature must be 64 bytes" });
+      const result = await nearRelayer.submitAcceptDealSolana({
+        dealId,
+        expectedHashHex: expectedHash,
+        sellerAddress: body.sellerAddress,
+        publicKey,
+        nonce: Number(body.nonce),
+        expiresAtNs: body.expiresAtNs,
+        signature,
+      });
+      return { ok: true, transactionHash: result.transactionHash };
+    } catch (error: any) {
+      return reply.status(400).send({ error: error?.message || "Solana seller acceptance failed" });
+    }
+  });
+
+  // The enclave independently checks the Solana transaction before it can
+  // mark the seller's collateral as deposited on the NEAR escrow.
+  app.post("/v1/deals/:id/solana-collateral", async (req, reply) => {
+    const dealId = Number((req.params as { id: string }).id);
+    const body = req.body as { txSignature: string; termsHashHex: string };
+    if (!Number.isSafeInteger(dealId) || dealId <= 0 || !body?.txSignature || !body?.termsHashHex) {
+      return reply.status(400).send({ error: "Missing Solana collateral parameters" });
+    }
+    if (!nearRelayer.isConfigured()) {
+      return reply.status(503).send({ error: "TEE relayer credentials are not configured" });
+    }
+    try {
+      const [deal, solanaDeal] = await Promise.all([
+        nearRelayer.getDeal(dealId),
+        nearRelayer.getSolanaDeal(dealId),
+      ]);
+      if (!deal || !solanaDeal) return reply.status(409).send({ error: "Solana seller acceptance must be recorded before collateral" });
+      if (solanaDeal.collateral_deposited) return reply.status(409).send({ error: "Solana collateral has already been recorded" });
+      const onChainHash = Array.isArray(deal.terms_hash) ? Buffer.from(deal.terms_hash).toString("hex") : "";
+      if (body.termsHashHex.replace(/^0x/, "").toLowerCase() !== onChainHash) {
+        return reply.status(409).send({ error: "Collateral terms hash does not match the on-chain deal" });
+      }
+      // The seller accepted these vault terms on-chain. Never use a mutable
+      // process default here: a DAO rotation is for future deals only.
+      const lockedSolanaClient = new SolanaClient(
+        CONFIG.solanaRpcUrl,
+        String(solanaDeal.token_mint),
+        String(solanaDeal.vault_address),
+      );
+      await lockedSolanaClient.verifyCollateralDeposit({
+        signature: body.txSignature,
+        sellerAddress: String(solanaDeal.seller_address),
+        amountAtomic: BigInt(solanaDeal.collateral_amount || 0),
+      });
+      const payload: SignedPayloadDto = {
+        domain: "conpi:v1",
+        contractId: CONFIG.contractId,
+        chainId: CONFIG.networkId,
+        dealId,
+        termsHash: Buffer.from(onChainHash, "hex"),
+        kind: PayloadKind.ForeignDeposit,
+        stage: 0,
+        meteredValueYocto: 0n,
+        reason: null,
+        nonce: BigInt(deal.last_nonce || 0) + 1n,
+        issuedAtNs: BigInt(Date.now()) * 1_000_000n,
+        foreignTxSighash: crypto.createHash("sha256").update(body.txSignature).digest(),
+      };
+      const signatureHex = Buffer.from(enclaveKeys.sign(serializeSignedPayload(payload))).toString("hex");
+      const relayed = await nearRelayer.submitRecordSolanaCollateral(dealId, body.txSignature, payload, signatureHex);
+      return {
+        ok: true,
+        transactionHash: relayed.transactionHash,
+        payload: publicSignedPayload({ payload, signatureHex } as any),
+      };
+    } catch (error: any) {
+      return reply.status(400).send({ error: error?.message || "Solana collateral verification failed" });
+    }
   });
 
   // 7. Multi-Chain Foreign Payments (Base Sepolia / Chain Signatures)

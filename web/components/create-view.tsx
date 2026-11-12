@@ -5,6 +5,7 @@ import { useRouter } from "next/navigation";
 import { modelsForProvider } from "@/lib/data";
 import { ratioOf, usd } from "@/lib/format";
 import { escrowOf } from "@/lib/money";
+import { MAKER_VAULT_CONFIG } from "@/lib/maker-vault";
 import { useApp } from "@/lib/store";
 import type { Asset, Provider } from "@/lib/types";
 import { Button, Card, Field, Overline, fieldClass } from "./ui";
@@ -114,6 +115,7 @@ export function CreateView() {
       reputation: 0,
       tee: true,
       token,
+      tokenContract: MAKER_VAULT_CONFIG.near.tokenAddress,
       rateLimit: "60 req/min",
       expectedTest: `One short call on ${models[0]}`,
       createdAt: new Date().toISOString(),

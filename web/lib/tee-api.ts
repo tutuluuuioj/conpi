@@ -327,6 +327,51 @@ export const teeApi = {
     return res.json();
   },
 
+  async getSolanaVaultConfig(): Promise<any> {
+    const res = await fetch(`${TEE_BASE_URL}/v1/solana/vault`, { cache: "no-store" });
+    if (!res.ok) throw new Error(`Failed to fetch Solana vault configuration: ${res.statusText}`);
+    return res.json();
+  },
+
+  async getSolanaDeal(dealId: number): Promise<any | null> {
+    const res = await fetch(`${TEE_BASE_URL}/v1/deals/${dealId}/solana`, { cache: "no-store" });
+    if (res.status === 404) return null;
+    if (!res.ok) throw new Error(`Failed to fetch locked Solana deal terms: ${res.statusText}`);
+    return res.json();
+  },
+
+  async acceptSolanaDeal(dealId: number, data: {
+    expectedHashHex: string;
+    sellerAddress: string;
+    publicKeyBase58: string;
+    nonce: number;
+    expiresAtNs: string;
+    signatureBase64: string;
+  }): Promise<{ ok: boolean; transactionHash?: string; error?: string }> {
+    const res = await fetch(`${TEE_BASE_URL}/v1/deals/${dealId}/accept-solana`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(data),
+    });
+    const body = await res.json().catch(() => ({}));
+    if (!res.ok) throw new Error(body.error || "Solana seller acceptance failed");
+    return body;
+  },
+
+  async verifySolanaCollateral(dealId: number, data: {
+    txSignature: string;
+    termsHashHex: string;
+  }): Promise<{ ok: boolean; transactionHash?: string; error?: string }> {
+    const res = await fetch(`${TEE_BASE_URL}/v1/deals/${dealId}/solana-collateral`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(data),
+    });
+    const body = await res.json().catch(() => ({}));
+    if (!res.ok) throw new Error(body.error || "Solana collateral verification failed");
+    return body;
+  },
+
   async verifyForeignDeposit(params: {
     dealId: number;
     txHash: string;

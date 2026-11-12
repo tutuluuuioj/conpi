@@ -128,6 +128,31 @@ pub enum ConpiEvent<'a> {
         s_hex: &'a str,
         recovery_id: u8,
     },
+    #[serde(rename = "solana_collateral_recorded")]
+    SolanaCollateralRecorded {
+        deal_id: u64,
+        seller: &'a str,
+        amount: U128,
+        tx_signature: &'a str,
+    },
+    #[serde(rename = "solana_tx_signed")]
+    SolanaTxSigned {
+        deal_id: u64,
+        stage: u8,
+        recipient: &'a str,
+        amount: U128,
+        message_hex: &'a str,
+        message_hash_hex: &'a str,
+        signature_hex: &'a str,
+        last_valid_block_height: u64,
+    },
+    #[serde(rename = "solana_payout_confirmed")]
+    SolanaPayoutConfirmed {
+        deal_id: u64,
+        stage: u8,
+        tx_signature: &'a str,
+        amount: U128,
+    },
     #[serde(rename = "contract_migrated")]
     ContractMigrated,
 }
@@ -163,6 +188,9 @@ pub fn emit_event(event: ConpiEvent) {
         ConpiEvent::GovernanceActionCancelled { .. } => "governance_action_cancelled",
         ConpiEvent::ForeignDepositRecorded { .. } => "foreign_deposit_recorded",
         ConpiEvent::ForeignTxSigned { .. } => "foreign_tx_signed",
+        ConpiEvent::SolanaCollateralRecorded { .. } => "solana_collateral_recorded",
+        ConpiEvent::SolanaTxSigned { .. } => "solana_tx_signed",
+        ConpiEvent::SolanaPayoutConfirmed { .. } => "solana_payout_confirmed",
         ConpiEvent::ContractMigrated => "contract_migrated",
     };
 

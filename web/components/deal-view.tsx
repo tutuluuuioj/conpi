@@ -42,6 +42,7 @@ import {
   getBaseEthBalance,
   seedVaultGas,
 } from "@/lib/evm-wallet";
+import { sendSolanaUsdcDeposit } from "@/lib/solana-wallet";
 import type { DealStep } from "@/lib/types";
 import {
   Badge,
@@ -76,6 +77,7 @@ export function DealView({ id }: { id: string }) {
   const [chatMsg, setChatMsg] = useState("");
   const [sellerEvmAddress, setSellerEvmAddress] = useState("");
   const [foreignInfo, setForeignInfo] = useState<any>(null);
+  const [solanaInfo, setSolanaInfo] = useState<any>(null);
   const [selectedPayChain, setSelectedPayChain] = useState<VaultChain>("base");
   const [isProcessingDeposit, setIsProcessingDeposit] = useState(false);
   const [depositError, setDepositError] = useState<string | null>(null);
@@ -322,10 +324,48 @@ export function DealView({ id }: { id: string }) {
   }, [deal?.role, deal?.seller, app.account, app.solanaAccount, app.evmAccount, app.nearAccount]);
 
   const isBuyerRole = !isSellerParty;
+  const isSolanaSellerDeal = Boolean(
+    deal
+      && /^[0-9a-f]{64}$/i.test(deal.seller)
+      && !deal.seller.startsWith("000000000000000000000000")
+  );
   const requiredDepositUsdc = isBuyerRole ? requiredBuyerUsdc : requiredSellerUsdc;
   const activeVaultAddress = selectedPayChain === "base"
     ? String(foreignInfo?.vault_address || "")
-    : MAKER_VAULT_CONFIG[selectedPayChain].vaultAddress;
+    : selectedPayChain === "solana" && isSolanaSellerDeal
+      ? String(solanaInfo?.vault_address || MAKER_VAULT_CONFIG.solana.vaultAddress)
+      : MAKER_VAULT_CONFIG[selectedPayChain].vaultAddress;
+
+  useEffect(() => {
+    if (!deal?.id || !isSolanaSellerDeal) {
+      setSolanaInfo(null);
+      return;
+    }
+    let cancelled = false;
+    const load = () => {
+      teeApi.getSolanaDeal(Number(deal.id))
+        .then((info) => {
+          if (!cancelled) setSolanaInfo(info);
+        })
+        .catch(() => {
+          // The seller may not have accepted yet. The default is only used to
+          // display guidance; the TEE always verifies the locked on-chain
+          // address before recording a transfer.
+          if (!cancelled) setSolanaInfo(null);
+        });
+    };
+    load();
+    const interval = setInterval(load, 5_000);
+    return () => {
+      cancelled = true;
+      clearInterval(interval);
+    };
+  }, [deal?.id, isSolanaSellerDeal]);
+
+  useEffect(() => {
+    if (!isSolanaSellerDeal) return;
+    setSelectedPayChain(isSellerParty ? "solana" : "near");
+  }, [isSolanaSellerDeal, isSellerParty, deal?.id]);
 
   const handleMakerVaultPay = async () => {
     if (!deal) return;
@@ -334,6 +374,12 @@ export function DealView({ id }: { id: string }) {
     setDepositSuccess(null);
 
     try {
+      if (isSolanaSellerDeal && isBuyerRole && selectedPayChain !== "near") {
+        throw new Error("This buyer deposits USDC through the NEAR escrow for the Solana seller deal.");
+      }
+      if (isSolanaSellerDeal && isSellerParty && selectedPayChain !== "solana") {
+        throw new Error("This seller collateral must be sent from Solana to the Chain Signatures vault.");
+      }
       if (selectedPayChain === "base") {
         if (!isBuyerRole) {
           throw new Error("Seller collateral must be deposited through the NEAR escrow contract");
@@ -359,7 +405,17 @@ export function DealView({ id }: { id: string }) {
         if (!res.ok) throw new Error(res.body || "Verification failed");
         setDepositSuccess(`Deposit of $${requiredDepositUsdc.toFixed(2)} USDC confirmed on Base Sepolia!`);
       } else if (selectedPayChain === "solana") {
-        throw new Error("Solana pooled-vault deposits are paused until TEE-signed Solana settlement is available. No funds were sent.");
+        if (!isSolanaSellerDeal) {
+          throw new Error("Solana USDC is available when the seller accepted this deal with a Solana wallet.");
+        }
+        if (!isSellerParty) throw new Error("Only the Solana seller can fund this collateral transfer.");
+        const { txHash } = await sendSolanaUsdcDeposit({
+          vaultAddress: activeVaultAddress,
+          amountUsdc: requiredDepositUsdc.toFixed(6),
+        });
+        const res = await app.depositSolanaCollateral(deal.id, txHash);
+        if (!res.ok) throw new Error(res.body || "TEE verification failed");
+        setDepositSuccess(`Seller collateral of $${requiredDepositUsdc.toFixed(2)} USDC was verified on Solana.`);
       } else {
         const res = await app.deposit(deal.id);
         if (!res.ok) throw new Error(res.body || "Deposit failed");
@@ -379,8 +435,15 @@ export function DealView({ id }: { id: string }) {
     setDepositSuccess(null);
 
     try {
+      if (selectedPayChain === "solana") {
+        const res = await app.depositSolanaCollateral(deal.id, manualTxHash.trim());
+        if (!res.ok) throw new Error(res.body || "Solana collateral verification failed");
+        setDepositSuccess(`Solana seller collateral verified for this deal.`);
+        setManualTxHash("");
+        return;
+      }
       if (selectedPayChain !== "base") {
-        throw new Error("Manual pooled-vault verification is paused. Use the on-chain NEAR escrow or the per-deal Base vault.");
+        throw new Error("Manual verification is available for the verified Solana seller collateral or the per-deal Base vault.");
       }
       if (!app.evmAccount) throw new Error("Connect the Base buyer wallet that sent the deposit");
       const res = await app.depositForeignBaseUsdc(
@@ -802,8 +865,8 @@ export function DealView({ id }: { id: string }) {
                     <label className="text-xs font-medium text-muted block mb-1.5">
                       Select Payment Chain (100% USDC):
                     </label>
-                    <div className="grid grid-cols-3 gap-2">
-                      <button
+                    <div className={`grid gap-2 ${isSolanaSellerDeal ? "grid-cols-1" : "grid-cols-3"}`}>
+                      {!isSolanaSellerDeal ? <button
                         type="button"
                         onClick={() => setSelectedPayChain("base")}
                         className={`p-2.5 rounded-lg border text-xs font-semibold flex items-center justify-center gap-1.5 transition-all ${
@@ -814,9 +877,9 @@ export function DealView({ id }: { id: string }) {
                       >
                         <span className="h-2 w-2 rounded-full bg-blue-500" />
                         <span>Base (USDC)</span>
-                      </button>
+                      </button> : null}
 
-                      <button
+                      {(!isSolanaSellerDeal || isSellerParty) ? <button
                         type="button"
                         onClick={() => setSelectedPayChain("solana")}
                         className={`p-2.5 rounded-lg border text-xs font-semibold flex items-center justify-center gap-1.5 transition-all ${
@@ -827,9 +890,9 @@ export function DealView({ id }: { id: string }) {
                       >
                         <span className="h-2 w-2 rounded-full bg-purple-500" />
                         <span>Solana (USDC)</span>
-                      </button>
+                      </button> : null}
 
-                      <button
+                      {(!isSolanaSellerDeal || !isSellerParty) ? <button
                         type="button"
                         onClick={() => setSelectedPayChain("near")}
                         className={`p-2.5 rounded-lg border text-xs font-semibold flex items-center justify-center gap-1.5 transition-all ${
@@ -840,7 +903,7 @@ export function DealView({ id }: { id: string }) {
                       >
                         <span className="h-2 w-2 rounded-full bg-emerald-500" />
                         <span>NEAR (USDC)</span>
-                      </button>
+                      </button> : null}
                     </div>
                   </div>
 
@@ -849,7 +912,9 @@ export function DealView({ id }: { id: string }) {
                     <div className="flex items-center justify-between">
                       <div className="flex items-center gap-2">
                         <span className="text-sm font-semibold text-ink">
-                          {MAKER_VAULT_CONFIG[selectedPayChain].name} Escrow Vault
+                          {selectedPayChain === "solana" && isSolanaSellerDeal
+                            ? "Solana Chain Signatures Vault"
+                            : `${MAKER_VAULT_CONFIG[selectedPayChain].name} Escrow Vault`}
                         </span>
                         <span className="text-[10px] uppercase font-bold text-brand bg-brand/15 px-2 py-0.5 rounded-full">
                           {MAKER_VAULT_CONFIG[selectedPayChain].symbol}
@@ -882,7 +947,7 @@ export function DealView({ id }: { id: string }) {
                           <a
                             href={
                               selectedPayChain === "solana"
-                                ? `${MAKER_VAULT_CONFIG.solana.explorer}/address/${MAKER_VAULT_CONFIG.solana.vaultAddress}?cluster=devnet`
+                                ? `${MAKER_VAULT_CONFIG.solana.explorer}/address/${activeVaultAddress}?cluster=devnet`
                                 : selectedPayChain === "base"
                                 ? `${MAKER_VAULT_CONFIG.base.explorer}/address/${activeVaultAddress}`
                                 : `${MAKER_VAULT_CONFIG.near.explorer}/address/${MAKER_VAULT_CONFIG.near.vaultAddress}`
@@ -1033,7 +1098,7 @@ export function DealView({ id }: { id: string }) {
                 <div className="mt-4 pt-2 border-t border-line/60">
                   <p className="text-xs text-muted mb-2">Counterparty confirmation needed on-chain:</p>
                   <Button variant="secondary" onClick={() => app.acceptDeal(deal.id)}>
-                    Accept Deal Terms on NEAR
+                    {isSolanaSellerDeal && isSellerParty ? "Accept Deal Terms with Solana" : "Accept Deal Terms on NEAR"}
                   </Button>
                 </div>
               ) : null}
@@ -1210,8 +1275,10 @@ export function DealView({ id }: { id: string }) {
                 </p>
                 <div className="mt-4 flex flex-wrap gap-2">
                   <Button variant="secondary" onClick={() => app.syncMeterState(deal.id)}>Sync meter</Button>
-                  <Button onClick={() => app.releaseStagePayout(deal.id)}>Release stage payout</Button>
-                  {deal.status === "Active" ? (
+                  {isSolanaSellerDeal ? (
+                    <span className="self-center text-xs text-muted">Solana stage payouts are signed, broadcast, and confirmed by the TEE automatically.</span>
+                  ) : <Button onClick={() => app.releaseStagePayout(deal.id)}>Release stage payout</Button>}
+                  {deal.status === "Active" && !isSolanaSellerDeal ? (
                     <Button variant="ghost" className="text-danger" onClick={() => app.triggerDefaultSettlement(deal.id, "InvalidKey")}>
                       Settle Default & Refund
                     </Button>

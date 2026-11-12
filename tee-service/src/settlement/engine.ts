@@ -3,6 +3,9 @@ import { nearRelayer } from "../chain/relayer.js";
 import { meterEngine } from "../proxy/meter.js";
 import { meterEvents } from "../proxy/events.js";
 import type { RelayReceipt, VaultEntry } from "../vault/preflight.js";
+import { PayloadKind, serializeSignedPayload, type SignedPayloadDto } from "../crypto/borsh.js";
+import { enclaveKeys } from "../crypto/keys.js";
+import { SolanaClient } from "../chain/solana-client.js";
 
 type RelayKind = RelayReceipt["kind"];
 type SignedEnvelope = { payload: any; signatureHex: string };
@@ -80,6 +83,9 @@ export class SettlementEngine {
 
   public relayStage(entry: VaultEntry, signed: SignedEnvelope): Promise<RelayReceipt> {
     return this.enqueue(entry, "stage", signed, async () => {
+      if (entry.solanaDeal) {
+        return this.relaySolanaStage(entry, signed);
+      }
       const foreignTx = (signed.payload as any).foreignTx;
       if (foreignTx) {
         return nearRelayer.submitReleaseStageForeign(
@@ -97,6 +103,122 @@ export class SettlementEngine {
         signed.signatureHex
       );
     });
+  }
+
+  /**
+   * A Solana seller payout is a two-step settlement. NEAR first requests an
+   * Ed25519 Chain Signature for the exact transaction message. The enclave
+   * broadcasts that message and only then confirms it back to NEAR, which is
+   * when the escrow stage advances.
+   */
+  private async relaySolanaStage(entry: VaultEntry, signed: SignedEnvelope) {
+    const stage = Number(signed.payload.stage);
+    const [deal, solanaDeal] = await Promise.all([
+      nearRelayer.getDeal(entry.dealId),
+      nearRelayer.getSolanaDeal(entry.dealId),
+    ]);
+    if (!deal || !solanaDeal?.collateral_deposited) {
+      throw new Error("Solana seller collateral is not confirmed on the escrow");
+    }
+    // Vault and mint are part of the seller's accepted, on-chain terms. Do
+    // not substitute the current configuration when an old deal is settled.
+    const lockedSolanaClient = new SolanaClient(
+      CONFIG.solanaRpcUrl,
+      String(solanaDeal.token_mint),
+      String(solanaDeal.vault_address),
+    );
+    const currentStage = Number(deal.stage_reached || 0);
+    if (currentStage >= stage) {
+      return { transactionHash: "", status: "already_applied" };
+    }
+    const price = BigInt(deal.price || 0);
+    const sellerCollateral = BigInt(deal.seller_collateral || 0);
+    const cumulativeAt = (BigInt(stage) * price) / 100n;
+    const cumulativeBefore = (BigInt(currentStage) * price) / 100n;
+    const amountAtomic = cumulativeAt - cumulativeBefore + (stage === 100 ? sellerCollateral : 0n);
+    if (amountAtomic <= 0n) throw new Error("Solana payout amount is zero");
+
+    const pending = await nearRelayer.getSolanaPendingPayout(entry.dealId).catch(() => null);
+    if (pending && Number(pending.stage) !== stage) {
+      throw new Error("A different Solana payout is still pending");
+    }
+    const prepared = pending
+      ? {
+          messageHex: String(pending.message_hex),
+          messageHashHex: Buffer.from(pending.message_hash).toString("hex"),
+          recipient: String(pending.recipient),
+          amountAtomic: BigInt(pending.amount),
+          lastValidBlockHeight: Number(pending.last_valid_block_height),
+        }
+      : await lockedSolanaClient.prepareUsdcPayout({
+          recipient: String(solanaDeal.seller_address),
+          amountAtomic,
+        });
+    if (prepared.recipient !== String(solanaDeal.seller_address) || prepared.amountAtomic !== amountAtomic) {
+      throw new Error("The pending Solana payout does not match the escrow terms");
+    }
+    const payload = signed.payload as SignedPayloadDto;
+    payload.foreignTxSighash = Buffer.from(prepared.messageHashHex, "hex");
+    signed.signatureHex = Buffer.from(enclaveKeys.sign(serializeSignedPayload(payload))).toString("hex");
+    const cached = entry.signedPayloads.find((item) => String(item.payload.nonce) === String(payload.nonce));
+    if (cached) cached.signatureHex = signed.signatureHex;
+
+    const requested: any = pending?.signature_hex
+      ? {
+          solanaTxSigned: {
+            deal_id: entry.dealId,
+            stage,
+            recipient: pending.recipient,
+            amount: pending.amount,
+            message_hex: pending.message_hex,
+            message_hash_hex: prepared.messageHashHex,
+            signature_hex: pending.signature_hex,
+            last_valid_block_height: pending.last_valid_block_height,
+          },
+        }
+      : await nearRelayer.submitRequestSolanaStagePayout(
+          entry.dealId,
+          stage,
+          payload,
+          signed.signatureHex,
+          prepared,
+        );
+    const remote = requested.solanaTxSigned;
+    if (
+      String(remote.message_hash_hex || "").replace(/^0x/, "").toLowerCase() !== prepared.messageHashHex
+      || String(remote.recipient) !== prepared.recipient
+      || BigInt(remote.amount) !== amountAtomic
+      || Number(remote.stage) !== stage
+    ) {
+      throw new Error("NEAR returned a Solana signature for different payout terms");
+    }
+    const broadcast = await lockedSolanaClient.broadcastSignedMessage({
+      messageHex: String(remote.message_hex),
+      signatureHex: String(remote.signature_hex),
+      lastValidBlockHeight: Number(remote.last_valid_block_height),
+    });
+    const confirmation: SignedPayloadDto = {
+      domain: payload.domain,
+      contractId: payload.contractId,
+      chainId: payload.chainId,
+      dealId: payload.dealId,
+      termsHash: payload.termsHash,
+      kind: PayloadKind.ForeignPayout,
+      stage,
+      meteredValueYocto: payload.meteredValueYocto,
+      reason: null,
+      nonce: meterEngine.getNextNonce(entry.dealId),
+      issuedAtNs: BigInt(Date.now()) * 1_000_000n,
+      foreignTxSighash: Buffer.from(prepared.messageHashHex, "hex"),
+    };
+    const confirmationSignatureHex = Buffer.from(enclaveKeys.sign(serializeSignedPayload(confirmation))).toString("hex");
+    entry.signedPayloads.push({ payload: confirmation, signatureHex: confirmationSignatureHex });
+    return nearRelayer.submitConfirmSolanaStagePayout(
+      entry.dealId,
+      broadcast.signature,
+      confirmation,
+      confirmationSignatureHex,
+    );
   }
 
   public relayCheckpoint(entry: VaultEntry, signed: SignedEnvelope): Promise<RelayReceipt> {

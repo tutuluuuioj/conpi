@@ -112,6 +112,22 @@ export interface ForeignDealInfo {
   evmNonce: number;
 }
 
+/**
+ * The Solana half of a NEAR escrow deal. The contract is the source of
+ * truth: this is only a cached copy used by the enclave when it builds a
+ * payout transaction for the Chain-Signatures vault.
+ */
+export interface SolanaDealInfo {
+  vaultAddress: string;
+  tokenMint: string;
+  mpcPath: string;
+  mpcDomainId: number;
+  sellerAddress: string;
+  collateralAmount: bigint;
+  collateralDeposited: boolean;
+  payoutSequence: number;
+}
+
 export interface VaultEntry {
   dealId: number;
   provider: string;
@@ -140,6 +156,7 @@ export interface VaultEntry {
   relayReceipts: RelayReceipt[];
   onChainStatus?: string;
   foreignDeal?: ForeignDealInfo | null;
+  solanaDeal?: SolanaDealInfo | null;
 }
 
 export function hashLockedPricing(pricing: LockedPricingTable): string {
@@ -263,12 +280,16 @@ class KeyVault {
     let onChainTokenIsNear = false;
 
     let resolvedForeignDeal: ForeignDealInfo | null = null;
+    let resolvedSolanaDeal: SolanaDealInfo | null = null;
 
     // Strictly resolve creditUsd, priceUsd and creditAmountYocto from on-chain deal state
     try {
       const { nearRelayer } = await import("../chain/relayer.js");
       const deal = await nearRelayer.getDeal(dealId);
-      const foreign = await nearRelayer.getForeignDeal(dealId).catch(() => null);
+      const [foreign, solana] = await Promise.all([
+        nearRelayer.getForeignDeal(dealId).catch(() => null),
+        nearRelayer.getSolanaDeal(dealId).catch(() => null),
+      ]);
       if (foreign && foreign.vault_address) {
         resolvedForeignDeal = {
           chainId: Number(foreign.chain_id || 84532),
@@ -278,6 +299,18 @@ class KeyVault {
           sellerAddress: foreign.seller_address,
           foreignAmount: BigInt(foreign.foreign_amount),
           evmNonce: Number(foreign.evm_nonce || 0),
+        };
+      }
+      if (solana && solana.vault_address) {
+        resolvedSolanaDeal = {
+          vaultAddress: String(solana.vault_address),
+          tokenMint: String(solana.token_mint),
+          mpcPath: String(solana.mpc_path),
+          mpcDomainId: Number(solana.mpc_domain_id),
+          sellerAddress: String(solana.seller_address),
+          collateralAmount: BigInt(solana.collateral_amount || 0),
+          collateralDeposited: Boolean(solana.collateral_deposited),
+          payoutSequence: Number(solana.payout_sequence || 0),
         };
       }
       if (deal) {
@@ -403,6 +436,7 @@ class KeyVault {
       relayReceipts: [],
       onChainStatus: resolvedStatus,
       foreignDeal: resolvedForeignDeal,
+      solanaDeal: resolvedSolanaDeal,
     };
 
     this.entries.set(dealId, entry);

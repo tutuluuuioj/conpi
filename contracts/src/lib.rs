@@ -21,8 +21,9 @@ use events::{emit_event, ConpiEvent};
 use settlement::SettlementCalculator;
 use types::{
     AdminAction, Balance, Config, CreateDealParams, Deal, DealId, DealStatus, DefaultReason,
-    ForeignChainInfo, ForeignTxRequest, MpcCallbackAction, PayloadKind, PayloadV2, SignRequest,
-    SignatureResponse, SignedPayload, SignedState, StagedAction, TeeSigner,
+    Ed25519SignatureResponse, ForeignChainInfo, ForeignTxRequest, MpcCallbackAction,
+    PayloadKind, PayloadV2, PendingSolanaPayout, SignRequest, SignatureResponse,
+    SignedPayload, SignedState, SolanaDealInfo, SolanaTxRequest, StagedAction, TeeSigner,
 };
 
 const GAS_FOR_FT_TRANSFER: Gas = Gas::from_tgas(20);
@@ -30,6 +31,10 @@ const GAS_FOR_RESOLVE_TRANSFER: Gas = Gas::from_tgas(10);
 const GAS_FOR_MPC_SIGN: Gas = Gas::from_tgas(250);
 const GAS_FOR_MPC_CALLBACK: Gas = Gas::from_tgas(30);
 const ONE_YOCTO: Balance = 1;
+const DEFAULT_SOLANA_VAULT: &str = "CtHaZkSC8e58VGtUmggu8WiH6fJ7RvUgiZNJtXu6SGp6";
+const DEFAULT_SOLANA_USDC_MINT: &str = "4zMMC9srt5Ri5X14GAgXhaHii3GnPAEERYPJgZJDncDU";
+const DEFAULT_SOLANA_MPC_PATH: &str = "conpi-solana-maker-v1";
+const DEFAULT_SOLANA_MPC_DOMAIN_ID: u32 = 1;
 
 #[ext_contract(ext_mpc_signer)]
 pub trait MpcSigner {
@@ -39,6 +44,38 @@ pub trait MpcSigner {
 #[near(contract_state)]
 #[derive(PanicOnDefault)]
 pub struct ConpiEscrow {
+    pub owner: AccountId,
+    pub chain_id: String,
+    pub paused: bool,
+    pub tee_signers: UnorderedMap<PublicKey, TeeSigner>,
+    pub deals: LookupMap<DealId, Deal>,
+    pub deal_creators: LookupMap<DealId, AccountId>,
+    pub pending_payouts: LookupMap<(AccountId, Option<AccountId>), Balance>,
+    pub next_deal_id: u64,
+    pub config: Config,
+    pub next_proposal_id: u64,
+    pub staged_proposals: UnorderedMap<u64, StagedAction>,
+    pub timelock_duration: Duration,
+    pub state_version: u32,
+    pub approved_measurement: Option<String>,
+    pub staged_upgrade_code: Option<Vec<u8>>,
+    pub foreign_deals: LookupMap<DealId, ForeignChainInfo>,
+    pub mpc_signer_contract: Option<AccountId>,
+    pub solana_deals: LookupMap<DealId, SolanaDealInfo>,
+    pub used_solana_transactions: LookupMap<[u8; 32], DealId>,
+    pub pending_solana_payouts: LookupMap<DealId, PendingSolanaPayout>,
+    pub solana_accept_nonces: LookupMap<DealId, u64>,
+    pub solana_vault_address: String,
+    pub solana_token_mint: String,
+    pub solana_mpc_path: String,
+    pub solana_mpc_domain_id: u32,
+}
+
+/// Frozen layout deployed immediately before Solana mixed-chain support.
+/// Keep this struct unchanged so `migrate()` can always deserialize that
+/// production state without touching any existing collection prefixes.
+#[near(serializers = [borsh])]
+pub struct ConpiEscrowV3 {
     pub owner: AccountId,
     pub chain_id: String,
     pub paused: bool,
@@ -137,6 +174,14 @@ impl ConpiEscrow {
             staged_upgrade_code: None,
             foreign_deals: LookupMap::new(b"f"),
             mpc_signer_contract: Some("v1.signer-prod.testnet".parse().unwrap()),
+            solana_deals: LookupMap::new(b"q"),
+            used_solana_transactions: LookupMap::new(b"u"),
+            pending_solana_payouts: LookupMap::new(b"r"),
+            solana_accept_nonces: LookupMap::new(b"n"),
+            solana_vault_address: DEFAULT_SOLANA_VAULT.to_string(),
+            solana_token_mint: DEFAULT_SOLANA_USDC_MINT.to_string(),
+            solana_mpc_path: DEFAULT_SOLANA_MPC_PATH.to_string(),
+            solana_mpc_domain_id: DEFAULT_SOLANA_MPC_DOMAIN_ID,
         };
 
         if let Some((pk, measurement)) = initial_tee_signer {
@@ -203,6 +248,17 @@ impl ConpiEscrow {
                     "Timelock duration must be at least 5 minutes"
                 );
             }
+            AdminAction::SetSolanaVault {
+                vault_address,
+                token_mint,
+                mpc_path,
+                mpc_domain_id,
+            } => {
+                require!(!vault_address.trim().is_empty(), "Solana vault cannot be empty");
+                require!(!token_mint.trim().is_empty(), "Solana token mint cannot be empty");
+                require!(!mpc_path.trim().is_empty(), "Solana MPC path cannot be empty");
+                require!(*mpc_domain_id > 0, "Solana MPC domain must be an Ed25519 domain");
+            }
         }
 
         let ready_at = env::block_timestamp() + self.timelock_duration;
@@ -226,6 +282,7 @@ impl ConpiEscrow {
             AdminAction::Unpause => "UNPAUSE",
             AdminAction::UpdateTimelock { .. } => "UPDATE_TIMELOCK",
             AdminAction::SetApprovedMeasurement { .. } => "SET_APPROVED_MEASUREMENT",
+            AdminAction::SetSolanaVault { .. } => "SET_SOLANA_VAULT",
         };
 
         emit_event(ConpiEvent::GovernanceActionProposed {
@@ -371,6 +428,26 @@ impl ConpiEscrow {
                 });
                 PromiseOrValue::Value(true)
             }
+            AdminAction::SetSolanaVault {
+                vault_address,
+                token_mint,
+                mpc_path,
+                mpc_domain_id,
+            } => {
+                require!(!vault_address.trim().is_empty(), "Solana vault cannot be empty");
+                require!(!token_mint.trim().is_empty(), "Solana token mint cannot be empty");
+                require!(!mpc_path.trim().is_empty(), "Solana MPC path cannot be empty");
+                require!(mpc_domain_id > 0, "Solana MPC domain must be an Ed25519 domain");
+                self.solana_vault_address = vault_address;
+                self.solana_token_mint = token_mint;
+                self.solana_mpc_path = mpc_path;
+                self.solana_mpc_domain_id = mpc_domain_id;
+                emit_event(ConpiEvent::GovernanceActionExecuted {
+                    proposal_id,
+                    action_type: "SET_SOLANA_VAULT",
+                });
+                PromiseOrValue::Value(true)
+            }
         }
     }
 
@@ -461,6 +538,47 @@ impl ConpiEscrow {
             return cur;
         }
 
+        if let Ok(v3) = ConpiEscrowV3::try_from_slice(&state_bytes) {
+            emit_event(ConpiEvent::ContractMigrated);
+            let mut migrated = Self {
+                owner: v3.owner,
+                chain_id: v3.chain_id,
+                paused: v3.paused,
+                tee_signers: v3.tee_signers,
+                deals: v3.deals,
+                deal_creators: v3.deal_creators,
+                pending_payouts: v3.pending_payouts,
+                next_deal_id: v3.next_deal_id,
+                config: v3.config,
+                next_proposal_id: v3.next_proposal_id,
+                staged_proposals: v3.staged_proposals,
+                timelock_duration: v3.timelock_duration,
+                state_version: v3.state_version + 1,
+                approved_measurement: v3.approved_measurement,
+                staged_upgrade_code: None,
+                foreign_deals: v3.foreign_deals,
+                mpc_signer_contract: v3.mpc_signer_contract,
+                solana_deals: LookupMap::new(b"q"),
+                used_solana_transactions: LookupMap::new(b"u"),
+                pending_solana_payouts: LookupMap::new(b"r"),
+                solana_accept_nonces: LookupMap::new(b"n"),
+                solana_vault_address: DEFAULT_SOLANA_VAULT.to_string(),
+                solana_token_mint: DEFAULT_SOLANA_USDC_MINT.to_string(),
+                solana_mpc_path: DEFAULT_SOLANA_MPC_PATH.to_string(),
+                solana_mpc_domain_id: DEFAULT_SOLANA_MPC_DOMAIN_ID,
+            };
+            for id in 1..migrated.next_deal_id {
+                if let Some(mut deal) = migrated.deals.get(&id) {
+                    if deal.status == DealStatus::Funded || deal.status == DealStatus::Created {
+                        deal.deposit_deadline = env::block_timestamp() + 86_400 * 1_000_000_000;
+                        deal.key_deadline = env::block_timestamp() + 86_400 * 1_000_000_000;
+                        migrated.deals.insert(&id, &deal);
+                    }
+                }
+            }
+            return migrated;
+        }
+
         let (v1, approved_measurement) = if let Ok(v2) =
             ConpiEscrowV2::try_from_slice(&state_bytes)
         {
@@ -517,6 +635,14 @@ impl ConpiEscrow {
             staged_upgrade_code: None,
             foreign_deals: LookupMap::new(b"f"),
             mpc_signer_contract: Some("v1.signer-prod.testnet".parse().unwrap()),
+            solana_deals: LookupMap::new(b"q"),
+            used_solana_transactions: LookupMap::new(b"u"),
+            pending_solana_payouts: LookupMap::new(b"r"),
+            solana_accept_nonces: LookupMap::new(b"n"),
+            solana_vault_address: DEFAULT_SOLANA_VAULT.to_string(),
+            solana_token_mint: DEFAULT_SOLANA_USDC_MINT.to_string(),
+            solana_mpc_path: DEFAULT_SOLANA_MPC_PATH.to_string(),
+            solana_mpc_domain_id: DEFAULT_SOLANA_MPC_DOMAIN_ID,
         }
     }
 
@@ -792,6 +918,10 @@ impl ConpiEscrow {
                 is_buyer: true,
             });
         } else if caller == deal.seller {
+            require!(
+                self.solana_deals.get(&deal_id).is_none(),
+                "Solana seller collateral must be verified from Solana"
+            );
             let required = deal.seller_collateral;
             require!(
                 deal.seller_deposited + attached <= required,
@@ -886,6 +1016,10 @@ impl ConpiEscrow {
                 is_buyer: true,
             });
         } else if sender_id == deal.seller {
+            if self.solana_deals.get(&deal_id).is_some() {
+                env::log_str("ft_on_transfer: Solana seller collateral must be verified on Solana, refunding full amount");
+                return PromiseOrValue::Value(amount);
+            }
             let required_total = deal.seller_collateral;
             let needed = required_total.saturating_sub(deal.seller_deposited);
             let accepted = std::cmp::min(amt, needed);
@@ -920,6 +1054,12 @@ impl ConpiEscrow {
             deal.status == DealStatus::Funded,
             "Deal must be in Funded status to activate"
         );
+        if let Some(solana) = self.solana_deals.get(&deal_id) {
+            require!(
+                solana.collateral_deposited,
+                "Solana seller collateral must be verified before activation"
+            );
+        }
         if env::block_timestamp() > deal.key_deadline {
             deal.key_deadline = env::block_timestamp() + 86400 * 1_000_000_000;
         }
@@ -958,6 +1098,10 @@ impl ConpiEscrow {
         sig: Vec<u8>,
     ) {
         let mut deal = self.get_deal_or_panic(deal_id);
+        require!(
+            self.solana_deals.get(&deal_id).is_none(),
+            "Solana deals must use request_solana_stage_payout"
+        );
         let is_foreign = self.foreign_deals.get(&deal_id).is_some();
         require!(
             deal.status == DealStatus::Active,
@@ -1222,6 +1366,392 @@ impl ConpiEscrow {
 
     pub fn get_foreign_deal(&self, deal_id: u64) -> Option<ForeignChainInfo> {
         self.foreign_deals.get(&deal_id)
+    }
+
+    /// Accepts a NEAR-created deal with a signature from its Solana
+    /// counterparty and atomically locks the Chain Signatures vault terms.
+    /// The relayer is untrusted: the contract verifies the Ed25519 signature
+    /// against the 32-byte key encoded in the counterparty's implicit account.
+    pub fn accept_deal_solana(
+        &mut self,
+        deal_id: u64,
+        expected_hash: [u8; 32],
+        seller_address: String,
+        public_key: Vec<u8>,
+        nonce: u64,
+        expires_at: u64,
+        signature: Vec<u8>,
+    ) {
+        self.assert_not_paused();
+        let mut deal = self.get_deal_or_panic(deal_id);
+        require!(deal.status == DealStatus::Created, "Deal must be in Created status");
+        require!(!deal.counterparty_accepted, "Deal is already accepted");
+        require!(deal.token.is_some(), "Mixed-chain deals require NEAR NEP-141 escrow");
+        require!(public_key.len() == 32, "Solana public key must be 32 bytes");
+        require!(signature.len() == 64, "Solana signature must be 64 bytes");
+        require!(expires_at >= env::block_timestamp(), "Solana acceptance signature expired");
+        require!(
+            expires_at <= env::block_timestamp() + 600_000_000_000,
+            "Solana acceptance expiry is too far in the future"
+        );
+
+        let creator = self.deal_creators.get(&deal_id).expect("Creator not found");
+        let counterparty = if creator == deal.buyer {
+            deal.seller.clone()
+        } else {
+            deal.buyer.clone()
+        };
+        require!(
+            counterparty.as_str() == hex::encode(&public_key),
+            "Solana signer is not the on-chain counterparty"
+        );
+        require!(
+            deal.terms_hash == Some(expected_hash),
+            "expected_hash does not match on-chain terms_hash"
+        );
+        let previous_nonce = self.solana_accept_nonces.get(&deal_id).unwrap_or(0);
+        require!(nonce > previous_nonce, "Solana acceptance nonce was already used");
+        require!(!seller_address.trim().is_empty(), "Solana seller address is required");
+        require!(
+            seller_address == hex::encode(&public_key),
+            "Solana payout address must be the signing wallet"
+        );
+
+        let message = self.solana_acceptance_message(
+            deal_id,
+            &expected_hash,
+            &seller_address,
+            nonce,
+            expires_at,
+        );
+        let mut pk = [0u8; 32];
+        pk.copy_from_slice(&public_key);
+        let mut sig = [0u8; 64];
+        sig.copy_from_slice(&signature);
+        require!(
+            env::ed25519_verify(&sig, message.as_bytes(), &pk),
+            "Invalid Solana acceptance signature"
+        );
+
+        let locked = SolanaDealInfo {
+            vault_address: self.solana_vault_address.clone(),
+            token_mint: self.solana_token_mint.clone(),
+            mpc_path: self.solana_mpc_path.clone(),
+            mpc_domain_id: self.solana_mpc_domain_id,
+            seller_address: seller_address.clone(),
+            collateral_amount: U128(deal.seller_collateral),
+            collateral_deposited: false,
+            deposit_tx: None,
+            payout_sequence: 0,
+            last_payout_tx: None,
+        };
+        self.solana_deals.insert(&deal_id, &locked);
+        self.solana_accept_nonces.insert(&deal_id, &nonce);
+        deal.counterparty_accepted = true;
+        self.check_and_transition_funded(&mut deal);
+        self.deals.insert(&deal_id, &deal);
+
+        emit_event(ConpiEvent::DealAccepted {
+            deal_id,
+            account: &counterparty,
+        });
+    }
+
+    pub fn get_solana_deal(&self, deal_id: u64) -> Option<SolanaDealInfo> {
+        self.solana_deals.get(&deal_id)
+    }
+
+    pub fn get_solana_pending_payout(&self, deal_id: u64) -> Option<PendingSolanaPayout> {
+        self.pending_solana_payouts.get(&deal_id)
+    }
+
+    pub fn get_solana_vault_config(&self) -> near_sdk::serde_json::Value {
+        near_sdk::serde_json::json!({
+            "vault_address": self.solana_vault_address,
+            "token_mint": self.solana_token_mint,
+            "mpc_path": self.solana_mpc_path,
+            "mpc_domain_id": self.solana_mpc_domain_id,
+        })
+    }
+
+    /// Records a finalized, exact Solana collateral transfer after the TEE has
+    /// verified its mint, authority, destination ATA, amount and finality.
+    pub fn record_solana_collateral(
+        &mut self,
+        deal_id: u64,
+        tx_signature: String,
+        payload: SignedPayload,
+        sig: Vec<u8>,
+    ) {
+        let mut deal = self.get_deal_or_panic(deal_id);
+        require!(deal.status == DealStatus::Created, "Deal must be Created");
+        let mut info = self.solana_deals.get(&deal_id).expect("Solana deal is not registered");
+        require!(!info.collateral_deposited, "Solana collateral is already recorded");
+        require!(info.collateral_amount.0 == deal.seller_collateral, "Locked collateral mismatch");
+        let tx_hash = env::sha256_array(tx_signature.as_bytes());
+        require!(
+            self.used_solana_transactions.get(&tx_hash).is_none(),
+            "Solana transaction was already used"
+        );
+        require!(
+            payload.foreign_tx_sighash == Some(tx_hash),
+            "TEE payload is not bound to this Solana deposit"
+        );
+        self.assert_active_tee_signer(&deal.tee_pubkey);
+        CryptoHelper::verify_signed_payload(
+            &payload,
+            &sig,
+            &deal.tee_pubkey,
+            &deal,
+            &env::current_account_id(),
+            &self.chain_id,
+            PayloadKind::ForeignDeposit,
+        );
+
+        info.collateral_deposited = true;
+        info.deposit_tx = Some(tx_signature.clone());
+        deal.seller_deposited = deal.seller_collateral;
+        deal.last_nonce = payload.nonce;
+        deal.last_tee_seen = env::block_timestamp();
+        self.used_solana_transactions.insert(&tx_hash, &deal_id);
+        self.solana_deals.insert(&deal_id, &info);
+        self.check_and_transition_funded(&mut deal);
+        self.deals.insert(&deal_id, &deal);
+
+        emit_event(ConpiEvent::SolanaCollateralRecorded {
+            deal_id,
+            seller: &info.seller_address,
+            amount: info.collateral_amount,
+            tx_signature: &tx_signature,
+        });
+    }
+
+    /// Requests an Ed25519 Chain Signature for a TEE-built Solana message.
+    /// State is not released here; it advances only after the TEE broadcasts
+    /// and confirms the exact signed transaction on Solana.
+    pub fn request_solana_stage_payout(
+        &mut self,
+        deal_id: u64,
+        stage: u8,
+        payload: SignedPayload,
+        sig: Vec<u8>,
+        solana_tx: SolanaTxRequest,
+    ) -> Promise {
+        let deal = self.get_deal_or_panic(deal_id);
+        let info = self.solana_deals.get(&deal_id).expect("Solana deal is not registered");
+        require!(deal.status == DealStatus::Active, "Deal must be Active");
+        require!(info.collateral_deposited, "Solana seller collateral is not funded");
+        require!(stage > deal.stage_reached, "Stage must advance");
+        require!(payload.stage == stage, "Payload stage mismatch");
+        require!(payload.metered_value.0 > 0, "Metered value must be positive");
+        let required_metered = if stage == 100 {
+            (9995 * deal.credit_amount) / 10000
+        } else {
+            (stage as u128 * deal.credit_amount) / 100
+        };
+        require!(payload.metered_value.0 >= required_metered, "Metered value is below stage threshold");
+        require!(
+            self.pending_solana_payouts.get(&deal_id).is_none(),
+            "A Solana payout is already pending"
+        );
+        require!(solana_tx.recipient == info.seller_address, "Solana payout recipient mismatch");
+        let incremental = SettlementCalculator::calculate_stage_payout(&deal, stage);
+        let expected = if stage == 100 {
+            incremental + deal.seller_collateral
+        } else {
+            incremental
+        };
+        require!(solana_tx.amount.0 == expected, "Solana payout amount mismatch");
+        let message = hex::decode(&solana_tx.message_hex).expect("Invalid Solana message hex");
+        require!(!message.is_empty() && message.len() <= 1232, "Invalid Solana message length");
+        let message_hash = env::sha256_array(&message);
+        require!(message_hash == solana_tx.message_hash, "Solana message hash mismatch");
+        require!(
+            payload.foreign_tx_sighash == Some(message_hash),
+            "TEE payload is not bound to the Solana message"
+        );
+        self.assert_active_tee_signer(&deal.tee_pubkey);
+        CryptoHelper::verify_signed_payload(
+            &payload,
+            &sig,
+            &deal.tee_pubkey,
+            &deal,
+            &env::current_account_id(),
+            &self.chain_id,
+            PayloadKind::Stage,
+        );
+
+        self.pending_solana_payouts.insert(&deal_id, &PendingSolanaPayout {
+            stage,
+            message_hex: solana_tx.message_hex.clone(),
+            message_hash,
+            recipient: solana_tx.recipient.clone(),
+            amount: solana_tx.amount,
+            last_valid_block_height: solana_tx.last_valid_block_height,
+            requested_at: env::block_timestamp(),
+            stage_payload: payload,
+            signature_hex: None,
+        });
+
+        let mpc_account = self
+            .mpc_signer_contract
+            .clone()
+            .unwrap_or_else(|| "v1.signer-prod.testnet".parse().unwrap());
+        ext_mpc_signer::ext(mpc_account)
+            .with_attached_deposit(NearToken::from_yoctonear(ONE_YOCTO))
+            .with_static_gas(GAS_FOR_MPC_SIGN)
+            .sign(SignRequest {
+                payload_v2: PayloadV2::Eddsa(solana_tx.message_hex),
+                path: info.mpc_path.clone(),
+                domain_id: info.mpc_domain_id,
+            })
+            .then(
+                Self::ext(env::current_account_id())
+                    .with_static_gas(GAS_FOR_MPC_CALLBACK)
+                    .on_solana_mpc_signed(deal_id),
+            )
+    }
+
+    #[private]
+    pub fn on_solana_mpc_signed(
+        &mut self,
+        deal_id: u64,
+        #[callback_result] result: Result<Ed25519SignatureResponse, near_sdk::PromiseError>,
+    ) -> bool {
+        let mut pending = match self.pending_solana_payouts.get(&deal_id) {
+            Some(value) => value,
+            None => return false,
+        };
+        match result {
+            Ok(Ed25519SignatureResponse::Ed25519 { signature }) if signature.len() == 64 => {
+                let signature_hex = hex::encode(signature);
+                let message_hash_hex = hex::encode(pending.message_hash);
+                pending.signature_hex = Some(signature_hex.clone());
+                self.pending_solana_payouts.insert(&deal_id, &pending);
+                emit_event(ConpiEvent::SolanaTxSigned {
+                    deal_id,
+                    stage: pending.stage,
+                    recipient: &pending.recipient,
+                    amount: pending.amount,
+                    message_hex: &pending.message_hex,
+                    message_hash_hex: &message_hash_hex,
+                    signature_hex: &signature_hex,
+                    last_valid_block_height: pending.last_valid_block_height,
+                });
+                true
+            }
+            Ok(_) | Err(_) => {
+                self.pending_solana_payouts.remove(&deal_id);
+                false
+            }
+        }
+    }
+
+    /// Finalizes accounting only after the TEE has observed the exact payout
+    /// transaction as confirmed on Solana.
+    pub fn confirm_solana_stage_payout(
+        &mut self,
+        deal_id: u64,
+        tx_signature: String,
+        payload: SignedPayload,
+        sig: Vec<u8>,
+    ) {
+        let mut deal = self.get_deal_or_panic(deal_id);
+        let pending = self
+            .pending_solana_payouts
+            .get(&deal_id)
+            .expect("No Solana payout is pending");
+        let mut info = self.solana_deals.get(&deal_id).expect("Solana deal is not registered");
+        require!(deal.status == DealStatus::Active, "Deal must be Active");
+        require!(payload.stage == pending.stage, "Confirmation stage mismatch");
+        require!(payload.nonce > pending.stage_payload.nonce, "Confirmation nonce must follow stage request");
+        require!(
+            payload.foreign_tx_sighash == Some(pending.message_hash),
+            "Confirmation is not bound to the signed Solana message"
+        );
+        let tx_hash = env::sha256_array(tx_signature.as_bytes());
+        require!(
+            self.used_solana_transactions.get(&tx_hash).is_none(),
+            "Solana transaction was already used"
+        );
+        self.assert_active_tee_signer(&deal.tee_pubkey);
+        CryptoHelper::verify_signed_payload(
+            &payload,
+            &sig,
+            &deal.tee_pubkey,
+            &deal,
+            &env::current_account_id(),
+            &self.chain_id,
+            PayloadKind::ForeignPayout,
+        );
+
+        let stage = pending.stage;
+        let incremental = SettlementCalculator::calculate_stage_payout(&deal, stage);
+        deal.released_to_seller += incremental;
+        deal.stage_reached = stage;
+        deal.last_nonce = payload.nonce;
+        deal.last_signed = Some(SignedState {
+            stage,
+            metered_value: pending.stage_payload.metered_value,
+            nonce: payload.nonce,
+            issued_at: payload.issued_at,
+        });
+        deal.last_tee_seen = env::block_timestamp();
+        deal.usage_deadline = env::block_timestamp() + self.config.default_usage_duration;
+        deal.notice_deadline = None;
+        info.payout_sequence += 1;
+        info.last_payout_tx = Some(tx_signature.clone());
+
+        if stage == 100 {
+            deal.status = DealStatus::Completed;
+            deal.seller_deposited = 0;
+            info.collateral_deposited = false;
+            if deal.buyer_collateral > 0 {
+                let _ = self.payout(&deal.buyer, deal.buyer_collateral, &deal.token);
+            }
+            self.refund_storage_deposit(deal_id);
+            emit_event(ConpiEvent::DealCompleted {
+                deal_id,
+                seller_total: U128(deal.released_to_seller + deal.seller_collateral),
+            });
+        }
+
+        self.used_solana_transactions.insert(&tx_hash, &deal_id);
+        self.solana_deals.insert(&deal_id, &info);
+        self.deals.insert(&deal_id, &deal);
+        self.pending_solana_payouts.remove(&deal_id);
+
+        emit_event(ConpiEvent::StageReleased {
+            deal_id,
+            stage,
+            amount_released: U128(incremental),
+            cumulative_released: U128(deal.released_to_seller),
+        });
+        emit_event(ConpiEvent::SolanaPayoutConfirmed {
+            deal_id,
+            stage,
+            tx_signature: &tx_signature,
+            amount: pending.amount,
+        });
+    }
+
+    /// Lets the active enclave rebuild a message after its Solana blockhash
+    /// expires, without allowing it to skip a confirmed payout.
+    pub fn clear_expired_solana_payout(&mut self, deal_id: u64) {
+        let deal = self.get_deal_or_panic(deal_id);
+        let is_tee_signer = self
+            .tee_signers
+            .get(&env::signer_account_pk())
+            .map(|entry| entry.active)
+            .unwrap_or(false)
+            || env::signer_account_pk() == deal.tee_pubkey;
+        require!(is_tee_signer || env::predecessor_account_id() == self.owner, "TEE signer required");
+        let pending = self.pending_solana_payouts.get(&deal_id).expect("No Solana payout is pending");
+        require!(
+            env::block_timestamp() >= pending.requested_at + 120_000_000_000,
+            "Solana payout is not stale"
+        );
+        self.pending_solana_payouts.remove(&deal_id);
     }
 
     pub fn set_mpc_signer_contract(&mut self, account_id: AccountId) {
@@ -1632,6 +2162,10 @@ impl ConpiEscrow {
     /// Settle default is NEVER blocked by contract pause so parties can always settle infractions.
     pub fn settle_default(&mut self, deal_id: u64, payload: SignedPayload, sig: Vec<u8>) {
         let mut deal = self.get_deal_or_panic(deal_id);
+        require!(
+            self.solana_deals.get(&deal_id).is_none(),
+            "Solana deals require Solana-aware default settlement"
+        );
         require!(
             self.foreign_deals.get(&deal_id).is_none(),
             "Foreign deals must use settle_default_foreign"
@@ -2147,6 +2681,10 @@ impl ConpiEscrow {
     pub fn timeout_refund(&mut self, deal_id: u64) {
         let mut deal = self.get_deal_or_panic(deal_id);
         require!(
+            self.solana_deals.get(&deal_id).is_none(),
+            "Solana deals require Solana-aware timeout settlement"
+        );
+        require!(
             self.foreign_deals.get(&deal_id).is_none(),
             "Foreign deals must use timeout_refund_foreign"
         );
@@ -2263,6 +2801,10 @@ impl ConpiEscrow {
 
     pub fn finalize_auto_release(&mut self, deal_id: u64) {
         let mut deal = self.get_deal_or_panic(deal_id);
+        require!(
+            self.solana_deals.get(&deal_id).is_none(),
+            "Solana deals require Solana-aware release"
+        );
         require!(
             self.foreign_deals.get(&deal_id).is_none(),
             "Foreign deals must use finalize_auto_release_foreign"
@@ -2568,6 +3110,29 @@ impl ConpiEscrow {
         require!(!self.paused, "Contract is currently paused");
     }
 
+    fn solana_acceptance_message(
+        &self,
+        deal_id: u64,
+        expected_hash: &[u8; 32],
+        seller_address: &str,
+        nonce: u64,
+        expires_at: u64,
+    ) -> String {
+        format!(
+            "CONPI_SOLANA_ACCEPT_V1\ncontract:{}\nnetwork:{}\ndeal:{}\nterms:{}\nseller:{}\nvault:{}\nmint:{}\ncollateral:{}\nnonce:{}\nexpires_at:{}",
+            env::current_account_id(),
+            self.chain_id,
+            deal_id,
+            hex::encode(expected_hash),
+            seller_address,
+            self.solana_vault_address,
+            self.solana_token_mint,
+            self.get_deal_or_panic(deal_id).seller_collateral,
+            nonce,
+            expires_at,
+        )
+    }
+
     pub fn get_approved_measurement(&self) -> Option<String> {
         self.approved_measurement.clone()
     }
@@ -2592,9 +3157,13 @@ impl ConpiEscrow {
     fn check_and_transition_funded(&mut self, deal: &mut Deal) {
         let buyer_required = deal.price + deal.buyer_collateral;
         let seller_required = deal.seller_collateral;
+        let seller_funded = match self.solana_deals.get(&deal.id) {
+            Some(solana) => solana.collateral_deposited && deal.seller_deposited >= seller_required,
+            None => deal.seller_deposited >= seller_required,
+        };
 
         if deal.buyer_deposited >= buyer_required
-            && deal.seller_deposited >= seller_required
+            && seller_funded
             && deal.terms_hash.is_some()
             && deal.counterparty_accepted
         {

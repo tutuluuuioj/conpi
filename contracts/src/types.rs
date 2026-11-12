@@ -38,6 +38,7 @@ pub enum PayloadKind {
     Checkpoint,
     Default,
     ForeignDeposit,
+    ForeignPayout,
 }
 
 #[near(serializers = [json, borsh])]
@@ -164,6 +165,12 @@ pub enum AdminAction {
     Unpause,
     UpdateTimelock { timelock_duration: u64 },
     SetApprovedMeasurement { measurement: String },
+    SetSolanaVault {
+        vault_address: String,
+        token_mint: String,
+        mpc_path: String,
+        mpc_domain_id: u32,
+    },
 }
 
 #[near(serializers = [json, borsh])]
@@ -184,6 +191,56 @@ pub struct ForeignChainInfo {
     pub foreign_amount: U128,
     pub evm_nonce: u64,
     pub seller_claimed: bool,
+}
+
+/// Solana-side state for a mixed-chain deal. The buyer's USDC remains in the
+/// NEAR escrow while the seller collateral and seller payouts use the
+/// Chain-Signatures-controlled Solana vault.
+#[near(serializers = [json, borsh])]
+#[derive(Clone, Debug, PartialEq)]
+pub struct SolanaDealInfo {
+    pub vault_address: String,
+    pub token_mint: String,
+    /// Chain Signatures settings are fixed at seller acceptance. Governance
+    /// may rotate defaults for future deals, but an existing seller must never
+    /// have their payout authority changed underneath an accepted deal.
+    pub mpc_path: String,
+    pub mpc_domain_id: u32,
+    pub seller_address: String,
+    pub collateral_amount: U128,
+    pub collateral_deposited: bool,
+    pub deposit_tx: Option<String>,
+    pub payout_sequence: u64,
+    pub last_payout_tx: Option<String>,
+}
+
+#[near(serializers = [json, borsh])]
+#[derive(Clone, Debug, PartialEq)]
+pub struct SolanaTxRequest {
+    /// Hex-encoded Solana legacy message bytes. Solana signs the message
+    /// directly with Ed25519; it must not be pre-hashed for MPC signing.
+    pub message_hex: String,
+    pub message_hash: [u8; 32],
+    pub recipient: String,
+    pub amount: U128,
+    pub last_valid_block_height: u64,
+}
+
+#[near(serializers = [json, borsh])]
+#[derive(Clone, Debug, PartialEq)]
+pub struct PendingSolanaPayout {
+    pub stage: u8,
+    pub message_hex: String,
+    pub message_hash: [u8; 32],
+    pub recipient: String,
+    pub amount: U128,
+    pub last_valid_block_height: u64,
+    pub requested_at: Timestamp,
+    pub stage_payload: SignedPayload,
+    /// Stored after the MPC callback so an enclave restart can broadcast the
+    /// exact already-authorized Solana transaction instead of requesting a
+    /// second signature for the same stage.
+    pub signature_hex: Option<String>,
 }
 
 #[near(serializers = [json, borsh])]
@@ -242,4 +299,19 @@ pub struct SignatureResponse {
     pub big_r: AffinePoint,
     pub s: Scalar,
     pub recovery_id: u8,
+}
+
+/// Current Chain Signatures response shape for the Ed25519/FROST domain.
+/// It is intentionally separate from the legacy ECDSA callback response so
+/// existing Base settlement remains wire-compatible.
+#[near(serializers = [json])]
+#[derive(Clone, Debug)]
+#[serde(tag = "scheme")]
+pub enum Ed25519SignatureResponse {
+    Ed25519 { signature: Vec<u8> },
+    Secp256k1 {
+        big_r: AffinePoint,
+        s: Scalar,
+        recovery_id: u8,
+    },
 }

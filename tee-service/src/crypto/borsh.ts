@@ -5,6 +5,10 @@ export enum PayloadKind {
   Checkpoint = 3,
   Default = 4,
   ForeignDeposit = 5,
+  // Confirms a Solana payout after the TEE has observed the signed
+  // transaction on-chain. Keep this at the end: the values above are part of
+  // the deployed contract's Borsh wire format.
+  ForeignPayout = 6,
 }
 
 export enum DefaultReason {

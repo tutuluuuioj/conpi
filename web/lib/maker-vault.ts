@@ -35,8 +35,9 @@ export const MAKER_VAULT_CONFIG: Record<VaultChain, ChainVaultConfig> = {
     symbol: "USDC",
     decimals: 6,
     tokenAddress: SOLANA_DEVNET_USDC_MINT,
-    // Canonical Conpi Maker Vault Address on Solana Devnet
-    vaultAddress: "FXCfMCe2T7u1gDC6534L8jzXCxoMrk4CKfjU3WCd7Doe",
+    // The NEAR Chain-Signatures-derived vault. Its private key never exists
+    // in the browser or the operator environment.
+    vaultAddress: "CtHaZkSC8e58VGtUmggu8WiH6fJ7RvUgiZNJtXu6SGp6",
     explorer: SOLANA_DEVNET_EXPLORER,
     rpcUrl: SOLANA_DEVNET_RPC,
   },
