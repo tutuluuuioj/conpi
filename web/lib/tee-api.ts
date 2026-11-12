@@ -3,7 +3,7 @@ import type { SellerKeyAuthorization } from "./seller-key-auth";
 
 const TEE_BASE_URL =
   process.env.NEXT_PUBLIC_TEE_URL ||
-  "https://b1b35377079ac7b7937afc607481587bc6d22665-3000.dstack-pha-prod9.phala.network";
+  "https://ce5044ca834d2da5bb1252706bfa3b2c91d7d934-3000.dstack-pha1-prod5.phala.network";
 const NEAR_RPC_URL = process.env.NEXT_PUBLIC_NEAR_RPC || "https://archival-rpc.testnet.near.org";
 
 export interface TeeAttestation {

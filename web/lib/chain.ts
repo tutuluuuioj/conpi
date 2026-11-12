@@ -4,9 +4,9 @@ export const CODE_HASH = "ca701509eaa1620d4d43b93b852eb56b64a7a81c08ce439dc81713
 export const CODE_HASH_BS58 = "EdEUu5XRUE65aLWT868viKZ2UxbbH2dNDmkxth2mPGFx";
 export const BASE_URL =
   process.env.NEXT_PUBLIC_TEE_BASE_URL ||
-  "https://b1b35377079ac7b7937afc607481587bc6d22665-3000.dstack-pha-prod9.phala.network/v1";
+  "https://ce5044ca834d2da5bb1252706bfa3b2c91d7d934-3000.dstack-pha1-prod5.phala.network/v1";
 export const TERMS_HASH = "0x33759870ce50be53364c8f0d319519ebd61e19f7bc0fbe39294cb1baaf009bd5";
-export const TEE_SIGNER_PUBLIC_KEY = "ed25519:CLHhDLsLCCqFeTjz7g31NkfbtN1UqT2mJRmRZgcRPTj3";
+export const TEE_SIGNER_PUBLIC_KEY = "ed25519:F4YtyCFTEj9rca8fJQxcQd7F1UHuuGQBxP8WmcAC7cbi";
 
 export const NETWORK = "testnet" as const;
 

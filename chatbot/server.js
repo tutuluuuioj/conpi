@@ -8,7 +8,7 @@ const __dirname = path.dirname(__filename);
 const PORT = Number(process.env.PORT || 4000);
 const TEE_BASE_URL = (
   process.env.TEE_BASE_URL ||
-  "https://b1b35377079ac7b7937afc607481587bc6d22665-3000.dstack-pha-prod9.phala.network"
+  "https://ce5044ca834d2da5bb1252706bfa3b2c91d7d934-3000.dstack-pha1-prod5.phala.network"
 ).replace(/\/$/, "");
 
 const MIME_TYPES = {

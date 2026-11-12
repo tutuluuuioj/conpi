@@ -35,7 +35,7 @@ struct ExecuteArgs {
 }
 
 const ESCROW_ID: &str = "dev-20261103062448-30583839049419.testnet";
-const LIVE_MEASUREMENT: &str = "mrtd:7fe60787222bd394cb516abca2435f22f035ab2cc9c0a4b4b3b148e46297f3d931a237b72f359052c6e657d8c1409173|compose:c847677bcdbe7d532fa96beabe82cb19e5c7ae44feed9e2c0d941660257d4ed0";
+const LIVE_MEASUREMENT: &str = "mrtd:7fe60787222bd394cb516abca2435f22f035ab2cc9c0a4b4b3b148e46297f3d931a237b72f359052c6e657d8c1409173|compose:76ff45050ad2f7e6c3771a7b4c85f11919f0236b45e731492dd7339965836b76";
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
