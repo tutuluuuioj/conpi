@@ -490,9 +490,12 @@ function mapOnChainDeal(
     })
   );
   const role: "buyer" | "seller" = isSeller ? "seller" : "buyer";
+  // USDC is the platform's settlement asset on every rail. Its presence in a
+  // listing does not make a deal foreign-chain funded; only a contract-locked
+  // foreign deal record does. Treating every USDC listing as foreign silently
+  // removed the buyer collateral from NEAR deposits.
   const isForeign = Boolean(
-    (foreignDeal && (Number(foreignDeal.foreign_amount) > 0 || foreignDeal.vault_address)) ||
-    (listing as any)?.token === "USDC"
+    foreignDeal && (Number(foreignDeal.foreign_amount) > 0 || foreignDeal.vault_address)
   );
   const foreignUsdcAmount = (foreignDeal && Number(foreignDeal.foreign_amount) > 0)
     ? Number(foreignDeal.foreign_amount) / 1e6
@@ -591,6 +594,8 @@ function mapOnChainDeal(
     token,
     buyer: fromNearAccountId(d.buyer, (listing as any)?.buyer),
     seller: fromNearAccountId(d.seller, (listing as any)?.seller),
+    buyerCanonical: d.buyer,
+    sellerCanonical: d.seller,
     deadline: defaultTerms.deadline,
     termsHash: termsHashHex,
     counterpartyAccepted,
@@ -1215,8 +1220,8 @@ export function Providers({ children }: { children: React.ReactNode }) {
         ticket = await teeApi.initTicket(
           deal.id,
           Number(deal.id),
-          deal.buyer,
-          deal.seller,
+          deal.buyerCanonical || toNearAccountId(deal.buyer),
+          deal.sellerCanonical || toNearAccountId(deal.seller),
           deal.termsHash?.replace(/^0x/, "")
         );
       }
@@ -1783,7 +1788,13 @@ export function Providers({ children }: { children: React.ReactNode }) {
           try {
             ticket = await teeApi.getTicket(dealId);
           } catch {
-            ticket = await teeApi.initTicket(dealId, Number(dealId), deal.buyer, deal.seller, deal.termsHash?.replace(/^0x/, ""));
+            ticket = await teeApi.initTicket(
+              dealId,
+              Number(dealId),
+              deal.buyerCanonical || toNearAccountId(deal.buyer),
+              deal.sellerCanonical || toNearAccountId(deal.seller),
+              deal.termsHash?.replace(/^0x/, "")
+            );
           }
           applyTicketState(dealId, ticket);
         } catch {
@@ -1799,7 +1810,8 @@ export function Providers({ children }: { children: React.ReactNode }) {
           if (hashBytes.length !== 32) throw new Error("Deal terms_hash missing or invalid");
 
           const solanaAddress = stateRef.current.solanaAccount;
-          const solanaSeller = solanaAddress && toNearAccountId(solanaAddress).toLowerCase() === deal.seller.toLowerCase();
+          const sellerCanonical = (deal.sellerCanonical || toNearAccountId(deal.seller)).toLowerCase();
+          const solanaSeller = solanaAddress && toNearAccountId(solanaAddress).toLowerCase() === sellerCanonical;
           if (solanaSeller) {
             // Submit the seller's encrypted term sheet now, so the key
             // activation screen cannot proceed until the buyer has supplied
@@ -1854,8 +1866,6 @@ export function Providers({ children }: { children: React.ReactNode }) {
         const deal = stateRef.current.deals.find((item) => item.id === dealId);
         if (!deal) return { ok: false, title: "Deal not found" };
         const isBuyer = deal.role === "buyer";
-        const escrow = escrowOf(deal);
-        const amount = isBuyer ? escrow.buyerDeposit : escrow.sellerDeposit;
 
         try {
           const tokenContract = MAKER_VAULT_CONFIG.near.tokenAddress;
@@ -1864,9 +1874,29 @@ export function Providers({ children }: { children: React.ReactNode }) {
           if (initialDeal.token !== tokenContract) {
             throw new Error(`Deal #${dealId} was created with legacy native-NEAR terms and cannot accept USDC. Create a new deal before depositing.`);
           }
+          const requiredAtomic = isBuyer
+            ? BigInt(initialDeal.price || "0") + BigInt(initialDeal.buyer_collateral || "0")
+            : BigInt(initialDeal.seller_collateral || "0");
+          const alreadyDepositedAtomic = BigInt(
+            isBuyer ? initialDeal.buyer_deposited || "0" : initialDeal.seller_deposited || "0"
+          );
+          const remainingAtomic = requiredAtomic > alreadyDepositedAtomic
+            ? requiredAtomic - alreadyDepositedAtomic
+            : BigInt(0);
+          if (remainingAtomic === BigInt(0)) {
+            await loadOnChainData();
+            return {
+              ok: true,
+              title: "USDC deposit already complete",
+              body: "The escrow already has this wallet's full required deposit.",
+            };
+          }
           await submitPartyTermsToTee(deal, deal.role);
           // 100% USDC deposits on NEAR using official Circle Native USDC:
-          const rawAmount = Math.round(amount * 1e6).toString();
+          // Derive the transfer from fresh contract state, not rounded browser
+          // listing metadata. This safely tops up a partial deposit exactly.
+          const rawAmount = remainingAtomic.toString();
+          const transferAmount = Number(remainingAtomic) / 1e6;
 
           const outcome: any = await txDepositFt(tokenContract, Number(dealId), rawAmount);
           const txHash = outcome?.transaction?.hash || outcome?.transaction_outcome?.id || "";
@@ -1894,7 +1924,7 @@ export function Providers({ children }: { children: React.ReactNode }) {
               {
                 id: crypto.randomUUID(),
                 title: "USDC Escrow Deposited",
-                detail: `$${amount.toFixed(2)} USDC locked in Conpi Maker Vault (NEAR).`,
+                detail: `$${transferAmount.toFixed(6)} USDC locked in Conpi Maker Vault (NEAR).`,
                 tx: txHash,
                 time: "Now",
               },
@@ -1906,7 +1936,7 @@ export function Providers({ children }: { children: React.ReactNode }) {
           return {
             ok: true,
             title: "USDC Deposit Confirmed on NEAR",
-            body: `$${amount.toFixed(2)} USDC locked in Conpi Maker Vault.`,
+            body: `$${transferAmount.toFixed(6)} USDC locked in Conpi Maker Vault.`,
             href: `https://testnet.nearblocks.io/txns/${txHash}`,
           };
         } catch (err: any) {
@@ -2043,7 +2073,8 @@ export function Providers({ children }: { children: React.ReactNode }) {
         if (!deal) return { ok: false, title: "Deal not found" };
         try {
           const solanaAccount = stateRef.current.solanaAccount;
-          if (!solanaAccount || toNearAccountId(solanaAccount).toLowerCase() !== deal.seller.toLowerCase()) {
+          const sellerCanonical = (deal.sellerCanonical || toNearAccountId(deal.seller)).toLowerCase();
+          if (!solanaAccount || toNearAccountId(solanaAccount).toLowerCase() !== sellerCanonical) {
             throw new Error("Connect the Solana seller wallet before recording collateral");
           }
           await submitPartyTermsToTee(deal, "seller");
@@ -2113,12 +2144,17 @@ export function Providers({ children }: { children: React.ReactNode }) {
           const connectedAccount = (stateRef.current.account || "").trim().toLowerCase();
           const nearConnected = toNearAccountId(connectedAccount);
           const sellerAddress = deal.seller.trim().toLowerCase();
+          const sellerCanonical = (deal.sellerCanonical || toNearAccountId(deal.seller)).trim().toLowerCase();
           const isSellerMatch =
             connectedAccount === sellerAddress ||
-            nearConnected === sellerAddress ||
-            (stateRef.current.solanaAccount && toNearAccountId(stateRef.current.solanaAccount) === sellerAddress) ||
+            connectedAccount === sellerCanonical ||
+            nearConnected === sellerCanonical ||
+            (stateRef.current.solanaAccount && toNearAccountId(stateRef.current.solanaAccount).toLowerCase() === sellerCanonical) ||
             (stateRef.current.solanaAccount && stateRef.current.solanaAccount.toLowerCase() === sellerAddress) ||
-            (stateRef.current.nearAccount && stateRef.current.nearAccount.toLowerCase() === sellerAddress);
+            (stateRef.current.nearAccount && (
+              stateRef.current.nearAccount.toLowerCase() === sellerAddress ||
+              toNearAccountId(stateRef.current.nearAccount).toLowerCase() === sellerCanonical
+            ));
           if (!isSellerMatch) {
             pushToast({ kind: "error", title: "Seller wallet required", body: `Connect seller wallet (${deal.seller}) before submitting the provider key.` });
             return;
@@ -2169,7 +2205,7 @@ export function Providers({ children }: { children: React.ReactNode }) {
             return;
           }
           if (onChain && !onChain.counterparty_accepted && deal.termsHash) {
-            if (stateRef.current.solanaAccount && toNearAccountId(stateRef.current.solanaAccount).toLowerCase() === deal.seller.toLowerCase()) {
+            if (stateRef.current.solanaAccount && toNearAccountId(stateRef.current.solanaAccount).toLowerCase() === sellerCanonical) {
               throw new Error("Accept the deal with the Solana seller wallet before submitting the provider key.");
             }
             pushToast({ kind: "pending", title: "Accepting deal on NEAR to fund escrow..." });
@@ -2197,7 +2233,7 @@ export function Providers({ children }: { children: React.ReactNode }) {
           const encryptedEnvelope = encryptApiKeyToEnclave(plainApiKey, enclaveKey);
           const sellerAuthorization = await signSellerKeyAuthorization(stateRef.current.walletChain, {
             dealId: Number(dealId),
-            seller: deal.seller,
+            seller: sellerCanonical,
             provider,
             model,
             models,

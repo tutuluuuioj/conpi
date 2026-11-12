@@ -21,7 +21,7 @@ import {
 } from "lucide-react";
 import { BASE_URL, CONTRACT_ID } from "@/lib/chain";
 import { clockTime, maskKey, middle, ratioOf, usd } from "@/lib/format";
-import { toNearAccountId } from "@/lib/near-account";
+import { isSolanaAddress, toNearAccountId } from "@/lib/near-account";
 import { escrowOf } from "@/lib/money";
 import { useApp } from "@/lib/store";
 import { MAKER_VAULT_CONFIG, type VaultChain } from "@/lib/maker-vault";
@@ -80,6 +80,7 @@ export function DealView({ id }: { id: string }) {
   const [solanaInfo, setSolanaInfo] = useState<any>(null);
   const [selectedPayChain, setSelectedPayChain] = useState<VaultChain>("base");
   const [isProcessingDeposit, setIsProcessingDeposit] = useState(false);
+  const [isAcceptingDeal, setIsAcceptingDeal] = useState(false);
   const [depositError, setDepositError] = useState<string | null>(null);
   const [depositSuccess, setDepositSuccess] = useState<string | null>(null);
   const [manualTxHash, setManualTxHash] = useState("");
@@ -306,10 +307,16 @@ export function DealView({ id }: { id: string }) {
     return Number(col.toFixed(4));
   }, [deal, dealPriceUsdc]);
 
+  const formatUsdcAmount = (amount: number) => {
+    const hasSubCentPrecision = Math.abs(amount * 100 - Math.round(amount * 100)) > 1e-8;
+    return hasSubCentPrecision ? amount.toFixed(4) : amount.toFixed(2);
+  };
+
   const isSellerParty = useMemo(() => {
     if (!deal) return false;
     if (deal.role === "seller") return true;
     const sLower = deal.seller.toLowerCase();
+    const canonicalSeller = (deal.sellerCanonical || toNearAccountId(deal.seller)).toLowerCase();
     const accounts = [
       app.account,
       app.solanaAccount,
@@ -319,17 +326,28 @@ export function DealView({ id }: { id: string }) {
     return accounts.some((acc) => {
       const accLower = acc.toLowerCase();
       const nearAcc = toNearAccountId(acc);
-      return accLower === sLower || (nearAcc && nearAcc.toLowerCase() === sLower);
+      return (
+        accLower === sLower ||
+        accLower === canonicalSeller ||
+        (nearAcc && nearAcc.toLowerCase() === canonicalSeller)
+      );
     });
-  }, [deal?.role, deal?.seller, app.account, app.solanaAccount, app.evmAccount, app.nearAccount]);
+  }, [deal?.role, deal?.seller, deal?.sellerCanonical, app.account, app.solanaAccount, app.evmAccount, app.nearAccount]);
 
   const isBuyerRole = !isSellerParty;
   const isSolanaSellerDeal = Boolean(
     deal
-      && /^[0-9a-f]{64}$/i.test(deal.seller)
-      && !deal.seller.startsWith("000000000000000000000000")
+      && (
+        isSolanaAddress(deal.seller) ||
+        (/^[0-9a-f]{64}$/i.test(deal.sellerCanonical || deal.seller)
+          && !(deal.sellerCanonical || deal.seller).startsWith("000000000000000000000000"))
+      )
   );
-  const requiredDepositUsdc = isBuyerRole ? requiredBuyerUsdc : requiredSellerUsdc;
+  const requiredDepositUsdc = isBuyerRole
+    ? (deal?.buyerDepositRemaining ?? requiredBuyerUsdc)
+    : (deal?.sellerDepositRemaining ?? requiredSellerUsdc);
+  const buyerAlreadyDepositedUsdc = Math.max(0, requiredBuyerUsdc - (deal?.buyerDepositRemaining ?? requiredBuyerUsdc));
+  const sellerAlreadyDepositedUsdc = Math.max(0, requiredSellerUsdc - (deal?.sellerDepositRemaining ?? requiredSellerUsdc));
   const activeVaultAddress = selectedPayChain === "base"
     ? String(foreignInfo?.vault_address || "")
     : selectedPayChain === "solana" && isSolanaSellerDeal
@@ -403,7 +421,7 @@ export function DealView({ id }: { id: string }) {
           effectiveSellerEvmAddress || ""
         );
         if (!res.ok) throw new Error(res.body || "Verification failed");
-        setDepositSuccess(`Deposit of $${requiredDepositUsdc.toFixed(2)} USDC confirmed on Base Sepolia!`);
+        setDepositSuccess(`Deposit of $${formatUsdcAmount(requiredDepositUsdc)} USDC confirmed on Base Sepolia!`);
       } else if (selectedPayChain === "solana") {
         if (!isSolanaSellerDeal) {
           throw new Error("Solana USDC is available when the seller accepted this deal with a Solana wallet.");
@@ -415,16 +433,39 @@ export function DealView({ id }: { id: string }) {
         });
         const res = await app.depositSolanaCollateral(deal.id, txHash);
         if (!res.ok) throw new Error(res.body || "TEE verification failed");
-        setDepositSuccess(`Seller collateral of $${requiredDepositUsdc.toFixed(2)} USDC was verified on Solana.`);
+        setDepositSuccess(`Seller collateral of $${formatUsdcAmount(requiredDepositUsdc)} USDC was verified on Solana.`);
       } else {
         const res = await app.deposit(deal.id);
         if (!res.ok) throw new Error(res.body || "Deposit failed");
-        setDepositSuccess(`Deposit of $${requiredDepositUsdc.toFixed(2)} USDC confirmed on NEAR!`);
+        setDepositSuccess(`Deposit of $${formatUsdcAmount(requiredDepositUsdc)} USDC confirmed on NEAR!`);
       }
     } catch (err: any) {
       setDepositError(err?.message || "Deposit transaction failed");
     } finally {
       setIsProcessingDeposit(false);
+    }
+  };
+
+  const handleAcceptDeal = async () => {
+    if (!deal) return;
+    setIsAcceptingDeal(true);
+    setDepositError(null);
+    try {
+      const result = await app.acceptDeal(deal.id);
+      app.pushToast({
+        kind: result.ok ? "success" : "error",
+        title: result.title,
+        body: result.body,
+        href: result.href,
+      });
+      if (!result.ok) {
+        setDepositError(result.body || result.title);
+        return;
+      }
+      setDepositSuccess("Solana seller acceptance recorded. The collateral rail is now unlocked.");
+      await app.refreshOnChain();
+    } finally {
+      setIsAcceptingDeal(false);
     }
   };
 
@@ -453,7 +494,7 @@ export function DealView({ id }: { id: string }) {
         effectiveSellerEvmAddress || ""
       );
       if (!res.ok) throw new Error(res.body || "Deposit verification failed");
-      setDepositSuccess(`Deposit of $${requiredDepositUsdc.toFixed(2)} USDC verified on ${selectedPayChain.toUpperCase()}!`);
+      setDepositSuccess(`Deposit of $${formatUsdcAmount(requiredDepositUsdc)} USDC verified on ${selectedPayChain.toUpperCase()}!`);
       setManualTxHash("");
     } catch (err: any) {
       setDepositError(err?.message || "Verification failed");
@@ -688,7 +729,7 @@ export function DealView({ id }: { id: string }) {
     : view === "deposit" && !myDeposited
     ? <Button className="w-full bg-brand text-white hover:bg-brand/90" onClick={handleMakerVaultPay} disabled={isProcessingDeposit}>
         {isProcessingDeposit ? <Loader2 className="w-4 h-4 animate-spin mr-1.5 inline" /> : null}
-        <span>Deposit ${requiredDepositUsdc.toFixed(2)} USDC ({MAKER_VAULT_CONFIG[selectedPayChain].name})</span>
+        <span>Deposit ${formatUsdcAmount(requiredDepositUsdc)} USDC ({MAKER_VAULT_CONFIG[selectedPayChain].name})</span>
       </Button>
     : view === "key" && deal.keyStatus !== "verified" && (isSellerParty || key.trim().length >= 8)
       ? <Button className="w-full" type="submit" form="seller-key">Activate Deal via TEE</Button>
@@ -813,11 +854,15 @@ export function DealView({ id }: { id: string }) {
               {/* Counterparty Status Cards */}
               <div className="mt-4 grid gap-3 sm:grid-cols-2">
                 <div className="rounded-md border border-line p-3">
-                  <Overline>Buyer · ${requiredBuyerUsdc.toFixed(2)} USDC</Overline>
+                  <Overline>Buyer · ${formatUsdcAmount(requiredBuyerUsdc)} USDC</Overline>
                   <p className="mt-2 text-sm font-semibold">
                     {deal.buyerDeposited || isForeignBuyerDeposited ? (
                       <span className="text-emerald-500 font-semibold flex items-center gap-1">
                         <Check className="w-4 h-4 inline" /> Deposited
+                      </span>
+                    ) : buyerAlreadyDepositedUsdc > 0 ? (
+                      <span className="text-amber-500">
+                        Partially deposited ${buyerAlreadyDepositedUsdc.toFixed(4)} · ${formatUsdcAmount(deal.buyerDepositRemaining ?? 0)} remaining
                       </span>
                     ) : (
                       <span className="text-amber-500">Awaiting Buyer Deposit</span>
@@ -825,11 +870,15 @@ export function DealView({ id }: { id: string }) {
                   </p>
                 </div>
                 <div className="rounded-md border border-line p-3">
-                  <Overline>Seller · ${requiredSellerUsdc.toFixed(2)} USDC</Overline>
+                  <Overline>Seller · ${formatUsdcAmount(requiredSellerUsdc)} USDC</Overline>
                   <p className="mt-2 text-sm font-semibold">
                     {deal.sellerDeposited || isSellerDeposited ? (
                       <span className="text-emerald-500 font-semibold flex items-center gap-1">
                         <Check className="w-4 h-4 inline" /> Deposited (Collateral Locked)
+                      </span>
+                    ) : sellerAlreadyDepositedUsdc > 0 ? (
+                      <span className="text-amber-500">
+                        Partially deposited ${sellerAlreadyDepositedUsdc.toFixed(4)} · ${formatUsdcAmount(deal.sellerDepositRemaining ?? 0)} remaining
                       </span>
                     ) : (
                       <span className="text-amber-500">Awaiting Seller Collateral</span>
@@ -837,6 +886,29 @@ export function DealView({ id }: { id: string }) {
                   </p>
                 </div>
               </div>
+
+              {isSolanaSellerDeal && isSellerParty && !deal.counterpartyAccepted ? (
+                <div className="mt-5 rounded-xl border border-purple-500/35 bg-purple-500/10 p-4 space-y-3">
+                  <div className="flex items-start gap-2.5">
+                    <ShieldCheck className="mt-0.5 h-5 w-5 shrink-0 text-purple-400" />
+                    <div>
+                      <p className="text-sm font-semibold text-ink">Accept this deal with the connected Solana seller wallet</p>
+                      <p className="mt-1 text-xs leading-relaxed text-muted">
+                        Connecting the wallet is not the acceptance transaction. Sign once to lock this seller, the Solana vault, token, collateral amount, and payout route on-chain before sending USDC.
+                      </p>
+                    </div>
+                  </div>
+                  <Button
+                    type="button"
+                    onClick={handleAcceptDeal}
+                    disabled={isAcceptingDeal}
+                    className="w-full flex items-center justify-center gap-2"
+                  >
+                    {isAcceptingDeal ? <Loader2 className="h-4 w-4 animate-spin" /> : <Fingerprint className="h-4 w-4" />}
+                    <span>{isAcceptingDeal ? "Recording Solana acceptance…" : "Accept Deal Terms with Solana"}</span>
+                  </Button>
+                </div>
+              ) : null}
 
               {bothDeposited ? (
                 <div className="mt-5 p-4 rounded-xl border border-emerald-500/30 bg-emerald-500/10 space-y-3">
@@ -858,7 +930,9 @@ export function DealView({ id }: { id: string }) {
                 </div>
               ) : null}
 
-              {!myDeposited && deal.step !== "settled" ? (
+              {!myDeposited
+                && deal.step !== "settled"
+                && !(isSolanaSellerDeal && isSellerParty && !deal.counterpartyAccepted) ? (
                 <div className="mt-5 space-y-4">
                   {/* Multi-Chain USDC Payment Rail Selector */}
                   <div>
@@ -921,7 +995,7 @@ export function DealView({ id }: { id: string }) {
                         </span>
                       </div>
                       <span className="text-xs font-bold font-mono text-ink">
-                        Required: ${requiredDepositUsdc.toFixed(2)} USDC
+                        Required now: ${formatUsdcAmount(requiredDepositUsdc)} USDC
                       </span>
                     </div>
 
@@ -988,7 +1062,7 @@ export function DealView({ id }: { id: string }) {
                         className="flex-1 flex items-center justify-center gap-2 bg-brand text-white hover:bg-brand/90 py-2.5 text-xs font-semibold"
                       >
                         {isProcessingDeposit ? <Loader2 className="w-4 h-4 animate-spin" /> : <Wallet className="w-4 h-4" />}
-                        <span>1-Click Pay ${requiredDepositUsdc.toFixed(2)} USDC ({MAKER_VAULT_CONFIG[selectedPayChain].name})</span>
+                        <span>1-Click Pay ${formatUsdcAmount(requiredDepositUsdc)} USDC ({MAKER_VAULT_CONFIG[selectedPayChain].name})</span>
                       </Button>
                     </div>
 
@@ -1094,11 +1168,14 @@ export function DealView({ id }: { id: string }) {
                 </div>
               ) : null}
 
-              {!deal.counterpartyAccepted && deal.termsHash ? (
+              {!deal.counterpartyAccepted
+                && deal.termsHash
+                && isSellerParty
+                && !isSolanaSellerDeal ? (
                 <div className="mt-4 pt-2 border-t border-line/60">
                   <p className="text-xs text-muted mb-2">Counterparty confirmation needed on-chain:</p>
-                  <Button variant="secondary" onClick={() => app.acceptDeal(deal.id)}>
-                    {isSolanaSellerDeal && isSellerParty ? "Accept Deal Terms with Solana" : "Accept Deal Terms on NEAR"}
+                  <Button variant="secondary" onClick={handleAcceptDeal} disabled={isAcceptingDeal}>
+                    {isAcceptingDeal ? "Recording acceptance…" : "Accept Deal Terms on NEAR"}
                   </Button>
                 </div>
               ) : null}

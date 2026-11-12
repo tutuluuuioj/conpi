@@ -359,8 +359,10 @@ export function EscrowTable({ deal, foreignInfo }: { deal: Deal; foreignInfo?: a
   const settled = deal.status === "Completed" || deal.step === "settled" || !!deal.split;
   const effectiveForeignInfo = foreignInfo || (deal as any).foreignInfo;
   const isForeign = Boolean(
-    (effectiveForeignInfo && Number(effectiveForeignInfo.foreign_amount) > 0) ||
-    deal.token === "USDC"
+    effectiveForeignInfo && (
+      Number(effectiveForeignInfo.foreign_amount) > 0 ||
+      effectiveForeignInfo.vault_address
+    )
   );
   const foreignUsdcAmount = isForeign
     ? (effectiveForeignInfo && Number(effectiveForeignInfo.foreign_amount) > 0
@@ -369,6 +371,12 @@ export function EscrowTable({ deal, foreignInfo }: { deal: Deal; foreignInfo?: a
     : 0;
   const sellerColUsdc = (deal.price * deal.sellerCollateralPct) / 100;
   const fmtAsset = (amount: number) => usd(amount);
+  const buyerDepositedAmount = deal.buyerDeposited
+    ? escrow.buyerDeposit
+    : Math.max(0, escrow.buyerDeposit - (deal.buyerDepositRemaining ?? escrow.buyerDeposit));
+  const sellerDepositedAmount = deal.sellerDeposited
+    ? escrow.sellerDeposit
+    : Math.max(0, escrow.sellerDeposit - (deal.sellerDepositRemaining ?? escrow.sellerDeposit));
 
   let rows: [string, string, string][];
 
@@ -430,31 +438,31 @@ export function EscrowTable({ deal, foreignInfo }: { deal: Deal; foreignInfo?: a
       ]);
     }
   } else {
+    const priceLocked = Math.min(deal.price, buyerDepositedAmount);
+    const buyerCollateralLocked = Math.max(0, buyerDepositedAmount - priceLocked);
     const priceState = settled
       ? "Released to seller"
       : deal.buyerDeposited
         ? "Locked in contract"
-        : "Awaiting buyer deposit";
+        : priceLocked >= deal.price
+          ? "Locked in contract"
+          : priceLocked > 0
+            ? "Partially locked in contract"
+            : "Awaiting buyer deposit";
 
     const buyerColState = settled
       ? "Refunded to buyer"
       : deal.buyerDeposited
         ? "Locked, refunded on completion"
-        : "Awaiting buyer deposit";
+        : buyerCollateralLocked > 0
+          ? "Partially locked, refunded on completion"
+          : "Awaiting buyer collateral";
 
     const sellerColState = settled
       ? "Returned to seller"
       : deal.sellerDeposited
         ? "Locked, returned on completion"
         : "Awaiting seller deposit";
-
-    const buyerDepositedAmount = deal.buyerDeposited
-      ? escrow.buyerDeposit
-      : Math.max(0, escrow.buyerDeposit - (deal.buyerDepositRemaining ?? escrow.buyerDeposit));
-
-    const sellerDepositedAmount = deal.sellerDeposited
-      ? escrow.sellerDeposit
-      : Math.max(0, escrow.sellerDeposit - (deal.sellerDepositRemaining ?? escrow.sellerDeposit));
 
     const totalDeposited = settled
       ? 0
@@ -466,7 +474,7 @@ export function EscrowTable({ deal, foreignInfo }: { deal: Deal; foreignInfo?: a
       ? "Settled (0.0000 in escrow)"
       : (deal.buyerDeposited && deal.sellerDeposited)
         ? "Locked in NEAR contract"
-        : (deal.buyerDeposited || deal.sellerDeposited)
+        : (buyerDepositedAmount > 0 || sellerDepositedAmount > 0)
           ? "Partial deposit in contract"
           : "Awaiting deposits (0 in contract)";
 
@@ -524,8 +532,11 @@ export function EscrowTable({ deal, foreignInfo }: { deal: Deal; foreignInfo?: a
         <DepositStatusBar
           buyerDeposited={deal.buyerDeposited}
           sellerDeposited={deal.sellerDeposited}
-          buyerPct={escrow.total > 0 ? (escrow.buyerDeposit / escrow.total) * 100 : 80}
-          sellerPct={escrow.total > 0 ? (escrow.sellerDeposit / escrow.total) * 100 : 20}
+          buyerAmount={buyerDepositedAmount}
+          sellerAmount={sellerDepositedAmount}
+          buyerRequired={escrow.buyerDeposit}
+          sellerRequired={escrow.sellerDeposit}
+          totalRequired={escrow.total}
         />
       )}
       {deal.matched && deal.buyerTerms?.price && Math.abs(deal.buyerTerms.price - (deal.priceUsd ?? deal.price)) > 0.0001 ? (
@@ -540,23 +551,35 @@ export function EscrowTable({ deal, foreignInfo }: { deal: Deal; foreignInfo?: a
 function DepositStatusBar({
   buyerDeposited,
   sellerDeposited,
-  buyerPct,
-  sellerPct,
+  buyerAmount,
+  sellerAmount,
+  buyerRequired,
+  sellerRequired,
+  totalRequired,
 }: {
   buyerDeposited: boolean;
   sellerDeposited: boolean;
-  buyerPct: number;
-  sellerPct: number;
+  buyerAmount: number;
+  sellerAmount: number;
+  buyerRequired: number;
+  sellerRequired: number;
+  totalRequired: number;
 }) {
-  const noneDeposited = !buyerDeposited && !sellerDeposited;
+  const noneDeposited = buyerAmount <= 0 && sellerAmount <= 0;
+  const buyerHasDeposit = buyerAmount > 0;
+  const sellerHasDeposit = sellerAmount > 0;
+  const buyerBarPct = totalRequired > 0 ? (buyerAmount / totalRequired) * 100 : 0;
+  const sellerBarPct = totalRequired > 0 ? (sellerAmount / totalRequired) * 100 : 0;
+  const buyerOwnPct = buyerRequired > 0 ? Math.min(100, (buyerAmount / buyerRequired) * 100) : 0;
+  const sellerOwnPct = sellerRequired > 0 ? Math.min(100, (sellerAmount / sellerRequired) * 100) : 0;
   return (
     <div className="mt-3">
       <div className="flex h-3 overflow-hidden rounded-full bg-surface-2 border border-line" aria-hidden>
-        {buyerDeposited ? (
-          <div className="bg-violet transition-all" style={{ width: `${buyerPct}%` }} />
+        {buyerHasDeposit ? (
+          <div className="bg-violet transition-all" style={{ width: `${buyerBarPct}%` }} />
         ) : null}
-        {sellerDeposited ? (
-          <div className="bg-violet/70 transition-all" style={{ width: `${sellerPct}%` }} />
+        {sellerHasDeposit ? (
+          <div className="bg-violet/70 transition-all" style={{ width: `${sellerBarPct}%` }} />
         ) : null}
       </div>
       <div className="mt-2 flex flex-wrap gap-3 text-[11px] text-muted">
@@ -565,12 +588,12 @@ function DepositStatusBar({
         ) : (
           <>
             <Legend
-              swatch={buyerDeposited ? "bg-violet" : "bg-surface-3 border border-line"}
-              label={buyerDeposited ? "Buyer deposited" : "Buyer awaiting deposit"}
+              swatch={buyerHasDeposit ? "bg-violet" : "bg-surface-3 border border-line"}
+              label={buyerDeposited ? "Buyer deposited" : buyerHasDeposit ? `Buyer ${buyerOwnPct.toFixed(1)}% deposited` : "Buyer awaiting deposit"}
             />
             <Legend
-              swatch={sellerDeposited ? "bg-violet/70" : "bg-surface-3 border border-line"}
-              label={sellerDeposited ? "Seller deposited" : "Seller awaiting deposit"}
+              swatch={sellerHasDeposit ? "bg-violet/70" : "bg-surface-3 border border-line"}
+              label={sellerDeposited ? "Seller deposited" : sellerHasDeposit ? `Seller ${sellerOwnPct.toFixed(1)}% deposited` : "Seller awaiting deposit"}
             />
           </>
         )}

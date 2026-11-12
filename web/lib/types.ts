@@ -142,6 +142,9 @@ export interface Deal {
   token: Asset;
   buyer: string;
   seller: string;
+  /** Canonical NEAR account ids used by the escrow contract. */
+  buyerCanonical?: string;
+  sellerCanonical?: string;
   deadline: string;
   termsHash: string | null;
   matched?: boolean;
