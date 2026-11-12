@@ -36,7 +36,7 @@ struct ExecuteArgs {
 
 const ESCROW_ID: &str = "dev-20261103062448-30583839049419.testnet";
 const DSTACK_HARDWARE_SIGNER: &str = "ed25519:F4YtyCFTEj9rca8fJQxcQd7F1UHuuGQBxP8WmcAC7cbi";
-const HARDWARE_MEASUREMENT: &str = "mrtd:7fe60787222bd394cb516abca2435f22f035ab2cc9c0a4b4b3b148e46297f3d931a237b72f359052c6e657d8c1409173|compose:76ff45050ad2f7e6c3771a7b4c85f11919f0236b45e731492dd7339965836b76";
+const HARDWARE_MEASUREMENT: &str = "mrtd:7fe60787222bd394cb516abca2435f22f035ab2cc9c0a4b4b3b148e46297f3d931a237b72f359052c6e657d8c1409173|compose:a10d9ba296253f69acbaf76cfc8455498f23ca7cdaac5d3ba5a927fa5d6ce2dd";
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -65,7 +65,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // 2. Connect to Testnet
     println!("\nConnecting to NEAR Testnet...");
-    let worker = near_workspaces::testnet().await?;
+    let worker = near_workspaces::testnet()
+        .rpc_addr("https://test.rpc.fastnear.com")
+        .await?;
     let member1_signer = near_workspaces::Account::from_secret_key(dao_id.clone(), member1_sk, &worker);
     let member2_signer = near_workspaces::Account::from_secret_key(dao_id.clone(), member2_sk, &worker);
 
