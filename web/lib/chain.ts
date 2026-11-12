@@ -1,7 +1,7 @@
 export const CONTRACT_ID = "dev-20261103062448-30583839049419.testnet";
 export const DAO_ID = "dev-20261103021740-59711933581376.testnet";
-export const CODE_HASH = "ca701509eaa1620d4d43b93b852eb56b64a7a81c08ce439dc8171338d98962cf";
-export const CODE_HASH_BS58 = "EdEUu5XRUE65aLWT868viKZ2UxbbH2dNDmkxth2mPGFx";
+export const CODE_HASH = "e54b1ae1e5aa3349544939a9eb1b76870ff704225d48bf7e85e966a123f40132";
+export const CODE_HASH_BS58 = "GS4nbEXJ1g7C1gU9CJJZVm9bQDcACWGuZgtY6WEaKBv9";
 export const BASE_URL =
   process.env.NEXT_PUBLIC_TEE_BASE_URL ||
   "https://ce5044ca834d2da5bb1252706bfa3b2c91d7d934-3000.dstack-pha1-prod5.phala.network/v1";
