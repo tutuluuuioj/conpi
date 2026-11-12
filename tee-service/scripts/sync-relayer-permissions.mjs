@@ -4,7 +4,7 @@ import { fileURLToPath } from "node:url";
 import {
   Account,
   JsonRpcProvider,
-  KeyPairEd25519,
+  KeyPair,
   KeyPairSigner,
   actions,
 } from "near-api-js";
@@ -26,8 +26,8 @@ if (funder.accountId !== relayer.accountId) {
   throw new Error("The full-access signer and restricted relayer key must belong to the same NEAR account");
 }
 
-const funderKey = KeyPairEd25519.fromString(funder.privateKey);
-const relayerKey = KeyPairEd25519.fromString(relayer.privateKey);
+const funderKey = KeyPair.fromString(funder.privateKey);
+const relayerKey = KeyPair.fromString(relayer.privateKey);
 if (funder.publicKey && funderKey.publicKey.toString() !== funder.publicKey) {
   throw new Error("Funder private key does not match its declared public key");
 }
