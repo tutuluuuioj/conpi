@@ -319,22 +319,21 @@ export function DealView({ id }: { id: string }) {
     if (deal.role === "seller") return true;
     const sLower = deal.seller.toLowerCase();
     const canonicalSeller = (deal.sellerCanonical || toNearAccountId(deal.seller)).toLowerCase();
-    const accounts = [
-      app.account,
-      app.solanaAccount,
-      app.evmAccount,
-      app.nearAccount,
-    ].filter((a): a is string => Boolean(a && a.trim()));
-    return accounts.some((acc) => {
-      const accLower = acc.toLowerCase();
-      const nearAcc = toNearAccountId(acc);
-      return (
-        accLower === sLower ||
-        accLower === canonicalSeller ||
-        (nearAcc && nearAcc.toLowerCase() === canonicalSeller)
-      );
-    });
-  }, [deal?.role, deal?.seller, deal?.sellerCanonical, app.account, app.solanaAccount, app.evmAccount, app.nearAccount]);
+    const activeAccount = (
+      app.walletChain === "near" ? app.nearAccount || app.account :
+      app.walletChain === "solana" ? app.solanaAccount || app.account :
+      app.walletChain === "evm" ? app.evmAccount || app.account :
+      app.account
+    )?.trim();
+    if (!activeAccount) return false;
+    const accLower = activeAccount.toLowerCase();
+    const nearAcc = toNearAccountId(activeAccount);
+    return (
+      accLower === sLower ||
+      accLower === canonicalSeller ||
+      (nearAcc && nearAcc.toLowerCase() === canonicalSeller)
+    );
+  }, [deal?.role, deal?.seller, deal?.sellerCanonical, app.account, app.solanaAccount, app.evmAccount, app.nearAccount, app.walletChain]);
 
   const isBuyerRole = !isSellerParty;
   const isSolanaSellerDeal = Boolean(
@@ -536,7 +535,7 @@ export function DealView({ id }: { id: string }) {
   // previous TEE restart predates durable negotiation storage, restore that
   // buyer's encrypted term sheet once while their matching wallet is present.
   useEffect(() => {
-    if (!deal || isSellerParty || !app.nearAccount) return;
+    if (!deal || !app.nearAccount || app.walletChain !== "near") return;
     if (!["Funded", "Active"].includes(deal.status) || deal.buyerSubmitted) return;
     if (app.nearAccount.trim().toLowerCase() !== deal.buyer.trim().toLowerCase()) return;
     const attemptKey = `${deal.id}:${buyerTermsRepairAttempt}`;
@@ -549,7 +548,7 @@ export function DealView({ id }: { id: string }) {
     return () => {
       if (retryTimer) window.clearTimeout(retryTimer);
     };
-  }, [deal?.id, deal?.status, deal?.buyer, deal?.buyerSubmitted, isSellerParty, buyerTermsRepairAttempt, app.nearAccount, app.submitNegotiationTerms]);
+  }, [deal?.id, deal?.status, deal?.buyer, deal?.buyerSubmitted, buyerTermsRepairAttempt, app.nearAccount, app.walletChain, app.submitNegotiationTerms]);
 
   const handleSendChat = (event: FormEvent) => {
     event.preventDefault();

@@ -429,8 +429,7 @@ function mapOnChainDeal(
   currentAccount: string | null,
   listing?: Listing | Deal,
   foreignDeal?: any,
-  existingDeal?: Deal,
-  allConnectedAccounts?: string[]
+  existingDeal?: Deal
 ): Deal {
   const raw = d as any;
   const chainStatus = String(d.status);
@@ -469,16 +468,16 @@ function mapOnChainDeal(
   const sellerSubmitted = Boolean(d.terms_submitted_by_seller ?? raw.counterparty_accepted);
   const currentStage = Number(d.current_stage ?? raw.stage_reached ?? raw.last_signed?.stage ?? 0);
 
-  const accountsToCheck = Array.from(new Set([
-    currentAccount,
-    ...(allConnectedAccounts || []),
-  ].filter((a): a is string => Boolean(a && a.trim()))));
-
+  // A browser can have the buyer's NEAR wallet and seller's Solana wallet
+  // connected at the same time. Only the actively selected wallet may define
+  // the current role; looking at every remembered wallet made buyer actions
+  // appear as seller actions and skipped the buyer's TEE confirmation.
+  const activeAccount = currentAccount?.trim();
   const isSeller = Boolean(
-    accountsToCheck.length &&
-    accountsToCheck.some((acc) => {
-      const nearAcc = toNearAccountId(acc);
-      const accLower = acc.toLowerCase();
+    activeAccount &&
+    (() => {
+      const nearAcc = toNearAccountId(activeAccount);
+      const accLower = activeAccount.toLowerCase();
       const sLower = d.seller.toLowerCase();
       const lstSeller = (listing as any)?.seller?.toLowerCase();
       return (
@@ -487,7 +486,7 @@ function mapOnChainDeal(
         (lstSeller && accLower === lstSeller) ||
         (lstSeller && nearAcc && nearAcc.toLowerCase() === lstSeller)
       );
-    })
+    })()
   );
   const role: "buyer" | "seller" = isSeller ? "seller" : "buyer";
   // USDC is the platform's settlement asset on every rail. Its presence in a
@@ -844,19 +843,13 @@ export function Providers({ children }: { children: React.ReactNode }) {
       );
 
       const currentAccount = stateRef.current.account;
-      const allConnectedAccounts = [
-        stateRef.current.account,
-        stateRef.current.solanaAccount,
-        stateRef.current.evmAccount,
-        stateRef.current.nearAccount,
-      ].filter((x): x is string => Boolean(x && x.trim()));
       const mappedDeals: Deal[] = [];
       for (const d of safeOnChainDeals) {
         try {
           const existing = stateRef.current.deals.find((item) => item.id === String(d.id));
           const listing = metadataListings.find((item) => String(item.dealId || "") === String(d.id));
           const foreignDeal = foreignDealsMap.get(Number(d.id));
-          const mapped = mapOnChainDeal(d, currentAccount, listing, foreignDeal, existing, allConnectedAccounts);
+          const mapped = mapOnChainDeal(d, currentAccount, listing, foreignDeal, existing);
           const resolvedProxyKey = existing?.proxyKey || storedKeys[String(d.id)] || "";
           const liveMeter = meterMap.get(Number(d.id));
 
@@ -1241,6 +1234,25 @@ export function Providers({ children }: { children: React.ReactNode }) {
       return ticket;
     };
 
+    const activePartyForDeal = (deal: Deal): "buyer" | "seller" => {
+      const current = stateRef.current;
+      const activeAccount = (
+        current.walletChain === "near" ? current.nearAccount || current.account :
+        current.walletChain === "solana" ? current.solanaAccount || current.account :
+        current.walletChain === "evm" ? current.evmAccount || current.account :
+        current.account
+      )?.trim();
+      if (!activeAccount) throw new Error("Connect the buyer or seller wallet first");
+
+      const activeCanonical = toNearAccountId(activeAccount).toLowerCase();
+      const buyerCanonical = (deal.buyerCanonical || toNearAccountId(deal.buyer)).toLowerCase();
+      const sellerCanonical = (deal.sellerCanonical || toNearAccountId(deal.seller)).toLowerCase();
+      const activeLower = activeAccount.toLowerCase();
+      if (activeLower === buyerCanonical || activeCanonical === buyerCanonical) return "buyer";
+      if (activeLower === sellerCanonical || activeCanonical === sellerCanonical) return "seller";
+      throw new Error("The active wallet is not a participant in this deal");
+    };
+
     return {
       setTheme: (theme) => setState((s) => ({ ...s, theme })),
       setDefaultToken: (defaultToken) => setState((s) => ({ ...s, defaultToken })),
@@ -1532,7 +1544,11 @@ export function Providers({ children }: { children: React.ReactNode }) {
         };
         setState((s) => ({ ...s, deals: [deal, ...s.deals] }));
         try {
-          const ticket = await teeApi.initTicket(id, Number(id), buyer, seller, createdTermsHashHex);
+          await teeApi.initTicket(id, Number(id), buyer, seller, createdTermsHashHex);
+          // Quick Buy is a buyer action. Bind the buyer's matching encrypted
+          // term sheet immediately, so activation never needs a hidden extra
+          // confirmation later.
+          const ticket = await submitPartyTermsToTee(deal, role);
           applyTicketState(id, ticket);
           replaceToast(pendingToast, {
             kind: "success",
@@ -1769,7 +1785,7 @@ export function Providers({ children }: { children: React.ReactNode }) {
         const deal = stateRef.current.deals.find((item) => item.id === dealId);
         if (!deal) return;
         try {
-          const party = deal.role;
+          const party = activePartyForDeal(deal);
           const ticket = await submitPartyTermsToTee(deal, party);
           pushToast({
             kind: ticket.matched ? "success" : "info",
@@ -1851,6 +1867,16 @@ export function Providers({ children }: { children: React.ReactNode }) {
           const txHash = outcome?.transaction?.hash || outcome?.transaction_outcome?.id;
           if (!txHash) throw new Error("Accept deal transaction was not confirmed");
 
+          // A NEAR acceptance is the buyer's normal confirmation step. Bind
+          // the same buyer terms to the attested TEE here as well, without
+          // asking them to find a separate term-submission action.
+          try {
+            const ticket = await submitPartyTermsToTee(deal, "buyer");
+            applyTicketState(dealId, ticket);
+          } catch (termsError) {
+            console.warn("[conpi:buyer-tee-terms]", termsError);
+          }
+
           setTimeout(loadOnChainData, 2000);
           return {
             ok: true,
@@ -1865,9 +1891,10 @@ export function Providers({ children }: { children: React.ReactNode }) {
       deposit: async (dealId) => {
         const deal = stateRef.current.deals.find((item) => item.id === dealId);
         if (!deal) return { ok: false, title: "Deal not found" };
-        const isBuyer = deal.role === "buyer";
 
         try {
+          const party = activePartyForDeal(deal);
+          const isBuyer = party === "buyer";
           const tokenContract = MAKER_VAULT_CONFIG.near.tokenAddress;
           const initialDeal = await fetchContractDeal(Number(dealId));
           if (!initialDeal) throw new Error(`Deal #${dealId} was not found on-chain`);
@@ -1891,7 +1918,10 @@ export function Providers({ children }: { children: React.ReactNode }) {
               body: "The escrow already has this wallet's full required deposit.",
             };
           }
-          await submitPartyTermsToTee(deal, deal.role);
+          // Deposit is another party-confirmed action. Re-submit its immutable
+          // encrypted term sheet idempotently as recovery for interrupted
+          // browser sessions.
+          await submitPartyTermsToTee(deal, party);
           // 100% USDC deposits on NEAR using official Circle Native USDC:
           // Derive the transfer from fresh contract state, not rounded browser
           // listing metadata. This safely tops up a partial deposit exactly.
