@@ -916,6 +916,18 @@ export function Providers({ children }: { children: React.ReactNode }) {
             : existing?.prices?.length
               ? existing.prices
               : mapped.prices;
+          // A deal created from a listing has one immutable set of commercial
+          // terms. Browser cache is useful for UI state, but must never be
+          // allowed to replace the listing's model allow-list when either party
+          // re-signs the encrypted TEE terms after a reload.
+          const canonicalListingTerms = listing
+            ? {
+                ...listingTerms(listing),
+                creditUsd: listing.creditUsd ?? listing.credit,
+                priceUsd: listing.priceUsd ?? listing.price,
+                models: [...listing.models],
+              }
+            : null;
 
           mappedDeals.push({
             ...mapped,
@@ -935,11 +947,11 @@ export function Providers({ children }: { children: React.ReactNode }) {
             pricingSnapshotHash: liveMeter?.pricingSnapshotHash || existing?.pricingSnapshotHash,
             usageReceiptCount: Number(liveMeter?.usageReceiptCount ?? existing?.usageReceiptCount ?? 0),
             lastUsageReceipt: liveMeter?.lastUsageReceipt ?? existing?.lastUsageReceipt ?? null,
-            buyerTerms: listing
-              ? { ...(existing?.buyerTerms || listingTerms(listing)), creditUsd: listing.creditUsd ?? listing.credit, priceUsd: listing.priceUsd ?? listing.price }
+            buyerTerms: canonicalListingTerms
+              ? { ...canonicalListingTerms, models: [...canonicalListingTerms.models] }
               : existing?.buyerTerms || mapped.buyerTerms,
-            sellerTerms: listing
-              ? { ...(existing?.sellerTerms || listingTerms(listing)), creditUsd: listing.creditUsd ?? listing.credit, priceUsd: listing.priceUsd ?? listing.price }
+            sellerTerms: canonicalListingTerms
+              ? { ...canonicalListingTerms, models: [...canonicalListingTerms.models] }
               : existing?.sellerTerms || mapped.sellerTerms,
           });
         } catch (err: any) {
