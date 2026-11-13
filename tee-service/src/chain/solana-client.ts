@@ -3,6 +3,7 @@ import { ed25519 } from "@noble/curves/ed25519";
 import {
   Connection,
   PublicKey,
+  SystemProgram,
   Transaction,
 } from "@solana/web3.js";
 import {
@@ -55,6 +56,19 @@ export class SolanaClient {
     return getAssociatedTokenAddressSync(this.mint, this.vault).toBase58();
   }
 
+  public async currentBlockHeight(): Promise<number> {
+    return this.connection.getBlockHeight("confirmed");
+  }
+
+  public async assertFeePayerReady(): Promise<void> {
+    const account = await this.connection.getAccountInfo(this.vault, "confirmed");
+    if (!account || !account.owner.equals(SystemProgram.programId) || account.lamports < 5_000) {
+      throw new Error(
+        `Solana MPC vault ${this.vault.toBase58()} needs devnet SOL before automatic payouts can pay transaction fees`
+      );
+    }
+  }
+
   public async verifyCollateralDeposit(params: {
     signature: string;
     sellerAddress: string;
@@ -102,6 +116,7 @@ export class SolanaClient {
     amountAtomic: bigint;
   }): Promise<PreparedSolanaPayout> {
     if (params.amountAtomic <= 0n) throw new Error("Solana payout amount must be positive");
+    await this.assertFeePayerReady();
     const recipient = publicKeyFromSolanaAddress(params.recipient);
     const source = getAssociatedTokenAddressSync(this.mint, this.vault);
     const destination = getAssociatedTokenAddressSync(this.mint, recipient);

@@ -68,6 +68,13 @@ async function runNearRelayerTests() {
   );
 
   console.log("[PASS] Solana collateral Buffer hashes serialize as contract byte arrays");
+
+  capturedMethod = "";
+  capturedArgs = null;
+  await relayer.submitClearExpiredSolanaPayout(57);
+  assert(capturedMethod === "clear_expired_solana_payout", "Wrong stale payout cleanup method");
+  assert((capturedArgs as Record<string, any>).deal_id === 57, "Stale payout cleanup deal id mismatch");
+  console.log("[PASS] Expired Solana payout cleanup is relayed with the locked deal id");
 }
 
 runNearRelayerTests().catch((error) => {

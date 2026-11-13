@@ -2609,7 +2609,6 @@ export function Providers({ children }: { children: React.ReactNode }) {
             const priceUsd = Number(data.priceUsd) || item.priceUsd || item.price;
             const usedUsd = Number(data.usedUsd ?? item.usedUsd);
             const tokens = Number(data.tokensTotal ?? item.tokens);
-            const stage = creditUsd > 0 ? Math.min(100, Math.floor((usedUsd / creditUsd) * 100)) : item.stage;
             const lockedPriceRows = priceRowsFromLockedPricing(data.lockedPricing);
             return {
               ...item,
@@ -2620,7 +2619,10 @@ export function Providers({ children }: { children: React.ReactNode }) {
               tokens,
               creditUsd,
               priceUsd,
-              stage,
+              // Usage crossing a threshold is not proof of payment. Keep the
+              // stage loaded from the escrow contract until its transfer is
+              // confirmed on-chain.
+              stage: item.stage,
               prices: lockedPriceRows.length ? lockedPriceRows : item.prices,
               pricingSnapshotHash: data.pricingSnapshotHash || item.pricingSnapshotHash,
               usageReceiptCount: Number(data.usageReceiptCount ?? item.usageReceiptCount ?? 0),
@@ -2659,14 +2661,13 @@ export function Providers({ children }: { children: React.ReactNode }) {
             const creditUsd = Number(meterData?.creditUsd) || deal.creditUsd || deal.credit;
             const usedUsd = Number(meterData?.usedUsd ?? deal.usedUsd);
             const tokens = Number(meterData?.tokensTotal ?? deal.tokens);
-            const stage = creditUsd > 0 ? Math.min(100, Math.floor((usedUsd / creditUsd) * 100)) : deal.stage;
             return {
               ...deal,
               proxyKey,
               heartbeat: "live",
               usedUsd,
               tokens,
-              stage,
+              stage: deal.stage,
             };
           });
           pushToast({ kind: "success", title: "Private live meter connected", body: "Authenticated WebSocket updates are now enabled for this browser." });
@@ -2680,7 +2681,6 @@ export function Providers({ children }: { children: React.ReactNode }) {
         patchDeal(dealId, (deal) => {
           const creditUsd = Number(event.creditUsd) || deal.creditUsd || deal.credit;
           const priceUsd = Number(event.priceUsd) || deal.priceUsd || deal.price;
-          const stage = creditUsd > 0 ? Math.max(deal.stage, ...event.stages, Math.min(100, Math.floor((event.usedUsd / creditUsd) * 100))) : deal.stage;
           const lockedPriceRows = priceRowsFromLockedPricing(event.lockedPricing);
           return {
             ...deal,
@@ -2691,13 +2691,13 @@ export function Providers({ children }: { children: React.ReactNode }) {
             tokens: event.tokensTotal,
             creditUsd,
             priceUsd,
-            stage,
+            stage: deal.stage,
             prices: lockedPriceRows.length ? lockedPriceRows : deal.prices,
             pricingSnapshotHash: event.pricingSnapshotHash || deal.pricingSnapshotHash,
             usageReceiptCount: Number(event.usageReceiptCount ?? deal.usageReceiptCount ?? 0),
             lastUsageReceipt: event.lastUsageReceipt ?? deal.lastUsageReceipt ?? null,
             heartbeat: event.active ? "live" : deal.heartbeat,
-            pulseStage: event.stages.length ? event.stages[event.stages.length - 1] : deal.pulseStage,
+            pulseStage: deal.pulseStage,
             lastUpdate: `TEE Enclave (${new Date(event.timestamp).toLocaleTimeString()})`,
           };
         });

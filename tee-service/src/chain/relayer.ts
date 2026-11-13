@@ -635,6 +635,10 @@ export class NearRelayer {
     return this.callView("get_solana_pending_payout", { deal_id: dealId });
   }
 
+  public async submitClearExpiredSolanaPayout(dealId: number) {
+    return this.submitFunctionCall("clear_expired_solana_payout", { deal_id: dealId });
+  }
+
   public async getDeal(dealId: number): Promise<any> {
     return this.callView("get_deal", { deal_id: dealId });
   }

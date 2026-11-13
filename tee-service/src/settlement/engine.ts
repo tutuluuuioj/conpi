@@ -170,9 +170,16 @@ export class SettlementEngine {
     const amountAtomic = cumulativeAt - cumulativeBefore + (stage === 100 ? sellerCollateral : 0n);
     if (amountAtomic <= 0n) throw new Error("Solana payout amount is zero");
 
-    const pending = await nearRelayer.getSolanaPendingPayout(entry.dealId).catch(() => null);
+    let pending = await nearRelayer.getSolanaPendingPayout(entry.dealId).catch(() => null);
     if (pending && Number(pending.stage) !== stage) {
       throw new Error("A different Solana payout is still pending");
+    }
+    if (pending) {
+      const currentBlockHeight = await lockedSolanaClient.currentBlockHeight();
+      if (currentBlockHeight > Number(pending.last_valid_block_height)) {
+        await nearRelayer.submitClearExpiredSolanaPayout(entry.dealId);
+        pending = null;
+      }
     }
     const prepared = pending
       ? {
@@ -224,11 +231,19 @@ export class SettlementEngine {
     ) {
       throw new Error("NEAR returned a Solana signature for different payout terms");
     }
-    const broadcast = await lockedSolanaClient.broadcastSignedMessage({
-      messageHex: String(remote.message_hex),
-      signatureHex: String(remote.signature_hex),
-      lastValidBlockHeight: Number(remote.last_valid_block_height),
-    });
+    let broadcast: { signature: string };
+    try {
+      broadcast = await lockedSolanaClient.broadcastSignedMessage({
+        messageHex: String(remote.message_hex),
+        signatureHex: String(remote.signature_hex),
+        lastValidBlockHeight: Number(remote.last_valid_block_height),
+      });
+    } catch (error: any) {
+      if (/blockhash expired/i.test(error?.message || "")) {
+        await nearRelayer.submitClearExpiredSolanaPayout(entry.dealId).catch(() => undefined);
+      }
+      throw error;
+    }
     const confirmation: SignedPayloadDto = {
       domain: payload.domain,
       contractId: payload.contractId,
