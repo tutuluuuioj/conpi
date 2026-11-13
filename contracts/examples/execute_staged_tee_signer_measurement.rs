@@ -2,12 +2,12 @@ use conpi_escrow::types::TeeSigner;
 use near_sdk::json_types::Base64VecU8;
 use near_workspaces::types::SecretKey;
 use serde::Deserialize;
-use std::fs;
+use std::{env, fs};
 use std::path::Path;
 
 const ESCROW_ID: &str = "dev-20261103062448-30583839049419.testnet";
 const DSTACK_HARDWARE_SIGNER: &str = "ed25519:F4YtyCFTEj9rca8fJQxcQd7F1UHuuGQBxP8WmcAC7cbi";
-const HARDWARE_MEASUREMENT: &str = "mrtd:7fe60787222bd394cb516abca2435f22f035ab2cc9c0a4b4b3b148e46297f3d931a237b72f359052c6e657d8c1409173|compose:c0e721177e14f30af1b8dcca1cbc7fb0e828c035a6551909810e938d109b8182";
+const DEFAULT_HARDWARE_MEASUREMENT: &str = "mrtd:7fe60787222bd394cb516abca2435f22f035ab2cc9c0a4b4b3b148e46297f3d931a237b72f359052c6e657d8c1409173|compose:c0e721177e14f30af1b8dcca1cbc7fb0e828c035a6551909810e938d109b8182";
 
 #[derive(Deserialize)]
 struct MemberKeyEntry { secret_key: String }
@@ -29,6 +29,8 @@ fn ready_at_ns(value: &serde_json::Value) -> Option<u128> {
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let hardware_measurement = env::var("CONPI_TEE_MEASUREMENT")
+        .unwrap_or_else(|_| DEFAULT_HARDWARE_MEASUREMENT.to_string());
     let credentials_path = [".credentials/dao_member_keys.json", "contracts/.credentials/dao_member_keys.json"]
         .into_iter()
         .find(|path| Path::new(path).exists())
@@ -36,7 +38,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let keys: DaoKeysFile = serde_json::from_str(&fs::read_to_string(credentials_path)?)?;
     let dao_id: near_sdk::AccountId = keys.dao_account_id.parse()?;
     let escrow_id: near_sdk::AccountId = ESCROW_ID.parse()?;
-    let worker = near_workspaces::testnet().rpc_addr("https://test.rpc.fastnear.com").await?;
+    let worker = near_workspaces::testnet().rpc_addr("https://rpc.testnet.fastnear.com").await?;
     let member1 = near_workspaces::Account::from_secret_key(dao_id.clone(), keys.members[0].secret_key.parse::<SecretKey>()?, &worker);
     let member2 = near_workspaces::Account::from_secret_key(dao_id.clone(), keys.members[1].secret_key.parse::<SecretKey>()?, &worker);
 
@@ -47,7 +49,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .json()?;
     let (proposal_id, proposal) = staged.into_iter().find(|(_, proposal)| {
         proposal["action"]["AddTeeSigner"]["public_key"] == DSTACK_HARDWARE_SIGNER
-            && proposal["action"]["AddTeeSigner"]["measurement"] == HARDWARE_MEASUREMENT
+            && proposal["action"]["AddTeeSigner"]["measurement"] == hardware_measurement
     }).ok_or("matching staged TEE measurement proposal was not found")?;
     let ready_at = ready_at_ns(&proposal).ok_or("staged proposal has invalid ready_at")?;
     println!("Found staged TEE measurement proposal #{}.", proposal_id);
@@ -82,7 +84,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             .args_json(serde_json::json!({ "public_key": DSTACK_HARDWARE_SIGNER }))
             .await?.json()?;
         if let Some(signer) = signer {
-            if signer.active && signer.measurement == HARDWARE_MEASUREMENT {
+            if signer.active && signer.measurement == hardware_measurement {
                 println!("TEE signer measurement is active on-chain.");
                 return Ok(());
             }
