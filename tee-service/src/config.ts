@@ -5,7 +5,7 @@ export const CONFIG = {
   port: parseInt(process.env.PORT || "3000", 10),
   host: process.env.HOST || "0.0.0.0",
   networkId: process.env.NEAR_NETWORK || "testnet",
-  nodeUrl: process.env.NEAR_NODE_URL || "https://rpc.testnet.near.org",
+  nodeUrl: process.env.NEAR_NODE_URL || "https://rpc.testnet.fastnear.com",
   contractId: process.env.CONTRACT_ID || "dev-20261103062448-30583839049419.testnet",
   daoId: process.env.DAO_ID || "dev-20261103021740-59711933581376.testnet",
   dstackSocketPath: process.env.DSTACK_SOCKET_PATH || "/var/run/tappd.sock",
@@ -21,8 +21,11 @@ export const CONFIG = {
   checkpointIntervalMs: Math.max(10_000, parseInt(process.env.CHECKPOINT_INTERVAL_MS || "300000", 10)),
   billingQueueTimeoutMs: Math.max(1_000, parseInt(process.env.BILLING_QUEUE_TIMEOUT_MS || "65000", 10)),
   billingQueueMaxWaiters: Math.max(1, parseInt(process.env.BILLING_QUEUE_MAX_WAITERS || "32", 10)),
-  relayerMaxAttempts: Math.max(1, parseInt(process.env.RELAYER_MAX_ATTEMPTS || "5", 10)),
-  relayerRetryBaseMs: Math.max(25, parseInt(process.env.RELAYER_RETRY_BASE_MS || "500", 10)),
+  // NEAR public RPCs can briefly throttle bursts of adjacent 25% stages. Keep
+  // the settlement queue intact and back off for long enough to recover
+  // automatically instead of abandoning later stages after a few seconds.
+  relayerMaxAttempts: Math.max(1, parseInt(process.env.RELAYER_MAX_ATTEMPTS || "8", 10)),
+  relayerRetryBaseMs: Math.max(25, parseInt(process.env.RELAYER_RETRY_BASE_MS || "1000", 10)),
   meteringStateDir: process.env.METERING_STATE_DIR || (process.env.NODE_ENV === "test" ? `/tmp/conpi-metering-${process.pid}` : "/var/lib/conpi"),
   solanaRpcUrl: process.env.SOLANA_RPC || "https://api.devnet.solana.com",
   solanaUsdcMint: process.env.SOLANA_USDC_MINT || "4zMMC9srt5Ri5X14GAgXhaHii3GnPAEERYPJgZJDncDU",
