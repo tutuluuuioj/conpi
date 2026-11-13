@@ -33,6 +33,17 @@ export function publicKeyFromSolanaAddress(address: string): PublicKey {
   return new PublicKey(bytes);
 }
 
+/** Compare the actual 32-byte Solana key, not its text encoding.  Older
+ * deals can hold a hexadecimal signer address while a pending payout holds
+ * its canonical base58 spelling for the very same wallet. */
+export function sameSolanaAddress(left: string, right: string): boolean {
+  try {
+    return publicKeyFromSolanaAddress(left).equals(publicKeyFromSolanaAddress(right));
+  } catch {
+    return false;
+  }
+}
+
 export class SolanaClient {
   private readonly connection: Connection;
   private readonly mint: PublicKey;

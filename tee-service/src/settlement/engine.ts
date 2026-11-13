@@ -5,7 +5,7 @@ import { meterEvents } from "../proxy/events.js";
 import type { RelayReceipt, VaultEntry } from "../vault/preflight.js";
 import { PayloadKind, serializeSignedPayload, type SignedPayloadDto } from "../crypto/borsh.js";
 import { enclaveKeys } from "../crypto/keys.js";
-import { SolanaClient } from "../chain/solana-client.js";
+import { sameSolanaAddress, SolanaClient } from "../chain/solana-client.js";
 
 type RelayKind = RelayReceipt["kind"];
 type SignedEnvelope = { payload: any; signatureHex: string };
@@ -18,6 +18,18 @@ function statusName(value: unknown): string {
   if (typeof value === "string") return value;
   if (value && typeof value === "object") return String(Object.keys(value as object)[0] || "");
   return String(value || "");
+}
+
+function byte32Hex(value: unknown, field: string): string {
+  if (typeof value === "string") {
+    const normalized = value.replace(/^0x/, "");
+    if (/^[0-9a-f]{64}$/i.test(normalized)) return normalized.toLowerCase();
+  }
+  if (Buffer.isBuffer(value) || value instanceof Uint8Array || Array.isArray(value)) {
+    const bytes = Buffer.from(value as Uint8Array);
+    if (bytes.length === 32) return bytes.toString("hex");
+  }
+  throw new Error(`${field} must be a 32-byte hex value`);
 }
 
 /**
@@ -193,7 +205,7 @@ export class SettlementEngine {
     const prepared = pending
       ? {
           messageHex: String(pending.message_hex),
-          messageHashHex: Buffer.from(pending.message_hash).toString("hex"),
+          messageHashHex: byte32Hex(pending.message_hash, "Pending Solana message hash"),
           recipient: String(pending.recipient),
           amountAtomic: BigInt(pending.amount),
           lastValidBlockHeight: Number(pending.last_valid_block_height),
@@ -202,7 +214,7 @@ export class SettlementEngine {
           recipient: String(solanaDeal.seller_address),
           amountAtomic,
         });
-    if (prepared.recipient !== String(solanaDeal.seller_address) || prepared.amountAtomic !== amountAtomic) {
+    if (!sameSolanaAddress(prepared.recipient, String(solanaDeal.seller_address)) || prepared.amountAtomic !== amountAtomic) {
       throw new Error("The pending Solana payout does not match the escrow terms");
     }
     const payload = signed.payload as SignedPayloadDto;
@@ -233,8 +245,8 @@ export class SettlementEngine {
         );
     const remote = requested.solanaTxSigned;
     if (
-      String(remote.message_hash_hex || "").replace(/^0x/, "").toLowerCase() !== prepared.messageHashHex
-      || String(remote.recipient) !== prepared.recipient
+      byte32Hex(remote.message_hash_hex, "NEAR Solana message hash") !== prepared.messageHashHex
+      || !sameSolanaAddress(String(remote.recipient), prepared.recipient)
       || BigInt(remote.amount) !== amountAtomic
       || Number(remote.stage) !== stage
     ) {

@@ -6,7 +6,7 @@ import { enclaveKeys } from "../src/crypto/keys.js";
 import { DefaultReason, PayloadKind, serializeSignedPayload } from "../src/crypto/borsh.js";
 import { meterEngine } from "../src/proxy/meter.js";
 import { settlementEngine } from "../src/settlement/engine.js";
-import { publicKeyFromSolanaAddress } from "../src/chain/solana-client.js";
+import { publicKeyFromSolanaAddress, sameSolanaAddress } from "../src/chain/solana-client.js";
 import type { VaultEntry } from "../src/vault/preflight.js";
 
 function assert(condition: unknown, message: string): asserts condition {
@@ -187,6 +187,10 @@ async function runPhase4Tests() {
     assert(
       publicKeyFromSolanaAddress(sellerHex).toBase58() === "DeEpqiydVZLN7xoFvD6ARyW6bjgum9UUdpK5wWA7UftN",
       "The locked Solana hex address did not decode to the seller's public key"
+    );
+    assert(
+      sameSolanaAddress(sellerHex, "DeEpqiydVZLN7xoFvD6ARyW6bjgum9UUdpK5wWA7UftN"),
+      "A pending base58 payout was not matched to the seller's locked hex address"
     );
 
     console.log("[P4-7] Failed stages are re-signed with fresh nonces and recovered in order...");

@@ -37,6 +37,10 @@ function finitePriceCeiling(value: unknown): number | undefined {
   return Number.isFinite(parsed) && parsed >= 0 ? parsed : undefined;
 }
 
+function waitFor(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
 export function requestWithProviderUsage(body: any, kind: ProviderKind, lockedRate?: PricingRate): any {
   if (kind !== "openrouter") {
     return body.stream ? { ...body, stream_options: { ...(body.stream_options || {}), include_usage: true } } : body;
@@ -67,10 +71,14 @@ export function requestWithProviderUsage(body: any, kind: ProviderKind, lockedRa
 }
 
 export function resolveMeteredCostUsd(provider: string, calculatedCostUsd: number, providerCost: unknown): number {
-  // Billing is deterministic from the price snapshot locked at activation.
-  // Provider-reported spend is delayed and is never authoritative for escrow.
-  void provider;
-  void providerCost;
+  // The locked catalogue is an admission-control ceiling: it prevents a
+  // request from being routed to a provider the deal cannot afford.  It is
+  // not a licence to charge that ceiling once OpenRouter has reported a lower
+  // amount actually billed for the selected provider.
+  if (provider.trim().toLowerCase() === "openrouter") {
+    const actual = finitePriceCeiling(providerCost);
+    if (actual !== undefined) return actual;
+  }
   return calculatedCostUsd;
 }
 
@@ -110,11 +118,33 @@ function providerKind(entry: VaultEntry): ProviderKind {
 export async function reconcilePendingUsage(entry: VaultEntry): Promise<UsageResult | null> {
   const pending = entry.pendingUsage;
   if (!pending) return null;
-  // A reservation is a credit hold, not usage.  A timeout or a broken stream
-  // does not prove that the provider generated the full requested completion.
-  // Leave the deal blocked until a result can be confirmed; never turn the
-  // maximum reservation into a seller payout.
-  throw new Error(`The previous provider request for deal #${entry.dealId} is unresolved; its reserved credit remains locked and has not been charged`);
+  if (providerKind(entry) !== "openrouter") {
+    throw new Error(`The previous provider request for deal #${entry.dealId} is unresolved; its reserved credit remains locked and has not been charged`);
+  }
+
+  const generationId = pending.generationId;
+  if (!generationId || generationId.startsWith("conpi-reservation:")) {
+    throw new Error(`The previous OpenRouter request for deal #${entry.dealId} has no generation ID yet; its reservation remains held without a charge`);
+  }
+  const generation = await lookupOpenRouterGeneration(entry, generationId);
+  if (!generation) {
+    throw new Error(`OpenRouter has not finalized generation '${generationId}' yet; its reservation remains held without a charge`);
+  }
+  const usage = recordUsage(
+    entry,
+    pending.model,
+    generation.inputTokens ?? pending.inputTokens,
+    generation.outputTokens ?? pending.outputTokens,
+    generation.cachedTokens ?? pending.cachedTokens,
+    generation.costUsd,
+    generationId,
+    "openrouter_generation",
+    {
+      cacheWriteTokens: generation.cacheWriteTokens ?? pending.cacheWriteTokens,
+      reasoningTokens: generation.reasoningTokens ?? pending.reasoningTokens,
+    }
+  );
+  return usage;
 }
 
 export function stagePendingUsage(
@@ -160,6 +190,77 @@ function retainAmbiguousPendingReservation(entry: VaultEntry): void {
   meterEvents.publish(entry, "usage");
 }
 
+/** Persist the provider generation ID as soon as the upstream supplies it.
+ * This makes an interrupted stream recoverable after a restart. */
+export function associatePendingGeneration(entry: VaultEntry, generationId: unknown): void {
+  const normalized = typeof generationId === "string" ? generationId.trim() : "";
+  if (!normalized || normalized.startsWith("conpi-reservation:") || !entry.pendingUsage) return;
+  if (entry.pendingUsage.generationId === normalized) return;
+  const pendingUsage = { ...entry.pendingUsage, generationId: normalized };
+  meteringStateStore.save({ ...entry, pendingUsage });
+  entry.pendingUsage = pendingUsage;
+}
+
+function openRouterGenerationId(response: Response, responseId?: unknown): string | undefined {
+  const header = response.headers.get("x-generation-id") || response.headers.get("x-openrouter-generation-id");
+  if (header?.trim()) return header.trim();
+  return typeof responseId === "string" && responseId.trim() ? responseId.trim() : undefined;
+}
+
+function openRouterCost(value: any): number | undefined {
+  return finitePriceCeiling(value?.usage?.cost ?? value?.usage?.total_cost ?? value?.total_cost ?? value?.cost);
+}
+
+interface OpenRouterGenerationUsage {
+  costUsd: number;
+  inputTokens?: number;
+  outputTokens?: number;
+  cachedTokens?: number;
+  cacheWriteTokens?: number;
+  reasoningTokens?: number;
+}
+
+/**
+ * The generation endpoint is eventually consistent. A just-completed stream
+ * can return 404 briefly, so callers retain the reservation rather than
+ * guessing a list-price charge.
+ */
+export async function lookupOpenRouterGeneration(
+  entry: VaultEntry,
+  generationId: string
+): Promise<OpenRouterGenerationUsage | null> {
+  const url = `https://openrouter.ai/api/v1/generation?id=${encodeURIComponent(generationId)}`;
+  for (let attempt = 0; attempt < 3; attempt += 1) {
+    const response = await fetchWithTransientBackoff(url, {
+      method: "GET",
+      headers: providerHeaders(entry, "openrouter"),
+    }, Math.min(CONFIG.upstreamFetchTimeoutMs, 30_000));
+    if (response.status === 404) {
+      if (attempt < 2) await waitFor(250 * (attempt + 1));
+      continue;
+    }
+    if (!response.ok) throw new Error(`OpenRouter generation lookup failed (HTTP ${response.status})`);
+    const body: any = await response.json().catch(() => null);
+    const data = body?.data ?? body;
+    const costUsd = openRouterCost(data);
+    if (costUsd === undefined) throw new Error(`OpenRouter generation '${generationId}' did not include an actual cost`);
+    const usage = data?.usage && typeof data.usage === "object" ? data.usage : data;
+    const numberOrUndefined = (value: unknown): number | undefined => {
+      const number = Number(value);
+      return Number.isFinite(number) && number >= 0 ? number : undefined;
+    };
+    return {
+      costUsd,
+      inputTokens: numberOrUndefined(data?.tokens_prompt ?? usage?.prompt_tokens ?? usage?.input_tokens),
+      outputTokens: numberOrUndefined(data?.tokens_completion ?? usage?.completion_tokens ?? usage?.output_tokens),
+      cachedTokens: numberOrUndefined(data?.native_tokens_cached ?? usage?.prompt_tokens_details?.cached_tokens),
+      cacheWriteTokens: numberOrUndefined(usage?.prompt_tokens_details?.cache_write_tokens),
+      reasoningTokens: numberOrUndefined(data?.native_tokens_reasoning ?? usage?.completion_tokens_details?.reasoning_tokens),
+    };
+  }
+  return null;
+}
+
 interface LocalUsageCommit {
   generationId: string | null;
   model: string;
@@ -168,6 +269,7 @@ interface LocalUsageCommit {
   cachedTokens: number;
   cacheWriteTokens?: number;
   reasoningTokens?: number;
+  providerCost?: unknown;
   reservedFallback?: boolean;
   source?: UsageCostSource;
 }
@@ -176,8 +278,37 @@ async function finalizeProviderUsage(
   entry: VaultEntry,
   usageData: LocalUsageCommit
 ): Promise<{ usage: UsageResult; generationId?: string; source: string }> {
-  const source: UsageCostSource = usageData.source
+  let generationId = usageData.generationId || undefined;
+  let providerCost = finitePriceCeiling(usageData.providerCost);
+  let source: UsageCostSource = usageData.source
     ?? (usageData.reservedFallback ? "locked_pricing_reserved" : "locked_pricing");
+
+  if (providerKind(entry) === "openrouter") {
+    generationId ||= entry.pendingUsage?.generationId || undefined;
+    if (generationId && !generationId.startsWith("conpi-reservation:")) {
+      associatePendingGeneration(entry, generationId);
+    }
+    if (providerCost !== undefined) {
+      source = "openrouter_usage";
+    } else if (generationId && !generationId.startsWith("conpi-reservation:")) {
+      const generation = await lookupOpenRouterGeneration(entry, generationId);
+      if (generation) {
+        providerCost = generation.costUsd;
+        usageData = {
+          ...usageData,
+          inputTokens: generation.inputTokens ?? usageData.inputTokens,
+          outputTokens: generation.outputTokens ?? usageData.outputTokens,
+          cachedTokens: generation.cachedTokens ?? usageData.cachedTokens,
+          cacheWriteTokens: generation.cacheWriteTokens ?? usageData.cacheWriteTokens,
+          reasoningTokens: generation.reasoningTokens ?? usageData.reasoningTokens,
+        };
+        source = "openrouter_generation";
+      }
+    }
+    if (providerCost === undefined) {
+      throw new Error("OpenRouter did not provide an actual cost yet; the reservation remains held without a charge");
+    }
+  }
   return {
     usage: recordUsage(
       entry,
@@ -185,12 +316,12 @@ async function finalizeProviderUsage(
       usageData.inputTokens,
       usageData.outputTokens,
       usageData.cachedTokens,
-      undefined,
-      usageData.generationId || undefined,
+      providerCost,
+      generationId,
       source,
       { cacheWriteTokens: usageData.cacheWriteTokens, reasoningTokens: usageData.reasoningTokens }
     ),
-    generationId: usageData.generationId || undefined,
+    generationId,
     source,
   };
 }
@@ -512,7 +643,10 @@ function recordUsage(
       console.warn("[conpi:stage-relay]", { dealId: entry.dealId, error: error instanceof Error ? error.message : String(error) });
     });
   }
-  if (entry.usedUsd >= entry.creditUsd) entry.active = false;
+  // Do not retire the proxy key merely because the credit cap was reached.
+  // The admission check already rejects further model calls. Keeping this
+  // record active lets the encrypted meter recover pending charges and retry
+  // stage payouts until the on-chain deal is actually completed.
   const stages = signedStages.map((stage) => stage.payload.stage);
   meterEvents.publish(entry, stages.length ? "stage" : "usage", stages);
   return { ...usage, stages };
@@ -670,6 +804,7 @@ async function streamOpenAiResponse(
   let providerInputSeen = false;
   let providerOutputSeen = false;
   let generationId: string | undefined;
+  let providerCost: number | undefined;
 
   if (transformToAnthropic) {
     reply.raw.write(`event: message_start\ndata: ${JSON.stringify({ type: "message_start", message: { id: `msg_${Date.now()}`, type: "message", role: "assistant", model, content: [], stop_reason: null, usage: { input_tokens: fallbackInputTokens, output_tokens: 0 } } })}\n\n`);
@@ -691,7 +826,10 @@ async function streamOpenAiResponse(
       if (!raw || raw === "[DONE]") continue;
       let data: any;
       try { data = JSON.parse(raw); } catch { continue; }
-      if (!generationId && typeof data.id === "string") generationId = data.id;
+      if (!generationId && typeof data.id === "string") {
+        generationId = data.id;
+        associatePendingGeneration(entry, generationId);
+      }
       const text = data.choices?.[0]?.delta?.content;
       if (typeof text === "string") {
         outputText += text;
@@ -701,6 +839,7 @@ async function streamOpenAiResponse(
       }
       if (!transformToAnthropic) reply.raw.write(`data: ${raw}\n\n`);
       if (data.usage) {
+        providerCost = openRouterCost(data) ?? providerCost;
         if (Number.isFinite(Number(data.usage.prompt_tokens))) {
           providerInputSeen = true;
           inputTokens = Number(data.usage.prompt_tokens);
@@ -735,6 +874,7 @@ async function streamOpenAiResponse(
       cachedTokens,
       cacheWriteTokens,
       reasoningTokens,
+      providerCost,
       source: tokenizerFallback ? "locked_pricing_tokenizer" : "locked_pricing",
     });
     const usage = committed.usage;
@@ -777,6 +917,8 @@ async function streamAnthropicResponse(
   let cacheWriteTokens = 0;
   let providerInputSeen = false;
   let providerOutputSeen = false;
+  let generationId: string | undefined;
+  let providerCost: number | undefined;
   const reader = response.body?.getReader();
   if (!reader) throw new Error("Provider streaming response has no body");
   const decoder = new TextDecoder();
@@ -794,9 +936,15 @@ async function streamAnthropicResponse(
       if (!raw) continue;
       let data: any;
       try { data = JSON.parse(raw); } catch { continue; }
+      const candidateGenerationId = data.id ?? data.message?.id;
+      if (!generationId && typeof candidateGenerationId === "string") {
+        generationId = candidateGenerationId;
+        associatePendingGeneration(entry, generationId);
+      }
       const reportedInput = data.message?.usage?.input_tokens ?? data.usage?.input_tokens;
       const reportedOutput = data.usage?.output_tokens;
       const usageDetails = data.message?.usage || data.usage || {};
+      providerCost = openRouterCost({ usage: usageDetails }) ?? providerCost;
       if (Number.isFinite(Number(reportedInput))) {
         providerInputSeen = true;
         inputTokens = Number(reportedInput);
@@ -831,19 +979,19 @@ async function streamAnthropicResponse(
   if (!providerInputSeen) inputTokens = fallbackInputTokens;
   if (!providerOutputSeen) outputTokens = countTextTokens(entry.provider, model, outputText);
   const meteredInputTokens = providerInputSeen ? inputTokens + cachedTokens + cacheWriteTokens : inputTokens;
-  const usage = recordUsage(
-    entry,
+  const committed = await finalizeProviderUsage(entry, {
+    generationId: generationId || null,
     model,
-    meteredInputTokens,
+    inputTokens: meteredInputTokens,
     outputTokens,
     cachedTokens,
-    undefined,
-    undefined,
-    tokenizerFallback ? "locked_pricing_tokenizer" : "locked_pricing",
-    { cacheWriteTokens }
-  );
+    cacheWriteTokens,
+    providerCost,
+    source: tokenizerFallback ? "locked_pricing_tokenizer" : "locked_pricing",
+  });
+  const usage = committed.usage;
   if (transformToOpenAi) {
-    reply.raw.write(`data: ${JSON.stringify({ id: `chatcmpl-${Date.now()}`, object: "chat.completion.chunk", created: Math.floor(Date.now() / 1000), model, choices: [{ index: 0, delta: {}, finish_reason: "stop" }], usage: { prompt_tokens: meteredInputTokens, completion_tokens: outputTokens, total_tokens: meteredInputTokens + outputTokens, prompt_tokens_details: { cached_tokens: cachedTokens, cache_write_tokens: cacheWriteTokens }, conpi_cost_usd: usage.costUsd, conpi_usage_source: tokenizerFallback ? "locked_pricing_tokenizer" : "locked_pricing" } })}\n\n`);
+    reply.raw.write(`data: ${JSON.stringify({ id: `chatcmpl-${Date.now()}`, object: "chat.completion.chunk", created: Math.floor(Date.now() / 1000), model, choices: [{ index: 0, delta: {}, finish_reason: "stop" }], usage: { prompt_tokens: meteredInputTokens, completion_tokens: outputTokens, total_tokens: meteredInputTokens + outputTokens, prompt_tokens_details: { cached_tokens: cachedTokens, cache_write_tokens: cacheWriteTokens }, conpi_cost_usd: usage.costUsd, conpi_usage_source: committed.source } })}\n\n`);
     reply.raw.write("data: [DONE]\n\n");
   }
   return reply.raw.end();
@@ -936,6 +1084,7 @@ export async function handleChatCompletions(req: FastifyRequest, reply: FastifyR
       body: JSON.stringify(requestWithProviderUsage(forwardBody, kind, entry.lockedPricing[model])),
     });
     if (!response.ok) return handleProviderFailure(response, entry, reply);
+    if (kind === "openrouter") associatePendingGeneration(entry, openRouterGenerationId(response));
     if (body.stream) return await streamOpenAiResponse(response, reply, entry, model, inputTokens, false, effectiveMaxTokens);
     const data: any = await response.json();
     const outputText = extractText(data.choices?.[0]?.message?.content);
@@ -945,14 +1094,17 @@ export async function handleChatCompletions(req: FastifyRequest, reply: FastifyR
     const cachedTokens = Number(data.usage?.prompt_tokens_details?.cached_tokens || 0);
     const cacheWriteTokens = Number(data.usage?.prompt_tokens_details?.cache_write_tokens || 0);
     const reasoningTokens = Number(data.usage?.completion_tokens_details?.reasoning_tokens || 0);
+    const generationId = openRouterGenerationId(response, data.id);
+    if (kind === "openrouter") associatePendingGeneration(entry, generationId);
     const committed = await finalizeProviderUsage(entry, {
-      generationId: typeof data.id === "string" ? data.id : null,
+      generationId: generationId || null,
       model,
       inputTokens: finalInput,
       outputTokens: finalOutput,
       cachedTokens,
       cacheWriteTokens,
       reasoningTokens,
+      providerCost: openRouterCost(data),
       source: providerUsageSeen ? "locked_pricing" : "locked_pricing_tokenizer",
     });
     const conpiUsageSource = committed.source;
@@ -1048,6 +1200,7 @@ export async function handleAnthropicMessages(req: FastifyRequest, reply: Fastif
       method: "POST", headers: providerHeaders(entry, kind), body: JSON.stringify(requestWithProviderUsage(anthropicMessagesToOpenAi(forwardBody), kind, entry.lockedPricing[model])),
     });
     if (!response.ok) return handleProviderFailure(response, entry, reply, true);
+    if (kind === "openrouter") associatePendingGeneration(entry, openRouterGenerationId(response));
     if (body.stream) return await streamOpenAiResponse(response, reply, entry, model, inputTokens, true, effectiveMaxTokens);
     const data: any = await response.json();
     const outputText = extractText(data.choices?.[0]?.message?.content);
@@ -1057,14 +1210,17 @@ export async function handleAnthropicMessages(req: FastifyRequest, reply: Fastif
     const cachedTokens = Number(data.usage?.prompt_tokens_details?.cached_tokens || 0);
     const cacheWriteTokens = Number(data.usage?.prompt_tokens_details?.cache_write_tokens || 0);
     const reasoningTokens = Number(data.usage?.completion_tokens_details?.reasoning_tokens || 0);
+    const generationId = openRouterGenerationId(response, data.id);
+    if (kind === "openrouter") associatePendingGeneration(entry, generationId);
     const committed = await finalizeProviderUsage(entry, {
-      generationId: typeof data.id === "string" ? data.id : null,
+      generationId: generationId || null,
       model,
       inputTokens: finalInput,
       outputTokens: finalOutput,
       cachedTokens,
       cacheWriteTokens,
       reasoningTokens,
+      providerCost: openRouterCost(data),
       source: providerUsageSeen ? "locked_pricing" : "locked_pricing_tokenizer",
     });
     return reply.send({
@@ -1121,18 +1277,22 @@ export async function handleEmbeddings(req: FastifyRequest, reply: FastifyReply)
       method: "POST", headers: providerHeaders(entry, kind), body: JSON.stringify(requestWithProviderUsage(body, kind, entry.lockedPricing[model])),
     });
     if (!response.ok) return handleProviderFailure(response, entry, reply);
+    if (kind === "openrouter") associatePendingGeneration(entry, openRouterGenerationId(response));
     const data: any = await response.json();
     const providerUsageSeen = Number.isFinite(Number(data.usage?.prompt_tokens ?? data.usage?.total_tokens));
     const finalInput = providerUsageSeen ? Number(data.usage?.prompt_tokens ?? data.usage?.total_tokens) : inputTokens;
     const cachedTokens = Number(data.usage?.prompt_tokens_details?.cached_tokens || 0);
     const cacheWriteTokens = Number(data.usage?.prompt_tokens_details?.cache_write_tokens || 0);
+    const generationId = openRouterGenerationId(response, data.id);
+    if (kind === "openrouter") associatePendingGeneration(entry, generationId);
     const committed = await finalizeProviderUsage(entry, {
-      generationId: typeof data.id === "string" ? data.id : null,
+      generationId: generationId || null,
       model,
       inputTokens: finalInput,
       outputTokens: 0,
       cachedTokens,
       cacheWriteTokens,
+      providerCost: openRouterCost(data),
       source: providerUsageSeen ? "locked_pricing" : "locked_pricing_tokenizer",
     });
     data.usage = { ...(data.usage || {}), prompt_tokens: finalInput, total_tokens: finalInput, conpi_cost_usd: committed.usage.costUsd, conpi_usage_source: committed.source };

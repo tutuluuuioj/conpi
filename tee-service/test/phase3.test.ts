@@ -3,7 +3,7 @@ process.env.NODE_ENV = "test";
 import WebSocket from "ws";
 import { buildApp } from "../src/index.js";
 import { nearRelayer } from "../src/chain/relayer.js";
-import { keyVault } from "../src/vault/preflight.js";
+import { keyVault, shouldKeepVaultEntryActive } from "../src/vault/preflight.js";
 import { meterEvents } from "../src/proxy/events.js";
 import { calculateCost, openRouterPricingFromModels } from "../src/proxy/pricing.js";
 import { proxyRateLimiter } from "../src/proxy/rate-limit.js";
@@ -36,6 +36,8 @@ async function runPhase3Tests() {
   assert(CONFIG.upstreamFetchTimeoutMs === 300_000, `Expected 300000ms upstream timeout, got ${CONFIG.upstreamFetchTimeoutMs}`);
   assert(CONFIG.websocketAuthTimeoutMs === 10_000, `Expected 10000ms websocket timeout, got ${CONFIG.websocketAuthTimeoutMs}`);
   assert(CONFIG.checkpointIntervalMs === 300_000, `Expected 300000ms checkpoint interval, got ${CONFIG.checkpointIntervalMs}`);
+  assert(shouldKeepVaultEntryActive("Active"), "A consumed Active deal was removed from payout recovery");
+  assert(!shouldKeepVaultEntryActive("Completed"), "A completed deal remained active in the key vault");
 
   (nearRelayer as any).getDeal = async () => ({
     id: 3001,
@@ -69,8 +71,8 @@ async function runPhase3Tests() {
   assert(Math.abs(priced.costUsd - 0.0075) < 1e-12, "Locked price calculation is incorrect");
   assert(Math.abs(accumulateUsedUsd(0.049, 0.003) - 0.052) < 1e-12, "Meter hid real usage above the deal credit cap");
   assert(
-    Math.abs(resolveMeteredCostUsd("OpenRouter", 0.05, 0.0251) - 0.05) < 1e-12,
-    "Delayed OpenRouter spend was allowed to override locked-price accounting"
+    Math.abs(resolveMeteredCostUsd("OpenRouter", 0.05, 0.0251) - 0.0251) < 1e-12,
+    "OpenRouter's reported actual cost was not used as the final charge"
   );
   assert(
     Math.abs(resolveMeteredCostUsd("OpenAI", 0.05, 0.0251) - 0.05) < 1e-12,
@@ -274,13 +276,22 @@ async function runPhase3Tests() {
   globalThis.fetch = (async (url: string | URL | Request, init?: RequestInit) => {
     if (String(url).includes("/generation?")) {
       generationLookups += 1;
-      throw new Error("Production metering must not poll OpenRouter generation usage");
+      throw new Error("The immediate usage.cost path should not require a generation lookup");
     }
     forwardedOpenRouterBody = JSON.parse(String(init?.body || "{}"));
+    if (forwardedOpenRouterBody.stream) {
+      const streamBody = [
+        'data: {"id":"gen-stream-exact","choices":[{"delta":{"content":"streamed"},"finish_reason":null}]}',
+        'data: {"id":"gen-stream-exact","choices":[{"delta":{},"finish_reason":"stop"}],"usage":{"prompt_tokens":6,"completion_tokens":3,"total_tokens":9,"cost":0.0013}}',
+        "data: [DONE]",
+        "",
+      ].join("\n\n");
+      return new Response(streamBody, { status: 200, headers: { "content-type": "text/event-stream" } });
+    }
     return new Response(JSON.stringify({
       id: "gen-reconcile",
       choices: [{ message: { role: "assistant", content: "reconciled" }, finish_reason: "stop" }],
-      usage: { prompt_tokens: 5, completion_tokens: 2, total_tokens: 7 },
+      usage: { prompt_tokens: 5, completion_tokens: 2, total_tokens: 7, cost: 0.0021 },
     }), { status: 200, headers: { "content-type": "application/json" } });
   }) as typeof fetch;
   const beforeReconciled = entry.usedUsd;
@@ -291,17 +302,27 @@ async function runPhase3Tests() {
     payload: { model: "gpt-4o", max_tokens: 4, messages: [{ role: "user", content: "reconcile exact cost" }] },
   });
   const reconciledBody = JSON.parse(reconciled.body);
-  const expectedLocalCost = calculateCost("gpt-4o", 5, 2, 0, entry.lockedPricing).costUsd;
-  assert(reconciled.statusCode === 200, `Local OpenRouter metering failed: ${reconciled.body}`);
-  assert(Math.abs((entry.usedUsd - beforeReconciled) - expectedLocalCost) < 1e-12, "Locked-price local cost did not advance the meter exactly");
-  assert(reconciledBody.usage?.conpi_usage_source === "locked_pricing", "Local locked-price source was not exposed");
-  assert(generationLookups === 0, "Metering performed a delayed OpenRouter generation lookup");
+  assert(reconciled.statusCode === 200, `OpenRouter actual-cost metering failed: ${reconciled.body}`);
+  assert(Math.abs((entry.usedUsd - beforeReconciled) - 0.0021) < 1e-12, "OpenRouter usage.cost did not advance the meter exactly");
+  assert(reconciledBody.usage?.conpi_usage_source === "openrouter_usage", "Immediate OpenRouter cost provenance was not exposed");
+  assert(generationLookups === 0, "A response that includes usage.cost should not need a delayed generation lookup");
   assert(forwardedOpenRouterBody.usage?.include === true, "Immediate OpenRouter token metadata was not requested");
   assert(forwardedOpenRouterBody.provider?.max_price?.prompt === entry.lockedPricing["gpt-4o"].inputPerMillion, "Locked OpenRouter prompt ceiling was not forwarded");
   assert(forwardedOpenRouterBody.provider?.max_price?.completion === entry.lockedPricing["gpt-4o"].outputPerMillion, "Locked OpenRouter completion ceiling was not forwarded");
   const receipt = entry.usageReceipts.at(-1)!;
-  assert(receipt.generationId === "gen-reconcile" && receipt.source === "locked_pricing", "Signed ledger omitted deterministic local pricing provenance");
+  assert(receipt.generationId === "gen-reconcile" && receipt.source === "openrouter_usage", "Signed ledger omitted OpenRouter actual-cost provenance");
   assert(enclaveKeys.verify(Buffer.from(receipt.hash, "hex"), Buffer.from(receipt.signatureHex, "hex")), "TEE usage receipt signature is invalid");
+  const beforeStreamedActual = entry.usedUsd;
+  const streamedActual = await app.inject({
+    method: "POST",
+    url: "/v1/chat/completions",
+    headers: auth,
+    payload: { model: "gpt-4o", stream: true, max_tokens: 4, messages: [{ role: "user", content: "stream exact cost" }] },
+  });
+  assert(streamedActual.statusCode === 200, `OpenRouter actual-cost stream failed: ${streamedActual.body}`);
+  assert(Math.abs((entry.usedUsd - beforeStreamedActual) - 0.0013) < 1e-12, "Stream final usage.cost did not advance the meter exactly");
+  assert(entry.usageReceipts.at(-1)?.generationId === "gen-stream-exact", "Stream generation ID was not written to the signed ledger");
+  assert(entry.usageReceipts.at(-1)?.source === "openrouter_usage", "Stream receipt did not record OpenRouter actual-cost provenance");
   const receiptsResponse = await app.inject({ method: "GET", url: "/v1/deals/3001/usage-receipts", headers: auth });
   assert(receiptsResponse.statusCode === 200 && JSON.parse(receiptsResponse.body).receipts.length > 0, "Authenticated usage receipt ledger was unavailable");
   const unpricedPlugin = await app.inject({
@@ -578,6 +599,37 @@ async function runPhase3Tests() {
   }
   assert(recoveryHeld, "Restart recovery did not keep an unconfirmed request on hold");
   assert(recoveredEntry.usedUsd === 0 && recoveredEntry.pendingUsage !== null, "Restart recovery converted an unresolved reservation into usage");
+
+  // When a generation ID was obtained before a disconnect, recovery must ask
+  // OpenRouter for the amount it actually billed rather than turning the
+  // reservation ceiling into a buyer charge.
+  const generationEntry: any = {
+    ...crashEntry,
+    dealId: 3903,
+    proxyKey: "cpk_live_generation_recovery_test",
+    provider: "OpenRouter",
+    apiKey: "sk-or-v1-generation-recovery-test",
+    usedUsd: 0,
+    tokensTotal: 0,
+    usageReceipts: [],
+    processedGenerationIds: [],
+    pendingUsage: null,
+  };
+  stagePendingUsage(generationEntry, "gpt-4o", toolReservation, 64);
+  generationEntry.pendingUsage = { ...generationEntry.pendingUsage, generationId: "gen-recovery-exact" };
+  meteringStateStore.save(generationEntry);
+  const fetchBeforeGenerationRecovery = globalThis.fetch;
+  globalThis.fetch = (async (url: string | URL | Request) => {
+    assert(String(url).includes("/api/v1/generation?id=gen-recovery-exact"), "Recovery queried the wrong OpenRouter generation");
+    return new Response(JSON.stringify({
+      data: { total_cost: 0.0017, tokens_prompt: 13, tokens_completion: 7 },
+    }), { status: 200, headers: { "content-type": "application/json" } });
+  }) as typeof fetch;
+  const recoveredUsage = await reconcilePendingUsage(generationEntry);
+  globalThis.fetch = fetchBeforeGenerationRecovery;
+  assert(Math.abs((recoveredUsage?.costUsd || 0) - 0.0017) < 1e-12, "Generation recovery did not use OpenRouter's actual cost");
+  assert(generationEntry.pendingUsage === null, "Resolved OpenRouter generation was left pending");
+  assert(generationEntry.usageReceipts.at(-1)?.source === "openrouter_generation", "Recovered receipt did not record generation-cost provenance");
 
   const legacyEntry: any = {
     ...entry,

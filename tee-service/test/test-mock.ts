@@ -26,7 +26,6 @@ export function handleMockChatCompletion(
     entry.signedPayloads.push(stg);
   }
   if (newStages.length) void settlementEngine.relayStages(entry, newStages);
-  if (entry.usedUsd >= entry.creditUsd) entry.active = false;
   meterEvents.publish(entry, newStages.length ? "stage" : "usage", newStages.map((stage) => stage.payload.stage));
 
   const testContent = `[Mock Test Engine]: ${Array.isArray(body.messages) ? (body.messages[body.messages.length - 1]?.content || "ok") : "ok"}`;
@@ -97,7 +96,6 @@ export function handleMockAnthropicMessage(
     entry.signedPayloads.push(stg);
   }
   if (newStages.length) void settlementEngine.relayStages(entry, newStages);
-  if (entry.usedUsd >= entry.creditUsd) entry.active = false;
   meterEvents.publish(entry, newStages.length ? "stage" : "usage", newStages.map((stage) => stage.payload.stage));
 
   const testContent = `[Mock Test Engine]: ${Array.isArray(body.messages) ? (body.messages[body.messages.length - 1]?.content || "ok") : "ok"}`;

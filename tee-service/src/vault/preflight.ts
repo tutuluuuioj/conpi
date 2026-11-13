@@ -58,6 +58,10 @@ export interface KeyCheckResult {
   activationTxHash?: string;
 }
 
+export function shouldKeepVaultEntryActive(onChainStatus: string): boolean {
+  return !["Completed", "Defaulted", "Cancelled"].includes(onChainStatus);
+}
+
 let cachedNearPriceUsd: { price: number; fetchedAt: number } | null = null;
 
 export async function fetchLiveNearPriceUsd(): Promise<number> {
@@ -429,7 +433,11 @@ class KeyVault {
       requestInFlight: false,
       rateLimitPerMinute: CONFIG.rateLimitPerMinute,
       creditAmountYocto: resolvedCreditYocto,
-      active: (persistedState?.usedUsd || 0) < resolvedCreditUsd,
+      // "active" controls deal recovery and proxy authentication, not the
+      // budget cap.  A fully consumed on-chain Active deal must remain in the
+      // recovery loop until its final stage is actually settled.  New model
+      // calls are independently rejected by the budget admission check.
+      active: shouldKeepVaultEntryActive(resolvedStatus),
       registeredAt: new Date().toISOString(),
       signedPayloads: [],
       lastCheckpointAt: Date.now(),

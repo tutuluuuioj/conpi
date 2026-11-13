@@ -412,17 +412,18 @@ async function runTests() {
   }
   console.log("PASS: creditUsd, priceUsd, and creditAmountYocto successfully derived from on-chain deal state.");
 
-  // 10. Locked Price Metering (provider-reported prices cannot mutate a deal)
-  console.log("\n[Test 10] Testing Locked Price Metering...");
+  // 10. Non-OpenRouter providers remain billed from the immutable price table.
+  // OpenRouter's completed usage.cost is covered separately by Phase 3 tests.
+  console.log("\n[Test 10] Testing Non-OpenRouter Locked Price Metering...");
   const entryForCost = keyVault.getByDealId(1)!;
   const openRouterReportedCost = 0.000009747;
   const lockedCost = calculateCost("gpt-4o", 12, 10, 0, entryForCost.lockedPricing).costUsd;
-  console.log("  Provider-reported cost (ignored):", openRouterReportedCost);
+  console.log("  Untrusted provider-reported cost (ignored for this OpenAI deal):", openRouterReportedCost);
   console.log("  Locked-table cost:", lockedCost);
   if (Math.abs(lockedCost - openRouterReportedCost) < 0.000000001) {
     throw new Error("Provider-reported price unexpectedly overrode the locked price table");
   }
-  console.log("PASS: Meter prices exact provider token counts only against the immutable deal table.");
+  console.log("PASS: Non-OpenRouter metering prices exact provider token counts against the immutable deal table.");
 
   // 11. Provider Ban Automatic Detection Test
   console.log("\n[Test 11] Testing Provider Ban Automatic Detection...");
