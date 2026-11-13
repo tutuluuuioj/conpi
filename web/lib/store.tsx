@@ -2251,10 +2251,16 @@ export function Providers({ children }: { children: React.ReactNode }) {
 
           const ticket = await submitPartyTermsToTee(deal, "seller");
           if (!ticket.matched) {
+            const bothSubmitted = ticket.buyerSubmitted && ticket.sellerSubmitted;
+            const mismatchFields = ticket.diffFields?.length
+              ? ` Differing terms: ${ticket.diffFields.join(", ")}.`
+              : "";
             pushToast({
               kind: "error",
-              title: "Buyer TEE confirmation required",
-              body: `Connect ${deal.buyer} and submit the encrypted terms before retrying the provider key.`,
+              title: bothSubmitted ? "TEE terms do not match" : "Buyer TEE confirmation required",
+              body: bothSubmitted
+                ? `Both parties submitted encrypted terms, but they differ.${mismatchFields} Reload the deal with the active buyer wallet and submit the exact listing terms again before retrying the provider key.`
+                : `Connect ${deal.buyer} and submit the encrypted terms before retrying the provider key.`,
             });
             return;
           }
