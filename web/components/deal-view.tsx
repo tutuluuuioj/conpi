@@ -536,7 +536,7 @@ export function DealView({ id }: { id: string }) {
   // buyer's encrypted term sheet once while their matching wallet is present.
   useEffect(() => {
     if (!deal || !app.nearAccount || app.walletChain !== "near") return;
-    if (!["Funded", "Active"].includes(deal.status) || deal.buyerSubmitted) return;
+    if (!["Funded", "Active"].includes(deal.status) || (deal.buyerSubmitted && deal.matched)) return;
     if (app.nearAccount.trim().toLowerCase() !== deal.buyer.trim().toLowerCase()) return;
     const attemptKey = `${deal.id}:${buyerTermsRepairAttempt}`;
     if (buyerTermsRepairRef.current === attemptKey) return;

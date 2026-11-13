@@ -464,8 +464,11 @@ function mapOnChainDeal(
   const sellerDeposited = Boolean(existing?.sellerDeposited || vaultSeller || (requiredSellerDeposit > BigInt(0) && currentSellerDeposit >= requiredSellerDeposit));
   const buyerDepositRemainingYocto = isForeignFunded ? BigInt(0) : (requiredBuyerDeposit > currentBuyerDeposit ? requiredBuyerDeposit - currentBuyerDeposit : BigInt(0));
   const sellerDepositRemainingYocto = requiredSellerDeposit > currentSellerDeposit ? requiredSellerDeposit - currentSellerDeposit : BigInt(0);
-  const buyerSubmitted = Boolean(d.terms_submitted_by_buyer ?? d.terms_hash?.length);
-  const sellerSubmitted = Boolean(d.terms_submitted_by_seller ?? raw.counterparty_accepted);
+  // An on-chain terms hash only binds the escrow terms; it does not prove that
+  // either party has encrypted the matching term sheet to the TEE. Preserve
+  // the TEE ticket state locally until its polling response refreshes it.
+  const buyerSubmitted = existingDeal?.buyerSubmitted ?? Boolean(d.terms_submitted_by_buyer);
+  const sellerSubmitted = existingDeal?.sellerSubmitted ?? Boolean(d.terms_submitted_by_seller);
   const currentStage = Number(d.current_stage ?? raw.stage_reached ?? raw.last_signed?.stage ?? 0);
 
   // A browser can have the buyer's NEAR wallet and seller's Solana wallet
@@ -597,9 +600,11 @@ function mapOnChainDeal(
     sellerCanonical: d.seller,
     deadline: defaultTerms.deadline,
     termsHash: termsHashHex,
+    matched: existingDeal?.matched ?? false,
     counterpartyAccepted,
     buyerSubmitted,
     sellerSubmitted,
+    termDiffFields: existingDeal?.termDiffFields ?? [],
     buyerTerms: defaultTerms,
     sellerTerms: defaultTerms,
     buyerDeposited,
