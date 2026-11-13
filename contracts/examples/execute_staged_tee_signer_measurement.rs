@@ -7,7 +7,7 @@ use std::path::Path;
 
 const ESCROW_ID: &str = "dev-20261103062448-30583839049419.testnet";
 const DSTACK_HARDWARE_SIGNER: &str = "ed25519:F4YtyCFTEj9rca8fJQxcQd7F1UHuuGQBxP8WmcAC7cbi";
-const HARDWARE_MEASUREMENT: &str = "mrtd:7fe60787222bd394cb516abca2435f22f035ab2cc9c0a4b4b3b148e46297f3d931a237b72f359052c6e657d8c1409173|compose:557feb0b971efff249c80a9e4ddd3546a89dab75902250fb10608bab61cd118a";
+const HARDWARE_MEASUREMENT: &str = "mrtd:7fe60787222bd394cb516abca2435f22f035ab2cc9c0a4b4b3b148e46297f3d931a237b72f359052c6e657d8c1409173|compose:c0e721177e14f30af1b8dcca1cbc7fb0e828c035a6551909810e938d109b8182";
 
 #[derive(Deserialize)]
 struct MemberKeyEntry { secret_key: String }
