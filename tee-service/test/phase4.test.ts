@@ -77,6 +77,42 @@ async function runPhase4Tests() {
       Buffer.from(item.signatureHex, "hex")
     )), "A stage payload signature is invalid");
 
+    console.log("[P4-1b] A checkpoint cannot interleave a multi-stage payout batch...");
+    settlementEngine.resetForTests();
+    meterEngine.reset(4011);
+    const batchedEntry = entry(4011, 80);
+    const batchedChain = { status: "Active", stage_reached: 0, last_nonce: 1 };
+    const relayOrder: string[] = [];
+    let interleavedCheckpoint: Promise<any> | undefined;
+    (nearRelayer as any).getDeal = async (dealId: number) => dealId === 4011 ? { ...batchedChain } : null;
+    (nearRelayer as any).submitReleaseStage = async (_dealId: number, stage: number, payload: any) => {
+      if (stage === 25) {
+        interleavedCheckpoint = settlementEngine.createAndRelayCheckpoint(batchedEntry);
+        // Let checkpoint creation enqueue while the first stage is in-flight.
+        await Promise.resolve();
+      }
+      assert(Number(payload.nonce) > batchedChain.last_nonce, "A checkpoint invalidated a queued stage nonce");
+      relayOrder.push(`stage-${stage}`);
+      batchedChain.stage_reached = stage;
+      batchedChain.last_nonce = Number(payload.nonce);
+      return { transactionHash: `batch-stage-${stage}`, status: { SuccessValue: "" } };
+    };
+    (nearRelayer as any).submitCheckpoint = async (_dealId: number, payload: any) => {
+      assert(Number(payload.nonce) > batchedChain.last_nonce, "Checkpoint nonce did not follow staged payouts");
+      relayOrder.push("checkpoint");
+      batchedChain.last_nonce = Number(payload.nonce);
+      return { transactionHash: "batch-checkpoint", status: { SuccessValue: "" } };
+    };
+    meterEngine.seedNonce(4011, 1);
+    const batchedStages = meterEngine.checkAndEmitStages(batchedEntry, batchedEntry.termsHashHex);
+    batchedEntry.signedPayloads.push(...batchedStages);
+    await settlementEngine.relayStages(batchedEntry, batchedStages);
+    await interleavedCheckpoint;
+    assert(
+      relayOrder.join(",") === "stage-25,stage-50,stage-75,checkpoint",
+      `Checkpoint interleaved a staged payout batch: ${relayOrder.join(",")}`
+    );
+
     console.log("[P4-2] Periodic checkpoints sign exact metered usage and refresh liveness...");
     settlementEngine.resetForTests();
     meterEngine.reset(4002);

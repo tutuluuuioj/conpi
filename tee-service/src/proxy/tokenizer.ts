@@ -53,6 +53,32 @@ export function countChatInputTokens(
   return total + 2;
 }
 
+/**
+ * Count the full text-only request that the model receives when an upstream
+ * response does not contain usage metadata.  This is deliberately separate
+ * from the byte-level reservation below: reservations protect the credit cap,
+ * while settled accounting must reflect the request and response actually
+ * exchanged rather than the maximum output that was permitted.
+ */
+export function countChatRequestTokens(
+  provider: string,
+  model: string,
+  body: unknown
+): number {
+  const request = body && typeof body === "object" ? body as Record<string, unknown> : {};
+  const messageTokens = countChatInputTokens(provider, model, request.messages, request.system);
+  const requestMetadata = {
+    tools: request.tools,
+    functions: request.functions,
+    response_format: request.response_format,
+    tool_choice: request.tool_choice,
+    function_call: request.function_call,
+    parallel_tool_calls: request.parallel_tool_calls,
+  };
+  const metadata = JSON.stringify(requestMetadata);
+  return messageTokens + (metadata === "{}" ? 0 : countTextTokens(provider, model, metadata));
+}
+
 export function countEmbeddingInputTokens(provider: string, model: string, input: unknown): number {
   if (Array.isArray(input)) {
     return input.reduce((sum, item) => sum + countTextTokens(provider, model, contentToText(item)), 0);

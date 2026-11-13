@@ -20,7 +20,7 @@ import {
   stagePendingUsage,
   validatePricedOpenRouterRequest,
 } from "../src/proxy/server.js";
-import { conservativeChatRequestTokenUpperBound, countChatInputTokens, countEmbeddingInputTokens } from "../src/proxy/tokenizer.js";
+import { conservativeChatRequestTokenUpperBound, countChatInputTokens, countChatRequestTokens, countEmbeddingInputTokens } from "../src/proxy/tokenizer.js";
 import { enclaveKeys } from "../src/crypto/keys.js";
 import { privateKeyToAccount } from "viem/accounts";
 import { buildSellerKeyAuthorizationMessage, canonicalSellerAccount } from "../src/auth/seller-key.js";
@@ -33,7 +33,7 @@ function assert(condition: unknown, message: string): asserts condition {
 
 async function runPhase3Tests() {
   console.log("=== RUNNING CONPI PHASE 3 ACCEPTANCE TESTS ===");
-  assert(CONFIG.upstreamFetchTimeoutMs === 60_000, `Expected 60000ms upstream timeout, got ${CONFIG.upstreamFetchTimeoutMs}`);
+  assert(CONFIG.upstreamFetchTimeoutMs === 300_000, `Expected 300000ms upstream timeout, got ${CONFIG.upstreamFetchTimeoutMs}`);
   assert(CONFIG.websocketAuthTimeoutMs === 10_000, `Expected 10000ms websocket timeout, got ${CONFIG.websocketAuthTimeoutMs}`);
   assert(CONFIG.checkpointIntervalMs === 300_000, `Expected 300000ms checkpoint interval, got ${CONFIG.checkpointIntervalMs}`);
 
@@ -129,6 +129,8 @@ async function runPhase3Tests() {
   };
   const toolReservation = conservativeChatRequestTokenUpperBound(toolHeavyRequest);
   assert(toolReservation > 80_000, `Tool-heavy request was under-reserved at ${toolReservation} tokens`);
+  const toolMeteredTokens = countChatRequestTokens("OpenAI", "gpt-4o", toolHeavyRequest);
+  assert(toolMeteredTokens > 10_000, `Tool-heavy request was not included in local settled metering at ${toolMeteredTokens} tokens`);
 
   console.log("[P3-3] Proxy authentication, allowlist, and model discovery...");
   const unauthModels = await app.inject({ method: "GET", url: "/v1/models" });
@@ -236,7 +238,7 @@ async function runPhase3Tests() {
     method: "POST",
     url: "/v1/chat/completions",
     headers: auth,
-    payload: { model: "gpt-4o", max_tokens: 8, messages: [{ role: "user", content: "meter without provider usage" }] },
+    payload: { model: "gpt-4o", max_tokens: 1_000, messages: [{ role: "user", content: "meter without provider usage" }] },
   });
   const fallbackBody = JSON.parse(fallbackResponse.body);
   const fallbackExpected = calculateCost(
@@ -249,11 +251,12 @@ async function runPhase3Tests() {
   assert(fallbackResponse.statusCode === 200, `Tokenizer fallback request failed: ${fallbackResponse.body}`);
   assert(fallbackBody.usage?.prompt_tokens > 0 && fallbackBody.usage?.completion_tokens > 0, "Tokenizer fallback did not synthesize usage");
   assert(
-    fallbackBody.usage?.conpi_usage_source === "locked_pricing_reserved",
-    "Missing provider usage was not charged from the fail-safe reservation"
+    fallbackBody.usage?.conpi_usage_source === "locked_pricing_tokenizer",
+    "Missing provider usage was not charged from actual local token counts"
   );
+  assert(fallbackBody.usage?.completion_tokens < 1_000, "A completed response without usage metadata was charged its maximum reservation");
   assert(Math.abs(fallbackBody.usage.conpi_cost_usd - fallbackExpected.costUsd) < 1e-12, "Tokenizer fallback was not charged against the locked table");
-  assert(entry.usageReceipts.at(-1)?.source === "locked_pricing_reserved", "Reserved fallback provenance was not written to the signed ledger");
+  assert(entry.usageReceipts.at(-1)?.source === "locked_pricing_tokenizer", "Tokenizer fallback provenance was not written to the signed ledger");
 
   const malformedLimit = await app.inject({
     method: "POST",
@@ -522,8 +525,23 @@ async function runPhase3Tests() {
   globalThis.fetch = timeoutFetch;
   entry.apiKey = savedKeyForAmbiguousFailure;
   assert(ambiguousFailure.statusCode === 502, "Ambiguous upstream failure did not return a proxy error");
-  assert(entry.usedUsd > usedBeforeAmbiguousFailure, "Ambiguous upstream failure was not charged from its durable reservation");
-  assert(entry.pendingUsage === null && entry.usageReceipts.at(-1)?.source === "locked_pricing_reserved", "Ambiguous charge reservation was not settled exactly once");
+  assert(entry.usedUsd === usedBeforeAmbiguousFailure, "Ambiguous upstream failure was incorrectly charged its durable reservation");
+  assert(entry.pendingUsage !== null, "Ambiguous upstream failure did not retain its durable reservation");
+  const savedKeyForPendingBlock = entry.apiKey;
+  entry.apiKey = "sk-real-shape-for-pending-block";
+  const blockedAfterAmbiguous = await app.inject({
+    method: "POST",
+    url: "/v1/chat/completions",
+    headers: auth,
+    payload: { model: "gpt-4o", max_tokens: 1, messages: [{ role: "user", content: "must remain blocked" }] },
+  });
+  assert(
+    blockedAfterAmbiguous.statusCode === 409 && blockedAfterAmbiguous.body.includes("usage_confirmation_pending"),
+    `An unresolved reservation did not block further calls: ${blockedAfterAmbiguous.statusCode} ${blockedAfterAmbiguous.body}`
+  );
+  entry.apiKey = savedKeyForPendingBlock;
+  entry.pendingUsage = null;
+  meteringStateStore.save(entry);
 
   console.log("[P3-12b] Crash-safe pending charge reservation...");
   const crashEntry: any = {
@@ -552,10 +570,33 @@ async function runPhase3Tests() {
     processedGenerationIds: persistedPending.processedGenerationIds,
     pendingUsage: persistedPending.pendingUsage,
   };
-  const recoveredUsage = await reconcilePendingUsage(recoveredEntry);
-  assert(Boolean(recoveredUsage) && recoveredEntry.usedUsd > 0, "Restart recovery did not commit the pending charge");
-  assert(recoveredEntry.pendingUsage === null, "Recovered pending charge was not settled");
-  assert(recoveredEntry.usageReceipts[0]?.source === "locked_pricing_reserved", "Recovered charge was not marked as a reservation fallback");
+  let recoveryHeld = false;
+  try {
+    await reconcilePendingUsage(recoveredEntry);
+  } catch (error: any) {
+    recoveryHeld = /unresolved/i.test(error?.message || "");
+  }
+  assert(recoveryHeld, "Restart recovery did not keep an unconfirmed request on hold");
+  assert(recoveredEntry.usedUsd === 0 && recoveredEntry.pendingUsage !== null, "Restart recovery converted an unresolved reservation into usage");
+
+  const legacyEntry: any = {
+    ...entry,
+    dealId: 3902,
+    proxyKey: "cpk_live_legacy_reservation_test",
+    apiKey: "sk-real-shape-for-legacy-block",
+    usageReceipts: [{ ...entry.usageReceipts[0], source: "locked_pricing_reserved" }],
+    pendingUsage: null,
+    requestInFlight: false,
+  };
+  (keyVault as any).entries.set(legacyEntry.dealId, legacyEntry);
+  (keyVault as any).proxyKeyToDealId.set(legacyEntry.proxyKey, legacyEntry.dealId);
+  const legacyBlocked = await app.inject({
+    method: "POST",
+    url: "/v1/chat/completions",
+    headers: { authorization: `Bearer ${legacyEntry.proxyKey}` },
+    payload: { model: "gpt-4o", max_tokens: 1, messages: [{ role: "user", content: "must not add to a legacy reservation" }] },
+  });
+  assert(legacyBlocked.statusCode === 409 && legacyBlocked.body.includes("legacy_unconfirmed_charge"), "A legacy reservation charge was allowed to continue");
 
   console.log("[P3-13] TEE relays activation for non-NEAR wallets...");
   const originalIsConfigured = nearRelayer.isConfigured.bind(nearRelayer);

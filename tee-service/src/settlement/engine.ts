@@ -74,6 +74,14 @@ export class SettlementEngine {
     if (!nearRelayer.isConfigured()) return [];
     const recovered: RelayReceipt[] = [];
     for (const entry of entries.filter((item) => item.active)) {
+      // Images released before the hold/settle split could convert a request
+      // reservation into metered usage after a timeout.  Do not release any
+      // further money from that historical, unverifiable reservation; it
+      // requires an explicit correction rather than automated settlement.
+      if (entry.usageReceipts?.some((receipt) => receipt.source === "locked_pricing_reserved")) {
+        console.warn("[conpi:stage-recovery-held-reservation]", { dealId: entry.dealId });
+        continue;
+      }
       const deal = await nearRelayer.getDeal(entry.dealId).catch(() => null);
       if (!deal || statusName(deal.status) !== "Active") continue;
       meterEngine.seedNonce(entry.dealId, BigInt(deal.last_nonce || 0));
@@ -108,9 +116,10 @@ export class SettlementEngine {
   }
 
   public async relayStages(entry: VaultEntry, payloads: SignedEnvelope[]): Promise<RelayReceipt[]> {
-    const receipts: RelayReceipt[] = [];
-    for (const payload of payloads) receipts.push(await this.relayStage(entry, payload));
-    return receipts;
+    // Enqueue the whole batch synchronously.  A checkpoint must not acquire
+    // the per-deal queue between stage 25 and stage 50, otherwise it advances
+    // the contract nonce and invalidates the remaining staged payouts.
+    return Promise.all(payloads.map((payload) => this.relayStage(entry, payload)));
   }
 
   public relayStage(entry: VaultEntry, signed: SignedEnvelope): Promise<RelayReceipt> {

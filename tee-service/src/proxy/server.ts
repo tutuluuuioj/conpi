@@ -12,7 +12,7 @@ import { proxyRateLimiter } from "./rate-limit.js";
 import {
   conservativeChatRequestTokenUpperBound,
   conservativeEmbeddingInputTokenUpperBound,
-  countChatInputTokens,
+  countChatRequestTokens,
   countEmbeddingInputTokens,
   countTextTokens,
   extractText,
@@ -110,23 +110,11 @@ function providerKind(entry: VaultEntry): ProviderKind {
 export async function reconcilePendingUsage(entry: VaultEntry): Promise<UsageResult | null> {
   const pending = entry.pendingUsage;
   if (!pending) return null;
-  // Migration path for a charge staged by the previous reconciliation-based
-  // image. Commit it from its already persisted token counts and locked prices;
-  // no OpenRouter generation or account-usage query is performed.
-  return recordUsage(
-    entry,
-    pending.model,
-    pending.inputTokens,
-    pending.outputTokens,
-    pending.cachedTokens,
-    undefined,
-    pending.generationId || undefined,
-    "locked_pricing_reserved",
-    {
-      cacheWriteTokens: pending.cacheWriteTokens,
-      reasoningTokens: pending.reasoningTokens,
-    }
-  );
+  // A reservation is a credit hold, not usage.  A timeout or a broken stream
+  // does not prove that the provider generated the full requested completion.
+  // Leave the deal blocked until a result can be confirmed; never turn the
+  // maximum reservation into a seller payout.
+  throw new Error(`The previous provider request for deal #${entry.dealId} is unresolved; its reserved credit remains locked and has not been charged`);
 }
 
 export function stagePendingUsage(
@@ -149,7 +137,7 @@ export function stagePendingUsage(
     attempts: 0,
   };
   // Persist first. No provider request is allowed until this fsynced commit
-  // succeeds, so a crash or broken stream always leaves a recoverable charge.
+  // succeeds, so a crash or broken stream always leaves a recoverable hold.
   meteringStateStore.save({ ...entry, pendingUsage: pending });
   entry.pendingUsage = pending;
 }
@@ -160,17 +148,16 @@ function clearPendingUsage(entry: VaultEntry): void {
   entry.pendingUsage = null;
 }
 
-async function settleAmbiguousPendingCharge(entry: VaultEntry): Promise<void> {
+function retainAmbiguousPendingReservation(entry: VaultEntry): void {
   if (!entry.pendingUsage) return;
-  try {
-    await reconcilePendingUsage(entry);
-  } catch (error: any) {
-    console.error("[conpi:pending-charge]", {
-      dealId: entry.dealId,
-      generationId: entry.pendingUsage?.generationId || null,
-      error: error?.message || String(error),
-    });
-  }
+  const pendingUsage = {
+    ...entry.pendingUsage,
+    attempts: entry.pendingUsage.attempts + 1,
+    lastError: "Provider result was not confirmed; reservation is held without charging usage",
+  };
+  meteringStateStore.save({ ...entry, pendingUsage });
+  entry.pendingUsage = pendingUsage;
+  meterEvents.publish(entry, "usage");
 }
 
 interface LocalUsageCommit {
@@ -182,15 +169,15 @@ interface LocalUsageCommit {
   cacheWriteTokens?: number;
   reasoningTokens?: number;
   reservedFallback?: boolean;
+  source?: UsageCostSource;
 }
 
 async function finalizeProviderUsage(
   entry: VaultEntry,
   usageData: LocalUsageCommit
 ): Promise<{ usage: UsageResult; generationId?: string; source: string }> {
-  const source: UsageCostSource = usageData.reservedFallback
-    ? "locked_pricing_reserved"
-    : "locked_pricing";
+  const source: UsageCostSource = usageData.source
+    ?? (usageData.reservedFallback ? "locked_pricing_reserved" : "locked_pricing");
   return {
     usage: recordUsage(
       entry,
@@ -251,21 +238,30 @@ async function acquireBillingLock(entry: VaultEntry, reply: FastifyReply): Promi
       else billingQueueWaiters.delete(entry.dealId);
     }
   }
-  entry.requestInFlight = true;
-  try {
-    await reconcilePendingUsage(entry);
-    return true;
-  } catch (error: any) {
-    entry.requestInFlight = false;
+  // Releases from pre-fix images may contain a charge made from an unresolved
+  // maximum reservation.  Never add another request or payout on top of that
+  // unverifiable balance; the operator must correct the affected deal first.
+  if (entry.usageReceipts?.some((receipt) => receipt.source === "locked_pricing_reserved")) {
     reply.status(409).send({
       error: {
-        message: error.message,
-        code: "cost_reconciliation_pending",
+        message: "This deal contains a legacy unconfirmed reservation and is frozen for correction. No further usage or payout will be processed automatically.",
+        code: "legacy_unconfirmed_charge",
+      },
+    });
+    return false;
+  }
+  if (entry.pendingUsage) {
+    reply.status(409).send({
+      error: {
+        message: "A previous provider request is still unresolved. Its credit is reserved but it has not been charged.",
+        code: "usage_confirmation_pending",
         generationId: entry.pendingUsage?.generationId || null,
       },
     });
     return false;
   }
+  entry.requestInFlight = true;
+  return true;
 }
 
 function openAiBaseUrl(kind: ProviderKind): string {
@@ -659,8 +655,7 @@ async function streamOpenAiResponse(
   model: string,
   fallbackInputTokens: number,
   transformToAnthropic = false,
-  maxOutputLimit = Infinity,
-  reservedInputTokens = fallbackInputTokens
+  maxOutputLimit = Infinity
 ) {
   reply.raw.setHeader("Content-Type", "text/event-stream");
   reply.raw.setHeader("Cache-Control", "no-cache, no-transform");
@@ -728,13 +723,9 @@ async function streamOpenAiResponse(
     }
   }
 
-  const reservedFallback = !(providerInputSeen && providerOutputSeen);
-  if (reservedFallback) {
-    inputTokens = Math.max(inputTokens, fallbackInputTokens, reservedInputTokens);
-    outputTokens = Number.isFinite(maxOutputLimit)
-      ? Math.max(outputTokens, Math.floor(maxOutputLimit))
-      : Math.max(outputTokens, countTextTokens(entry.provider, model, outputText));
-  }
+  const tokenizerFallback = !(providerInputSeen && providerOutputSeen);
+  if (!providerInputSeen) inputTokens = fallbackInputTokens;
+  if (!providerOutputSeen) outputTokens = countTextTokens(entry.provider, model, outputText);
   try {
     const committed = await finalizeProviderUsage(entry, {
       generationId: generationId || null,
@@ -744,7 +735,7 @@ async function streamOpenAiResponse(
       cachedTokens,
       cacheWriteTokens,
       reasoningTokens,
-      reservedFallback,
+      source: tokenizerFallback ? "locked_pricing_tokenizer" : "locked_pricing",
     });
     const usage = committed.usage;
     const usageSource = committed.source;
@@ -757,7 +748,7 @@ async function streamOpenAiResponse(
       reply.raw.write("data: [DONE]\n\n");
     }
   } catch (error: any) {
-    await settleAmbiguousPendingCharge(entry);
+    retainAmbiguousPendingReservation(entry);
     const payload = { error: { message: error.message, code: "meter_commit_failed" } };
     if (transformToAnthropic) reply.raw.write(`event: error\ndata: ${JSON.stringify(payload)}\n\n`);
     else reply.raw.write(`data: ${JSON.stringify(payload)}\n\ndata: [DONE]\n\n`);
@@ -773,8 +764,7 @@ async function streamAnthropicResponse(
   model: string,
   fallbackInputTokens: number,
   transformToOpenAi = false,
-  maxOutputLimit = Infinity,
-  reservedInputTokens = fallbackInputTokens
+  maxOutputLimit = Infinity
 ) {
   reply.raw.setHeader("Content-Type", "text/event-stream");
   reply.raw.setHeader("Cache-Control", "no-cache, no-transform");
@@ -837,14 +827,10 @@ async function streamAnthropicResponse(
       }
     }
   }
-  const reservedFallback = !(providerInputSeen && providerOutputSeen);
-  if (reservedFallback) {
-    inputTokens = Math.max(inputTokens, fallbackInputTokens, reservedInputTokens);
-    outputTokens = Number.isFinite(maxOutputLimit)
-      ? Math.max(outputTokens, Math.floor(maxOutputLimit))
-      : Math.max(outputTokens, countTextTokens(entry.provider, model, outputText));
-  }
-  const meteredInputTokens = reservedFallback ? inputTokens : inputTokens + cachedTokens + cacheWriteTokens;
+  const tokenizerFallback = !(providerInputSeen && providerOutputSeen);
+  if (!providerInputSeen) inputTokens = fallbackInputTokens;
+  if (!providerOutputSeen) outputTokens = countTextTokens(entry.provider, model, outputText);
+  const meteredInputTokens = providerInputSeen ? inputTokens + cachedTokens + cacheWriteTokens : inputTokens;
   const usage = recordUsage(
     entry,
     model,
@@ -853,11 +839,11 @@ async function streamAnthropicResponse(
     cachedTokens,
     undefined,
     undefined,
-    reservedFallback ? "locked_pricing_reserved" : "locked_pricing",
+    tokenizerFallback ? "locked_pricing_tokenizer" : "locked_pricing",
     { cacheWriteTokens }
   );
   if (transformToOpenAi) {
-    reply.raw.write(`data: ${JSON.stringify({ id: `chatcmpl-${Date.now()}`, object: "chat.completion.chunk", created: Math.floor(Date.now() / 1000), model, choices: [{ index: 0, delta: {}, finish_reason: "stop" }], usage: { prompt_tokens: meteredInputTokens, completion_tokens: outputTokens, total_tokens: meteredInputTokens + outputTokens, prompt_tokens_details: { cached_tokens: cachedTokens, cache_write_tokens: cacheWriteTokens }, conpi_cost_usd: usage.costUsd, conpi_usage_source: reservedFallback ? "locked_pricing_reserved" : "locked_pricing" } })}\n\n`);
+    reply.raw.write(`data: ${JSON.stringify({ id: `chatcmpl-${Date.now()}`, object: "chat.completion.chunk", created: Math.floor(Date.now() / 1000), model, choices: [{ index: 0, delta: {}, finish_reason: "stop" }], usage: { prompt_tokens: meteredInputTokens, completion_tokens: outputTokens, total_tokens: meteredInputTokens + outputTokens, prompt_tokens_details: { cached_tokens: cachedTokens, cache_write_tokens: cacheWriteTokens }, conpi_cost_usd: usage.costUsd, conpi_usage_source: tokenizerFallback ? "locked_pricing_tokenizer" : "locked_pricing" } })}\n\n`);
     reply.raw.write("data: [DONE]\n\n");
   }
   return reply.raw.end();
@@ -880,7 +866,7 @@ export async function handleChatCompletions(req: FastifyRequest, reply: FastifyR
       });
     }
   }
-  const inputTokens = countChatInputTokens(entry.provider, model, body.messages);
+  const inputTokens = countChatRequestTokens(entry.provider, model, body);
   const reservedInputTokens = Math.max(inputTokens, conservativeChatRequestTokenUpperBound(body));
   const affordableOutputTokens = computeAffordableOutputTokens(entry, model, reservedInputTokens);
   if (affordableOutputTokens <= 0) {
@@ -929,19 +915,19 @@ export async function handleChatCompletions(req: FastifyRequest, reply: FastifyR
         method: "POST", headers: providerHeaders(entry, kind), body: JSON.stringify(openAiMessagesToAnthropic(forwardBody)),
       });
       if (!response.ok) return handleProviderFailure(response, entry, reply);
-      if (body.stream) return await streamAnthropicResponse(response, reply, entry, model, inputTokens, true, effectiveMaxTokens, reservedInputTokens);
+      if (body.stream) return await streamAnthropicResponse(response, reply, entry, model, inputTokens, true, effectiveMaxTokens);
       const data: any = await response.json();
       const outputText = extractText(data.content);
       const providerUsageSeen = Number.isFinite(Number(data.usage?.input_tokens)) && Number.isFinite(Number(data.usage?.output_tokens));
       const cachedTokens = providerUsageSeen ? Number(data.usage?.cache_read_input_tokens || 0) : 0;
       const cacheWriteTokens = providerUsageSeen ? Number(data.usage?.cache_creation_input_tokens || 0) : 0;
-      const finalInput = providerUsageSeen ? Number(data.usage.input_tokens) + cachedTokens + cacheWriteTokens : reservedInputTokens;
-      const finalOutput = providerUsageSeen ? Number(data.usage.output_tokens) : effectiveMaxTokens;
-      const usage = recordUsage(entry, model, finalInput, finalOutput, cachedTokens, undefined, undefined, providerUsageSeen ? "locked_pricing" : "locked_pricing_reserved", { cacheWriteTokens });
+      const finalInput = providerUsageSeen ? Number(data.usage.input_tokens) + cachedTokens + cacheWriteTokens : inputTokens;
+      const finalOutput = providerUsageSeen ? Number(data.usage.output_tokens) : countTextTokens(entry.provider, model, outputText);
+      const usage = recordUsage(entry, model, finalInput, finalOutput, cachedTokens, undefined, undefined, providerUsageSeen ? "locked_pricing" : "locked_pricing_tokenizer", { cacheWriteTokens });
       return reply.send({
         id: `chatcmpl-${data.id || Date.now()}`, object: "chat.completion", created: Math.floor(Date.now() / 1000), model,
         choices: [{ index: 0, message: { role: "assistant", content: outputText }, finish_reason: data.stop_reason === "max_tokens" ? "length" : "stop" }],
-        usage: { prompt_tokens: finalInput, completion_tokens: finalOutput, total_tokens: finalInput + finalOutput, conpi_cost_usd: usage.costUsd, conpi_usage_source: providerUsageSeen ? "locked_pricing" : "locked_pricing_reserved" },
+        usage: { prompt_tokens: finalInput, completion_tokens: finalOutput, total_tokens: finalInput + finalOutput, conpi_cost_usd: usage.costUsd, conpi_usage_source: providerUsageSeen ? "locked_pricing" : "locked_pricing_tokenizer" },
       });
     }
 
@@ -950,12 +936,12 @@ export async function handleChatCompletions(req: FastifyRequest, reply: FastifyR
       body: JSON.stringify(requestWithProviderUsage(forwardBody, kind, entry.lockedPricing[model])),
     });
     if (!response.ok) return handleProviderFailure(response, entry, reply);
-    if (body.stream) return await streamOpenAiResponse(response, reply, entry, model, inputTokens, false, effectiveMaxTokens, reservedInputTokens);
+    if (body.stream) return await streamOpenAiResponse(response, reply, entry, model, inputTokens, false, effectiveMaxTokens);
     const data: any = await response.json();
     const outputText = extractText(data.choices?.[0]?.message?.content);
     const providerUsageSeen = Number.isFinite(Number(data.usage?.prompt_tokens)) && Number.isFinite(Number(data.usage?.completion_tokens));
-    const finalInput = providerUsageSeen ? Number(data.usage.prompt_tokens) : reservedInputTokens;
-    const finalOutput = providerUsageSeen ? Number(data.usage.completion_tokens) : effectiveMaxTokens;
+    const finalInput = providerUsageSeen ? Number(data.usage.prompt_tokens) : inputTokens;
+    const finalOutput = providerUsageSeen ? Number(data.usage.completion_tokens) : countTextTokens(entry.provider, model, outputText);
     const cachedTokens = Number(data.usage?.prompt_tokens_details?.cached_tokens || 0);
     const cacheWriteTokens = Number(data.usage?.prompt_tokens_details?.cache_write_tokens || 0);
     const reasoningTokens = Number(data.usage?.completion_tokens_details?.reasoning_tokens || 0);
@@ -967,13 +953,13 @@ export async function handleChatCompletions(req: FastifyRequest, reply: FastifyR
       cachedTokens,
       cacheWriteTokens,
       reasoningTokens,
-      reservedFallback: !providerUsageSeen,
+      source: providerUsageSeen ? "locked_pricing" : "locked_pricing_tokenizer",
     });
     const conpiUsageSource = committed.source;
     data.usage = { ...(data.usage || {}), prompt_tokens: finalInput, completion_tokens: finalOutput, total_tokens: finalInput + finalOutput, conpi_cost_usd: committed.usage.costUsd, conpi_usage_source: conpiUsageSource };
     return reply.status(response.status).send(data);
   } catch (err: any) {
-    await settleAmbiguousPendingCharge(entry);
+    retainAmbiguousPendingReservation(entry);
     return reply.status(502).send({ error: { message: err.message, code: "proxy_error" } });
   } finally {
     entry.requestInFlight = false;
@@ -997,7 +983,7 @@ export async function handleAnthropicMessages(req: FastifyRequest, reply: Fastif
       });
     }
   }
-  const inputTokens = countChatInputTokens(entry.provider, model, body.messages, body.system);
+  const inputTokens = countChatRequestTokens(entry.provider, model, body);
   const reservedInputTokens = Math.max(inputTokens, conservativeChatRequestTokenUpperBound(body));
   const affordableOutputTokens = computeAffordableOutputTokens(entry, model, reservedInputTokens);
   if (affordableOutputTokens <= 0) {
@@ -1045,16 +1031,16 @@ export async function handleAnthropicMessages(req: FastifyRequest, reply: Fastif
         method: "POST", headers: providerHeaders(entry, kind), body: JSON.stringify(forwardBody),
       });
       if (!response.ok) return handleProviderFailure(response, entry, reply, true);
-      if (body.stream) return await streamAnthropicResponse(response, reply, entry, model, inputTokens, false, effectiveMaxTokens, reservedInputTokens);
+      if (body.stream) return await streamAnthropicResponse(response, reply, entry, model, inputTokens, false, effectiveMaxTokens);
       const data: any = await response.json();
       const outputText = extractText(data.content);
       const providerUsageSeen = Number.isFinite(Number(data.usage?.input_tokens)) && Number.isFinite(Number(data.usage?.output_tokens));
       const cachedTokens = providerUsageSeen ? Number(data.usage?.cache_read_input_tokens || 0) : 0;
       const cacheWriteTokens = providerUsageSeen ? Number(data.usage?.cache_creation_input_tokens || 0) : 0;
-      const finalInput = providerUsageSeen ? Number(data.usage.input_tokens) + cachedTokens + cacheWriteTokens : reservedInputTokens;
-      const finalOutput = providerUsageSeen ? Number(data.usage.output_tokens) : effectiveMaxTokens;
-      const usage = recordUsage(entry, model, finalInput, finalOutput, cachedTokens, undefined, undefined, providerUsageSeen ? "locked_pricing" : "locked_pricing_reserved", { cacheWriteTokens });
-      data.usage = { ...(data.usage || {}), input_tokens: finalInput, output_tokens: finalOutput, conpi_cost_usd: usage.costUsd, conpi_usage_source: providerUsageSeen ? "locked_pricing" : "locked_pricing_reserved" };
+      const finalInput = providerUsageSeen ? Number(data.usage.input_tokens) + cachedTokens + cacheWriteTokens : inputTokens;
+      const finalOutput = providerUsageSeen ? Number(data.usage.output_tokens) : countTextTokens(entry.provider, model, outputText);
+      const usage = recordUsage(entry, model, finalInput, finalOutput, cachedTokens, undefined, undefined, providerUsageSeen ? "locked_pricing" : "locked_pricing_tokenizer", { cacheWriteTokens });
+      data.usage = { ...(data.usage || {}), input_tokens: finalInput, output_tokens: finalOutput, conpi_cost_usd: usage.costUsd, conpi_usage_source: providerUsageSeen ? "locked_pricing" : "locked_pricing_tokenizer" };
       return reply.send(data);
     }
 
@@ -1062,12 +1048,12 @@ export async function handleAnthropicMessages(req: FastifyRequest, reply: Fastif
       method: "POST", headers: providerHeaders(entry, kind), body: JSON.stringify(requestWithProviderUsage(anthropicMessagesToOpenAi(forwardBody), kind, entry.lockedPricing[model])),
     });
     if (!response.ok) return handleProviderFailure(response, entry, reply, true);
-    if (body.stream) return await streamOpenAiResponse(response, reply, entry, model, inputTokens, true, effectiveMaxTokens, reservedInputTokens);
+    if (body.stream) return await streamOpenAiResponse(response, reply, entry, model, inputTokens, true, effectiveMaxTokens);
     const data: any = await response.json();
     const outputText = extractText(data.choices?.[0]?.message?.content);
     const providerUsageSeen = Number.isFinite(Number(data.usage?.prompt_tokens)) && Number.isFinite(Number(data.usage?.completion_tokens));
-    const finalInput = providerUsageSeen ? Number(data.usage.prompt_tokens) : reservedInputTokens;
-    const finalOutput = providerUsageSeen ? Number(data.usage.completion_tokens) : effectiveMaxTokens;
+    const finalInput = providerUsageSeen ? Number(data.usage.prompt_tokens) : inputTokens;
+    const finalOutput = providerUsageSeen ? Number(data.usage.completion_tokens) : countTextTokens(entry.provider, model, outputText);
     const cachedTokens = Number(data.usage?.prompt_tokens_details?.cached_tokens || 0);
     const cacheWriteTokens = Number(data.usage?.prompt_tokens_details?.cache_write_tokens || 0);
     const reasoningTokens = Number(data.usage?.completion_tokens_details?.reasoning_tokens || 0);
@@ -1079,7 +1065,7 @@ export async function handleAnthropicMessages(req: FastifyRequest, reply: Fastif
       cachedTokens,
       cacheWriteTokens,
       reasoningTokens,
-      reservedFallback: !providerUsageSeen,
+      source: providerUsageSeen ? "locked_pricing" : "locked_pricing_tokenizer",
     });
     return reply.send({
       id: `msg_${data.id || Date.now()}`, type: "message", role: "assistant", model,
@@ -1088,7 +1074,7 @@ export async function handleAnthropicMessages(req: FastifyRequest, reply: Fastif
       usage: { input_tokens: finalInput, output_tokens: finalOutput, conpi_cost_usd: committed.usage.costUsd, conpi_usage_source: committed.source },
     });
   } catch (err: any) {
-    await settleAmbiguousPendingCharge(entry);
+    retainAmbiguousPendingReservation(entry);
     return reply.status(502).send({ error: { type: "api_error", message: err.message } });
   } finally {
     entry.requestInFlight = false;
@@ -1137,7 +1123,7 @@ export async function handleEmbeddings(req: FastifyRequest, reply: FastifyReply)
     if (!response.ok) return handleProviderFailure(response, entry, reply);
     const data: any = await response.json();
     const providerUsageSeen = Number.isFinite(Number(data.usage?.prompt_tokens ?? data.usage?.total_tokens));
-    const finalInput = providerUsageSeen ? Number(data.usage?.prompt_tokens ?? data.usage?.total_tokens) : reservedInputTokens;
+    const finalInput = providerUsageSeen ? Number(data.usage?.prompt_tokens ?? data.usage?.total_tokens) : inputTokens;
     const cachedTokens = Number(data.usage?.prompt_tokens_details?.cached_tokens || 0);
     const cacheWriteTokens = Number(data.usage?.prompt_tokens_details?.cache_write_tokens || 0);
     const committed = await finalizeProviderUsage(entry, {
@@ -1147,12 +1133,12 @@ export async function handleEmbeddings(req: FastifyRequest, reply: FastifyReply)
       outputTokens: 0,
       cachedTokens,
       cacheWriteTokens,
-      reservedFallback: !providerUsageSeen,
+      source: providerUsageSeen ? "locked_pricing" : "locked_pricing_tokenizer",
     });
     data.usage = { ...(data.usage || {}), prompt_tokens: finalInput, total_tokens: finalInput, conpi_cost_usd: committed.usage.costUsd, conpi_usage_source: committed.source };
     return reply.status(response.status).send(data);
   } catch (err: any) {
-    await settleAmbiguousPendingCharge(entry);
+    retainAmbiguousPendingReservation(entry);
     return reply.status(502).send({ error: { message: err.message, code: "proxy_error" } });
   } finally {
     entry.requestInFlight = false;

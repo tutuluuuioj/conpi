@@ -428,9 +428,9 @@ export async function buildApp() {
     };
   });
 
-  // Retry only the unresolved provider charge. This never sends a new model
-  // request, so operators can safely recover billing after OpenRouter's
-  // generation endpoint becomes available again.
+  // Inspect an unresolved provider request. Reservations are deliberately not
+  // converted into a charge here: the enclave only settles usage it observed
+  // in a completed provider response.
   app.post("/v1/deals/:id/reconcile", async (req, reply) => {
     const { id } = req.params as { id: string };
     const dealId = parseInt(id, 10);

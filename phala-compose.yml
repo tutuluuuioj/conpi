@@ -16,11 +16,11 @@ services:
       - DAO_ID=dev-20261103021740-59711933581376.testnet
       # The legacy rpc.testnet.near.org endpoint is retired; use an actively
       # maintained testnet endpoint for all TEE contract reads and relays.
-      - NEAR_NODE_URL=https://test.rpc.fastnear.com
+      - NEAR_NODE_URL=https://rpc.testnet.near.org
       - RATE_LIMIT_REQUESTS_PER_MINUTE=60
       - TRANSIENT_RATE_LIMIT_RETRIES=2
       - TRANSIENT_RATE_LIMIT_BACKOFF_MS=250
-      - UPSTREAM_FETCH_TIMEOUT_MS=60000
+      - UPSTREAM_FETCH_TIMEOUT_MS=300000
       - WEBSOCKET_AUTH_TIMEOUT_MS=10000
       - CHECKPOINT_INTERVAL_MS=300000
       - BILLING_QUEUE_TIMEOUT_MS=65000

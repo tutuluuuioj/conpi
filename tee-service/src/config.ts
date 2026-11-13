@@ -13,7 +13,10 @@ export const CONFIG = {
   rateLimitPerMinute: Math.max(1, parseInt(process.env.RATE_LIMIT_REQUESTS_PER_MINUTE || "60", 10)),
   transientRateLimitRetries: Math.max(0, parseInt(process.env.TRANSIENT_RATE_LIMIT_RETRIES || "2", 10)),
   transientRateLimitBackoffMs: Math.max(25, parseInt(process.env.TRANSIENT_RATE_LIMIT_BACKOFF_MS || "250", 10)),
-  upstreamFetchTimeoutMs: Math.max(1_000, parseInt(process.env.UPSTREAM_FETCH_TIMEOUT_MS || "60000", 10)),
+  // Generations may legitimately take longer than a minute.  A timeout only
+  // stops waiting for the upstream response; it must never turn a reservation
+  // into a completed charge.
+  upstreamFetchTimeoutMs: Math.max(1_000, parseInt(process.env.UPSTREAM_FETCH_TIMEOUT_MS || "300000", 10)),
   websocketAuthTimeoutMs: Math.max(1_000, parseInt(process.env.WEBSOCKET_AUTH_TIMEOUT_MS || "10000", 10)),
   checkpointIntervalMs: Math.max(10_000, parseInt(process.env.CHECKPOINT_INTERVAL_MS || "300000", 10)),
   billingQueueTimeoutMs: Math.max(1_000, parseInt(process.env.BILLING_QUEUE_TIMEOUT_MS || "65000", 10)),

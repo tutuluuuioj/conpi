@@ -9,6 +9,7 @@ export type UsageCostSource =
   | "openrouter_usage"
   | "openrouter_generation"
   | "locked_pricing"
+  | "locked_pricing_tokenizer"
   | "locked_pricing_reserved";
 
 export interface UsageReceipt {
