@@ -6,26 +6,24 @@ import { ShieldCheck, ShieldAlert, Loader2 } from "lucide-react";
 import { verifyLiveAttestation, AttestationVerificationResult } from "@/lib/attestation-verifier";
 
 export function AttestationBadge({ showLink = true }: { showLink?: boolean }) {
-  const [result, setResult] = useState<AttestationVerificationResult | null>(() => {
-    if (typeof window !== "undefined") {
-      try {
-        const cached = sessionStorage.getItem("conpi:attestation_badge");
-        if (cached) return JSON.parse(cached);
-      } catch {}
-    }
-    return null;
-  });
-  const [loading, setLoading] = useState(() => {
-    if (typeof window !== "undefined") {
-      try {
-        return !sessionStorage.getItem("conpi:attestation_badge");
-      } catch {}
-    }
-    return true;
-  });
+  // Keep the server render and the browser's first render identical. Reading
+  // sessionStorage in a state initializer made a returning browser render the
+  // cached badge while the server rendered "Verifying TEE...", which caused a
+  // hydration failure across every page containing the header.
+  const [result, setResult] = useState<AttestationVerificationResult | null>(null);
+  const [loading, setLoading] = useState(true);
 
   useEffect(() => {
     let mounted = true;
+
+    try {
+      const cached = sessionStorage.getItem("conpi:attestation_badge");
+      if (cached) {
+        setResult(JSON.parse(cached));
+        setLoading(false);
+      }
+    } catch {}
+
     verifyLiveAttestation()
       .then((res) => {
         if (mounted) {
