@@ -130,16 +130,27 @@ export class NearRelayer {
   }
 
   private payloadForContract(payloadDto: any, kind: string, stage = 0, reason: string | null = null) {
+    const byte32 = (value: any, field: string): number[] => {
+      let bytes: number[];
+      if (Buffer.isBuffer(value) || value instanceof Uint8Array) {
+        bytes = Array.from(value);
+      } else if (Array.isArray(value)) {
+        bytes = value.map(Number);
+      } else if (typeof value === "string" && /^[0-9a-fA-F]{64}$/.test(value.replace(/^0x/, ""))) {
+        bytes = Array.from(Buffer.from(value.replace(/^0x/, ""), "hex"));
+      } else {
+        throw new Error(`${field} must be a 32-byte value`);
+      }
+      if (bytes.length !== 32 || bytes.some((item) => !Number.isInteger(item) || item < 0 || item > 255)) {
+        throw new Error(`${field} must be a 32-byte value`);
+      }
+      return bytes;
+    };
+
     const termsHash = payloadDto.termsHash || payloadDto.termsHashHex;
-    const termsHashBytes = Array.from(
-      Buffer.isBuffer(termsHash) ? termsHash : Buffer.from(String(termsHash).replace(/^0x/, ""), "hex")
-    );
+    const termsHashBytes = byte32(termsHash, "terms_hash");
     const sighash = payloadDto.foreignTxSighash || payloadDto.foreign_tx_sighash;
-    const foreignTxSighash = !sighash
-      ? null
-      : Array.isArray(sighash)
-        ? sighash
-        : Array.from(Buffer.from(String(sighash).replace(/^0x/, ""), "hex"));
+    const foreignTxSighash = sighash == null ? null : byte32(sighash, "foreign_tx_sighash");
     return {
       domain: payloadDto.domain,
       contract_id: payloadDto.contractId,

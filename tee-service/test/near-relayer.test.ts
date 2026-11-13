@@ -35,6 +35,39 @@ async function runNearRelayerTests() {
   assert(!JSON.stringify(args).includes(`\"expires_at\":\"`), "expires_at must not be quoted in JSON");
 
   console.log("[PASS] Solana acceptance expiry serializes as the contract's u64");
+
+  const termsHash = Buffer.alloc(32, 0x41);
+  const solanaTxHash = Buffer.alloc(32, 0x55);
+  capturedMethod = "";
+  capturedArgs = null;
+  await relayer.submitRecordSolanaCollateral(
+    55,
+    "4cASSracKaykpEM1DjSyDba2MnhsQXFCs1ebRH47xveKVjnsAk8moJ53SVs71U7zgG4KfMdUeWJGYJLWXQpdmhcx",
+    {
+      domain: "conpi:v1",
+      contractId: "dev-20261103062448-30583839049419.testnet",
+      chainId: "testnet",
+      dealId: 55,
+      termsHash,
+      nonce: 1n,
+      issuedAtNs: 1_794_531_571_000_000_000n,
+      meteredValueYocto: 0n,
+      foreignTxSighash: solanaTxHash,
+    },
+    "22".repeat(64),
+  );
+
+  assert(capturedMethod === "record_solana_collateral", "Wrong collateral contract method");
+  assert(capturedArgs !== null, "Collateral contract arguments were not captured");
+  const collateralArgs = capturedArgs as Record<string, any>;
+  assert(collateralArgs.payload.terms_hash.length === 32, "terms_hash must contain 32 bytes");
+  assert(collateralArgs.payload.foreign_tx_sighash.length === 32, "foreign_tx_sighash must contain 32 bytes");
+  assert(
+    collateralArgs.payload.foreign_tx_sighash.every((value: number) => value === 0x55),
+    "The Solana transaction hash bytes must be preserved",
+  );
+
+  console.log("[PASS] Solana collateral Buffer hashes serialize as contract byte arrays");
 }
 
 runNearRelayerTests().catch((error) => {
