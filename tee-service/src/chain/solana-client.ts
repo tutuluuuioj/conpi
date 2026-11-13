@@ -20,6 +20,18 @@ export interface PreparedSolanaPayout {
   lastValidBlockHeight: number;
 }
 
+/**
+ * Deal terms keep the exact wallet representation that the seller signed.
+ * Solana itself accepts either a base58 public key or the equivalent 32-byte
+ * hex value used by Conpi's cross-chain wallet adapter.
+ */
+export function publicKeyFromSolanaAddress(address: string): PublicKey {
+  const bytes = /^[0-9a-f]{64}$/i.test(address)
+    ? Buffer.from(address, "hex")
+    : address;
+  return new PublicKey(bytes);
+}
+
 export class SolanaClient {
   private readonly connection: Connection;
   private readonly mint: PublicKey;
@@ -48,10 +60,7 @@ export class SolanaClient {
     sellerAddress: string;
     amountAtomic: bigint;
   }): Promise<{ slot: number; vaultTokenAccount: string }> {
-    const sellerBytes = /^[0-9a-f]{64}$/i.test(params.sellerAddress)
-      ? Buffer.from(params.sellerAddress, "hex")
-      : params.sellerAddress;
-    const seller = new PublicKey(sellerBytes);
+    const seller = publicKeyFromSolanaAddress(params.sellerAddress);
     const destination = getAssociatedTokenAddressSync(this.mint, this.vault);
     const status = await this.connection.getSignatureStatuses([params.signature], {
       searchTransactionHistory: true,
@@ -93,10 +102,7 @@ export class SolanaClient {
     amountAtomic: bigint;
   }): Promise<PreparedSolanaPayout> {
     if (params.amountAtomic <= 0n) throw new Error("Solana payout amount must be positive");
-    const recipientBytes = /^[0-9a-f]{64}$/i.test(params.recipient)
-      ? Buffer.from(params.recipient, "hex")
-      : params.recipient;
-    const recipient = new PublicKey(recipientBytes);
+    const recipient = publicKeyFromSolanaAddress(params.recipient);
     const source = getAssociatedTokenAddressSync(this.mint, this.vault);
     const destination = getAssociatedTokenAddressSync(this.mint, recipient);
     const tx = new Transaction();
@@ -124,7 +130,10 @@ export class SolanaClient {
     return {
       messageHex: message.toString("hex"),
       messageHashHex: crypto.createHash("sha256").update(message).digest("hex"),
-      recipient: recipient.toBase58(),
+      // The NEAR contract compares this field with the seller address locked
+      // in the deal. Preserve that exact representation (hex or base58), even
+      // though the transaction itself uses the canonical PublicKey above.
+      recipient: params.recipient,
       amountAtomic: params.amountAtomic,
       lastValidBlockHeight,
     };

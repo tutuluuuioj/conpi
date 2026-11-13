@@ -50,6 +50,12 @@ export class MeterEngine {
     if (stage > current) this.lastStageEmitted.set(dealId, stage);
   }
 
+  /** Reconcile the local emitter with the stage actually finalized on-chain. */
+  public syncStage(dealId: number, releasedStage: number): void {
+    const stage = Math.max(0, Math.min(100, Math.floor(releasedStage)));
+    this.lastStageEmitted.set(dealId, stage);
+  }
+
   public getNextNonce(dealId: number): bigint {
     const current = this.nonceMap.get(dealId) || 0n;
     const next = current + 1n;
@@ -90,15 +96,19 @@ export class MeterEngine {
   }
 
   public checkAndEmitStages(entry: VaultEntry, termsHashHex: string): Array<{ payload: SignedPayloadDto; signatureHex: string }> {
-    const pct = (entry.usedUsd / entry.creditUsd) * 100;
+    const usedMicro = BigInt(Math.max(0, Math.round(entry.usedUsd * 1_000_000)));
+    const creditMicro = BigInt(Math.max(1, Math.round(entry.creditUsd * 1_000_000)));
     const results: Array<{ payload: SignedPayloadDto; signatureHex: string }> = [];
 
     const STAGES = [25, 50, 75, 100];
     for (const targetStage of STAGES) {
       const currentLast = this.lastStageEmitted.get(entry.dealId) || 0;
-      // 5 basis points (0.05%) completion tolerance: >= 99.95% metered usage triggers 100% stage release
-      const stageThreshold = targetStage === 100 ? 99.95 : targetStage;
-      if (targetStage > currentLast && pct >= stageThreshold) {
+      // Compare integer micro-dollars so a value displayed as 99.95% cannot
+      // miss the final stage because of binary floating-point rounding.
+      const reached = targetStage === 100
+        ? usedMicro * 10_000n >= creditMicro * 9_995n
+        : usedMicro * 100n >= creditMicro * BigInt(targetStage);
+      if (targetStage > currentLast && reached) {
         this.lastStageEmitted.set(entry.dealId, targetStage);
 
         // Unit scaling: if creditAmountYocto is present, scale to contract's deal.credit_amount

@@ -262,6 +262,16 @@ export async function buildApp() {
       const entry = keyVault.getByDealId(dealId);
       const onChainStatus = String(entry?.onChainStatus || "").toLowerCase();
       if (onChainStatus === "active") {
+        // Rehydrating an active deal after a CVM update must also resume any
+        // metered stages that were signed but never finalized on-chain.
+        if (entry) {
+          void settlementEngine.recoverDueStages([entry]).catch((error) => {
+            console.warn("[conpi:key-stage-recovery]", {
+              dealId,
+              error: error instanceof Error ? error.message : String(error),
+            });
+          });
+        }
         return {
           ...result,
           activationRelayed: true,

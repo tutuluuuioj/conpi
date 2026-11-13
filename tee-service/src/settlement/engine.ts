@@ -41,6 +41,9 @@ export class SettlementEngine {
 
   public start(entries: () => VaultEntry[]): void {
     if (this.checkpointTimer) return;
+    void this.recoverDueStages(entries()).catch((error) => {
+      console.warn("[conpi:stage-recovery]", { error: error instanceof Error ? error.message : String(error) });
+    });
     this.checkpointTimer = setInterval(() => {
       void this.checkpointActiveDeals(entries()).catch((error) => {
         console.warn("[conpi:checkpoint-loop]", { error: error instanceof Error ? error.message : String(error) });
@@ -56,9 +59,38 @@ export class SettlementEngine {
 
   public async checkpointActiveDeals(entries: VaultEntry[]): Promise<void> {
     if (!nearRelayer.isConfigured()) return;
+    await this.recoverDueStages(entries);
     const now = Date.now();
     const eligible = entries.filter((entry) => entry.active && now - entry.lastCheckpointAt >= CONFIG.checkpointIntervalMs);
     await Promise.all(eligible.map((entry) => this.createAndRelayCheckpoint(entry)));
+  }
+
+  /**
+   * Re-sign and retry any usage stages that are due but not finalized. Stage
+   * payloads need fresh nonces because periodic checkpoints may have advanced
+   * the contract nonce after an earlier relay failure.
+   */
+  public async recoverDueStages(entries: VaultEntry[]): Promise<RelayReceipt[]> {
+    if (!nearRelayer.isConfigured()) return [];
+    const recovered: RelayReceipt[] = [];
+    for (const entry of entries.filter((item) => item.active)) {
+      const deal = await nearRelayer.getDeal(entry.dealId).catch(() => null);
+      if (!deal || statusName(deal.status) !== "Active") continue;
+      meterEngine.seedNonce(entry.dealId, BigInt(deal.last_nonce || 0));
+      meterEngine.syncStage(entry.dealId, Number(deal.stage_reached || 0));
+      const stages = meterEngine.checkAndEmitStages(entry, entry.termsHashHex);
+      if (stages.length === 0) continue;
+      entry.signedPayloads.push(...stages);
+      meterEvents.publish(entry, "stage", stages.map((item) => Number(item.payload.stage)));
+      const receipts = await this.relayStages(entry, stages);
+      recovered.push(...receipts);
+      if (stages.some((item) => Number(item.payload.stage) === 100)
+        && receipts.some((receipt) => receipt.kind === "stage" && receipt.state === "applied")) {
+        const finalDeal = await nearRelayer.getDeal(entry.dealId).catch(() => null);
+        if (finalDeal && statusName(finalDeal.status) === "Completed") entry.active = false;
+      }
+    }
+    return recovered;
   }
 
   public async createAndRelayCheckpoint(entry: VaultEntry): Promise<RelayReceipt | null> {

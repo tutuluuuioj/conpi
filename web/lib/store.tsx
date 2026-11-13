@@ -874,10 +874,10 @@ export function Providers({ children }: { children: React.ReactNode }) {
           const onChainStage = (String(d.status) === "Settled" || String(d.status) === "Completed")
             ? 100
             : Number(d.current_stage ?? (d as any).stage_reached ?? (d as any).last_signed?.stage ?? 0);
-          const computedMeterStage = creditUsd > 0 && liveMeter?.usedUsd !== undefined
-            ? Math.min(100, Math.floor((usedUsd / creditUsd) * 100))
-            : 0;
-          const stage = Math.max(onChainStage, computedMeterStage);
+          // A metered threshold is not a released payout. Only the escrow
+          // contract can confirm a stage as paid; showing the local meter as
+          // "released" hid failed Solana relays from both parties.
+          const stage = onChainStage;
 
           const lastUpdate = liveMeter?.timestamp
             ? `TEE Enclave (${new Date(liveMeter.timestamp).toLocaleTimeString()})`

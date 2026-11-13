@@ -6,6 +6,7 @@ import { enclaveKeys } from "../src/crypto/keys.js";
 import { DefaultReason, PayloadKind, serializeSignedPayload } from "../src/crypto/borsh.js";
 import { meterEngine } from "../src/proxy/meter.js";
 import { settlementEngine } from "../src/settlement/engine.js";
+import { publicKeyFromSolanaAddress } from "../src/chain/solana-client.js";
 import type { VaultEntry } from "../src/vault/preflight.js";
 
 function assert(condition: unknown, message: string): asserts condition {
@@ -145,8 +146,38 @@ async function runPhase4Tests() {
     assert(cappedCheckpoint.payload.meteredValueYocto === 100_000_000n, "Checkpoint exceeded locked credit");
     assert(cappedDefault.payload.meteredValueYocto === 100_000_000n, "Default exceeded locked credit");
 
+    console.log("[P4-6] Solana hex wallets preserve the seller's signed address representation...");
+    const sellerHex = "bbd65d65de6e15e11d9f887423339a4acc257184d59e6cbc5d4afe1e556e0273";
+    assert(
+      publicKeyFromSolanaAddress(sellerHex).toBase58() === "DeEpqiydVZLN7xoFvD6ARyW6bjgum9UUdpK5wWA7UftN",
+      "The locked Solana hex address did not decode to the seller's public key"
+    );
+
+    console.log("[P4-7] Failed stages are re-signed with fresh nonces and recovered in order...");
+    settlementEngine.resetForTests();
+    meterEngine.reset(4007);
+    const recoveryEntry = entry(4007, 100);
+    const recoveryChain = { status: "Active", stage_reached: 0, last_nonce: 32 };
+    const recoveryStages: number[] = [];
+    const recoveryNonces: number[] = [];
+    (nearRelayer as any).getDeal = async (dealId: number) => dealId === 4007 ? { ...recoveryChain } : null;
+    (nearRelayer as any).submitReleaseStage = async (_dealId: number, stage: number, payload: any) => {
+      recoveryStages.push(stage);
+      recoveryNonces.push(Number(payload.nonce));
+      assert(Number(payload.nonce) > recoveryChain.last_nonce, "Recovered stage reused a stale checkpoint nonce");
+      recoveryChain.stage_reached = stage;
+      recoveryChain.last_nonce = Number(payload.nonce);
+      if (stage === 100) recoveryChain.status = "Completed";
+      return { transactionHash: `recovered-${stage}-tx`, status: { SuccessValue: "" } };
+    };
+    const recovered = await settlementEngine.recoverDueStages([recoveryEntry]);
+    assert(recoveryStages.join(",") === "25,50,75,100", "Due stages were not recovered in order");
+    assert(recoveryNonces[0] > 32, "Recovery did not continue after the latest on-chain checkpoint nonce");
+    assert(recovered.length === 4 && recovered.every((receipt) => receipt.state === "applied"), "Recovered stages did not finalize");
+    assert(recoveryEntry.active === false, "Completed recovery left the proxy entry active");
+
     console.log("=======================================================");
-    console.log("  ALL PHASE 4 ACCEPTANCE TESTS PASSED (5/5)           ");
+    console.log("  ALL PHASE 4 ACCEPTANCE TESTS PASSED (7/7)           ");
     console.log("=======================================================");
   } finally {
     (nearRelayer as any).getDeal = originalGetDeal;
