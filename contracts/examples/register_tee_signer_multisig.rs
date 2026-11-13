@@ -2,7 +2,7 @@ use conpi_escrow::types::{AdminAction, TeeSigner};
 use near_sdk::json_types::Base64VecU8;
 use near_workspaces::types::SecretKey;
 use serde::Deserialize;
-use std::fs;
+use std::{env, fs};
 use std::path::Path;
 
 #[derive(Deserialize)]
@@ -36,13 +36,19 @@ struct ExecuteArgs {
 
 const ESCROW_ID: &str = "dev-20261103062448-30583839049419.testnet";
 const DSTACK_HARDWARE_SIGNER: &str = "ed25519:F4YtyCFTEj9rca8fJQxcQd7F1UHuuGQBxP8WmcAC7cbi";
-const HARDWARE_MEASUREMENT: &str = "mrtd:7fe60787222bd394cb516abca2435f22f035ab2cc9c0a4b4b3b148e46297f3d931a237b72f359052c6e657d8c1409173|compose:c0e721177e14f30af1b8dcca1cbc7fb0e828c035a6551909810e938d109b8182";
+const DEFAULT_HARDWARE_MEASUREMENT: &str = "mrtd:7fe60787222bd394cb516abca2435f22f035ab2cc9c0a4b4b3b148e46297f3d931a237b72f359052c6e657d8c1409173|compose:c0e721177e14f30af1b8dcca1cbc7fb0e828c035a6551909810e938d109b8182";
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("============================================================");
     println!("  REGISTER PHALA TEE SIGNER & MRTD/COMPOSE VIA DAO          ");
     println!("============================================================");
+
+    // The live compose hash changes on every verified CVM deployment.  Taking
+    // it from an explicit environment variable prevents this governance tool
+    // from accidentally re-registering a stale, hard-coded measurement.
+    let hardware_measurement = env::var("CONPI_TEE_MEASUREMENT")
+        .unwrap_or_else(|_| DEFAULT_HARDWARE_MEASUREMENT.to_string());
 
     // 1. Load keys
     let creds_p1 = Path::new(".credentials/dao_member_keys.json");
@@ -58,7 +64,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("DAO Multisig Account: {}", dao_id);
     println!("Target Escrow Contract: {}", escrow_id);
     println!("Dstack Derived Signer:  {}", DSTACK_HARDWARE_SIGNER);
-    println!("Hardware Measurement:   {}", HARDWARE_MEASUREMENT);
+    println!("Hardware Measurement:   {}", hardware_measurement);
 
     let member1_sk: SecretKey = keys_file.members[0].secret_key.parse()?;
     let member2_sk: SecretKey = keys_file.members[1].secret_key.parse()?;
@@ -66,7 +72,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // 2. Connect to Testnet
     println!("\nConnecting to NEAR Testnet...");
     let worker = near_workspaces::testnet()
-        .rpc_addr("https://test.rpc.fastnear.com")
+        .rpc_addr("https://rpc.testnet.fastnear.com")
         .await?;
     let member1_signer = near_workspaces::Account::from_secret_key(dao_id.clone(), member1_sk, &worker);
     let member2_signer = near_workspaces::Account::from_secret_key(dao_id.clone(), member2_sk, &worker);
@@ -74,7 +80,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // 3. Prepare AdminAction::AddTeeSigner
     let action = AdminAction::AddTeeSigner {
         public_key: DSTACK_HARDWARE_SIGNER.parse()?,
-        measurement: HARDWARE_MEASUREMENT.to_string(),
+        measurement: hardware_measurement.clone(),
     };
     let propose_call_args = serde_json::to_vec(&ProposeArgs { action })?;
     let propose_b64 = Base64VecU8::from(propose_call_args);
@@ -131,7 +137,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             .json()?;
         if let Some(signer) = current {
             println!("Current signer measurement after quorum: {}", signer.measurement);
-            if signer.active && signer.measurement == HARDWARE_MEASUREMENT {
+            if signer.active && signer.measurement == hardware_measurement {
                 println!("The DAO action was idempotent: the requested measurement is already active.");
                 return Ok(());
             }
@@ -226,7 +232,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         println!("  Registered At:     {}", signer.registered_at);
         println!("  Active:            {}", signer.active);
         assert!(signer.active, "Signer must be active");
-        assert_eq!(signer.measurement, HARDWARE_MEASUREMENT, "Measurement must match");
+        assert_eq!(signer.measurement, hardware_measurement, "Measurement must match");
     } else {
         panic!("TEE Signer was not found on Escrow contract!");
     }
@@ -240,7 +246,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("Execution Confirmation Tx:{}", confirm_exec_tx);
     println!("Escrow Contract:          {}", escrow_id);
     println!("TEE Signer:               {}", DSTACK_HARDWARE_SIGNER);
-    println!("Measurement (MRTD+RTMR3): {}", HARDWARE_MEASUREMENT);
+    println!("Measurement (MRTD+RTMR3): {}", hardware_measurement);
     println!("============================================================");
 
     Ok(())
