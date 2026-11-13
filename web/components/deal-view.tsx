@@ -116,6 +116,7 @@ export function DealView({ id }: { id: string }) {
   const [vaultEthBal, setVaultEthBal] = useState<string | null>(null);
   const [isFundingGas, setIsFundingGas] = useState(false);
   const prevStepRef = useRef<DealStep | null>(null);
+  const buyerTermsRepairRef = useRef<string | null>(null);
 
   useEffect(() => {
     if (!deal?.id) return;
@@ -529,6 +530,18 @@ export function DealView({ id }: { id: string }) {
     const interval = window.setInterval(() => void app.syncNegotiationTicket(deal.id), 2500);
     return () => window.clearInterval(interval);
   }, [deal?.id, app.syncNegotiationTicket]);
+
+  // A funded buyer has already accepted the canonical on-chain terms. If a
+  // previous TEE restart predates durable negotiation storage, restore that
+  // buyer's encrypted term sheet once while their matching wallet is present.
+  useEffect(() => {
+    if (!deal || isSellerParty || !app.nearAccount) return;
+    if (!["Funded", "Active"].includes(deal.status) || deal.buyerSubmitted) return;
+    if (app.nearAccount.trim().toLowerCase() !== deal.buyer.trim().toLowerCase()) return;
+    if (buyerTermsRepairRef.current === deal.id) return;
+    buyerTermsRepairRef.current = deal.id;
+    void app.submitNegotiationTerms(deal.id);
+  }, [deal?.id, deal?.status, deal?.buyer, deal?.buyerSubmitted, isSellerParty, app.nearAccount, app.submitNegotiationTerms]);
 
   const handleSendChat = (event: FormEvent) => {
     event.preventDefault();

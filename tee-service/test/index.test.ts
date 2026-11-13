@@ -3,7 +3,7 @@ import { enclaveKeys } from "../src/crypto/keys.js";
 import { computeTermsHash, buildTermsMessage } from "../src/crypto/terms.js";
 import { serializeSignedPayload, PayloadKind } from "../src/crypto/borsh.js";
 import { encryptToEnclave, decryptFromClient } from "../src/crypto/encryption.js";
-import { negotiationService } from "../src/negotiation/matcher.js";
+import { NegotiationService, negotiationService } from "../src/negotiation/matcher.js";
 import { keyVault, fetchLiveNearPriceUsd, usdBudgetMatchesOnChain } from "../src/vault/preflight.js";
 import { calculateCost, meterEngine } from "../src/proxy/meter.js";
 import { openRouterPricingFromModels } from "../src/proxy/pricing.js";
@@ -157,6 +157,23 @@ async function runTests() {
     throw new Error("Encrypted ticket message failed");
   }
   console.log("PASS: Negotiation terms matching and diffing verified.");
+
+  const restartTicketId = `ticket-restart-${Date.now()}`;
+  const beforeRestart = new NegotiationService();
+  beforeRestart.getOrCreateTicket(restartTicketId, 91, "buyer.restart", "seller.restart", canonicalOnChainTermsHash);
+  beforeRestart.submitTerms(restartTicketId, "buyer", termA);
+  const afterBuyerRestart = new NegotiationService();
+  const restoredBuyer = afterBuyerRestart.getTicketView(restartTicketId);
+  if (!restoredBuyer?.buyerSubmitted || restoredBuyer.sellerSubmitted) {
+    throw new Error("Buyer negotiation confirmation did not survive TEE restart");
+  }
+  afterBuyerRestart.submitTerms(restartTicketId, "seller", termA);
+  const afterMatchedRestart = new NegotiationService();
+  const restoredMatch = afterMatchedRestart.getTicketView(restartTicketId);
+  if (!restoredMatch?.matched || !restoredMatch.buyerSubmitted || !restoredMatch.sellerSubmitted) {
+    throw new Error("Matched negotiation ticket did not survive TEE restart");
+  }
+  console.log("PASS: Encrypted negotiation confirmations survive TEE restart.");
 
   if (!usdBudgetMatchesOnChain(0.05, 0.0504, true)) {
     throw new Error("Valid USD-to-NEAR oracle drift was rejected");

@@ -3,6 +3,7 @@ import { computeTermsHash, buildTermsMessage, DealTermsParams } from "../crypto/
 import { enclaveKeys } from "../crypto/keys.js";
 import { decryptFromClient, EncryptedEnvelope } from "../crypto/encryption.js";
 import { CONFIG } from "../config.js";
+import { negotiationStateStore } from "../state/negotiation-store.js";
 
 export interface TermSheet {
   provider: "OpenAI" | "Anthropic" | "OpenRouter";
@@ -70,8 +71,20 @@ export function normalizeTerms(input: any): TermSheet {
   };
 }
 
-class NegotiationService {
+export class NegotiationService {
   private tickets = new Map<string, TicketState>();
+
+  private loadTicket(ticketId: string): TicketState | undefined {
+    const cached = this.tickets.get(ticketId);
+    if (cached) return cached;
+    const persisted = negotiationStateStore.load(ticketId);
+    if (persisted) this.tickets.set(ticketId, persisted);
+    return persisted || undefined;
+  }
+
+  private persist(ticket: TicketState): void {
+    negotiationStateStore.save(ticket);
+  }
 
   public getOrCreateTicket(
     ticketId: string,
@@ -84,7 +97,7 @@ class NegotiationService {
     if (normalizedHash && !/^[0-9a-f]{64}$/.test(normalizedHash)) {
       throw new Error("On-chain terms hash must be exactly 32 bytes of hex");
     }
-    let ticket = this.tickets.get(ticketId);
+    let ticket = this.loadTicket(ticketId);
     if (!ticket) {
       ticket = {
         ticketId,
@@ -97,6 +110,7 @@ class NegotiationService {
         updatedAt: new Date().toISOString(),
       };
       this.tickets.set(ticketId, ticket);
+      this.persist(ticket);
     } else {
       if (ticket.dealId !== dealId || ticket.buyer !== buyer || ticket.seller !== seller) {
         throw new Error(`Ticket ${ticketId} is already bound to different deal participants`);
@@ -104,13 +118,16 @@ class NegotiationService {
       if (ticket.onChainTermsHashHex && normalizedHash && ticket.onChainTermsHashHex !== normalizedHash) {
         throw new Error(`Ticket ${ticketId} is already bound to a different on-chain terms hash`);
       }
-      if (!ticket.onChainTermsHashHex && normalizedHash) ticket.onChainTermsHashHex = normalizedHash;
+      if (!ticket.onChainTermsHashHex && normalizedHash) {
+        ticket.onChainTermsHashHex = normalizedHash;
+        this.persist(ticket);
+      }
     }
     return ticket;
   }
 
   public getTicket(ticketId: string): TicketState | undefined {
-    return this.tickets.get(ticketId);
+    return this.loadTicket(ticketId);
   }
 
   public assertMatchedDealTerms(
@@ -119,7 +136,8 @@ class NegotiationService {
     models: string[],
     termsHashHex: string
   ): TermSheet | undefined {
-    const ticket = [...this.tickets.values()].find((item) => item.dealId === dealId);
+    const ticket = [...this.tickets.values()].find((item) => item.dealId === dealId)
+      || this.loadTicket(String(dealId));
     if (!ticket) {
       if (process.env.NODE_ENV === "test") return undefined;
       throw new Error(`Matched TEE term sheet for deal #${dealId} was not found`);
@@ -147,7 +165,7 @@ class NegotiationService {
    * private inside the enclave and are never returned by the public API.
    */
   public getTicketView(ticketId: string): TicketView | undefined {
-    const ticket = this.tickets.get(ticketId);
+    const ticket = this.loadTicket(ticketId);
     if (!ticket) return undefined;
     const { buyerTerms, sellerTerms, ...view } = ticket;
     return {
@@ -178,7 +196,7 @@ class NegotiationService {
     sender: string,
     envelope: EncryptedEnvelope
   ): TicketView {
-    const ticket = this.tickets.get(ticketId);
+    const ticket = this.loadTicket(ticketId);
     if (!ticket) throw new Error(`Ticket ${ticketId} not found`);
     if (sender !== ticket.buyer && sender !== ticket.seller) {
       throw new Error("Message sender is not a ticket participant");
@@ -195,11 +213,12 @@ class NegotiationService {
       createdAt: new Date().toISOString(),
     });
     ticket.updatedAt = new Date().toISOString();
+    this.persist(ticket);
     return this.getTicketView(ticketId)!;
   }
 
   public submitTerms(ticketId: string, party: "buyer" | "seller", inputTerms: any): TicketState {
-    const ticket = this.tickets.get(ticketId);
+    const ticket = this.loadTicket(ticketId);
     if (!ticket) {
       throw new Error(`Ticket ${ticketId} not found`);
     }
@@ -264,6 +283,7 @@ class NegotiationService {
       }
     }
 
+    this.persist(ticket);
     return ticket;
   }
 
