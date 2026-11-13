@@ -115,6 +115,7 @@ export function DealView({ id }: { id: string }) {
   const [hasAutoAdvanced, setHasAutoAdvanced] = useState(false);
   const [vaultEthBal, setVaultEthBal] = useState<string | null>(null);
   const [isFundingGas, setIsFundingGas] = useState(false);
+  const [buyerTermsRepairAttempt, setBuyerTermsRepairAttempt] = useState(0);
   const prevStepRef = useRef<DealStep | null>(null);
   const buyerTermsRepairRef = useRef<string | null>(null);
 
@@ -538,10 +539,17 @@ export function DealView({ id }: { id: string }) {
     if (!deal || isSellerParty || !app.nearAccount) return;
     if (!["Funded", "Active"].includes(deal.status) || deal.buyerSubmitted) return;
     if (app.nearAccount.trim().toLowerCase() !== deal.buyer.trim().toLowerCase()) return;
-    if (buyerTermsRepairRef.current === deal.id) return;
-    buyerTermsRepairRef.current = deal.id;
-    void app.submitNegotiationTerms(deal.id);
-  }, [deal?.id, deal?.status, deal?.buyer, deal?.buyerSubmitted, isSellerParty, app.nearAccount, app.submitNegotiationTerms]);
+    const attemptKey = `${deal.id}:${buyerTermsRepairAttempt}`;
+    if (buyerTermsRepairRef.current === attemptKey) return;
+    buyerTermsRepairRef.current = attemptKey;
+    let retryTimer: number | undefined;
+    void app.submitNegotiationTerms(deal.id).finally(() => {
+      retryTimer = window.setTimeout(() => setBuyerTermsRepairAttempt((value) => value + 1), 15_000);
+    });
+    return () => {
+      if (retryTimer) window.clearTimeout(retryTimer);
+    };
+  }, [deal?.id, deal?.status, deal?.buyer, deal?.buyerSubmitted, isSellerParty, buyerTermsRepairAttempt, app.nearAccount, app.submitNegotiationTerms]);
 
   const handleSendChat = (event: FormEvent) => {
     event.preventDefault();

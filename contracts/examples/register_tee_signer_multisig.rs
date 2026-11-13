@@ -36,7 +36,7 @@ struct ExecuteArgs {
 
 const ESCROW_ID: &str = "dev-20261103062448-30583839049419.testnet";
 const DSTACK_HARDWARE_SIGNER: &str = "ed25519:F4YtyCFTEj9rca8fJQxcQd7F1UHuuGQBxP8WmcAC7cbi";
-const HARDWARE_MEASUREMENT: &str = "mrtd:7fe60787222bd394cb516abca2435f22f035ab2cc9c0a4b4b3b148e46297f3d931a237b72f359052c6e657d8c1409173|compose:d16e9e1e9f52c35f57e59fc1238105b644e902a38653de77ed34089a52e6405d";
+const HARDWARE_MEASUREMENT: &str = "mrtd:7fe60787222bd394cb516abca2435f22f035ab2cc9c0a4b4b3b148e46297f3d931a237b72f359052c6e657d8c1409173|compose:da1548e95c84ccef37dc458df4f4cdd9a5c923184dc3ab37e3f519b97b1cf108";
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -124,7 +124,19 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     println!("\nActive Staged Proposals on Escrow: {:?}", staged_proposals);
     if staged_proposals.is_empty() {
-        panic!("No staged proposals found after confirmation!");
+        let current: Option<TeeSigner> = worker
+            .view(&escrow_id, "get_tee_signer")
+            .args_json(serde_json::json!({ "public_key": DSTACK_HARDWARE_SIGNER }))
+            .await?
+            .json()?;
+        if let Some(signer) = current {
+            println!("Current signer measurement after quorum: {}", signer.measurement);
+            if signer.active && signer.measurement == HARDWARE_MEASUREMENT {
+                println!("The DAO action was idempotent: the requested measurement is already active.");
+                return Ok(());
+            }
+        }
+        panic!("No staged proposal found after confirmation and the requested measurement is not active");
     }
 
     let (proposal_id, staged_val) = staged_proposals.last().unwrap();
