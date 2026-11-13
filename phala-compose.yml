@@ -14,9 +14,9 @@ services:
       - NODE_ENV=production
       - CONTRACT_ID=dev-20261103062448-30583839049419.testnet
       - DAO_ID=dev-20261103021740-59711933581376.testnet
-      # The legacy rpc.testnet.near.org endpoint is retired; use an actively
-      # maintained testnet endpoint for all TEE contract reads and relays.
-      - NEAR_NODE_URL=https://rpc.testnet.near.org
+      # FastNear's maintained testnet RPC. The legacy near.org testnet URL
+      # rejects production traffic, so never use it for relaying settlements.
+      - NEAR_NODE_URL=https://rpc.testnet.fastnear.com
       - RATE_LIMIT_REQUESTS_PER_MINUTE=60
       - TRANSIENT_RATE_LIMIT_RETRIES=2
       - TRANSIENT_RATE_LIMIT_BACKOFF_MS=250
