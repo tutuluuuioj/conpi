@@ -5,7 +5,7 @@ import { nearRelayer } from "../src/chain/relayer.js";
 import { enclaveKeys } from "../src/crypto/keys.js";
 import { DefaultReason, PayloadKind, serializeSignedPayload } from "../src/crypto/borsh.js";
 import { meterEngine } from "../src/proxy/meter.js";
-import { settlementEngine, solanaPendingRecoveryPlan } from "../src/settlement/engine.js";
+import { settlementEngine, settlementPayloadsForRelay, solanaPendingRecoveryPlan } from "../src/settlement/engine.js";
 import { publicKeyFromSolanaAddress, sameSolanaAddress } from "../src/chain/solana-client.js";
 import type { VaultEntry } from "../src/vault/preflight.js";
 
@@ -111,6 +111,18 @@ async function runPhase4Tests() {
     assert(
       relayOrder.join(",") === "stage-25,stage-50,stage-75,checkpoint",
       `Checkpoint interleaved a staged payout batch: ${relayOrder.join(",")}`
+    );
+
+    console.log("[P4-1c] Solana batches relay only the highest cumulative stage...");
+    const solanaBatchEntry = { ...entry(4012, 100), solanaDeal: { collateral_deposited: true } } as VaultEntry;
+    const solanaStages = [25, 50, 75, 100].map((stage) => ({
+      payload: { stage },
+      signatureHex: `stage-${stage}`,
+    }));
+    const selectedSolanaStages = settlementPayloadsForRelay(solanaBatchEntry, solanaStages);
+    assert(
+      selectedSolanaStages.length === 1 && selectedSolanaStages[0].payload.stage === 100,
+      "A Solana batch retained pre-signed lower stages that would become stale after confirmation"
     );
 
     console.log("[P4-2] Periodic checkpoints sign exact metered usage and refresh liveness...");

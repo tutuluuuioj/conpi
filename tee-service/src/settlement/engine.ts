@@ -10,6 +10,18 @@ import { sameSolanaAddress, SolanaClient } from "../chain/solana-client.js";
 type RelayKind = RelayReceipt["kind"];
 type SignedEnvelope = { payload: any; signatureHex: string };
 
+export function settlementPayloadsForRelay(entry: Pick<VaultEntry, "solanaDeal">, payloads: SignedEnvelope[]): SignedEnvelope[] {
+  if (!entry.solanaDeal || payloads.length <= 1) return payloads;
+  // A Solana stage is cumulative and its two-step NEAR -> Chain Signatures ->
+  // NEAR confirmation consumes a fresh nonce. Relaying pre-signed 25/50/75/100
+  // payloads one after another therefore makes every payload after the first
+  // stale. Submit only the highest due cumulative stage; it includes all
+  // earlier value and leaves the next recovery cycle with a fresh nonce.
+  return [payloads.reduce((highest, candidate) => (
+    Number(candidate.payload.stage) > Number(highest.payload.stage) ? candidate : highest
+  ))];
+}
+
 function delay(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
@@ -144,10 +156,9 @@ export class SettlementEngine {
   }
 
   public async relayStages(entry: VaultEntry, payloads: SignedEnvelope[]): Promise<RelayReceipt[]> {
-    // Enqueue the whole batch synchronously.  A checkpoint must not acquire
-    // the per-deal queue between stage 25 and stage 50, otherwise it advances
-    // the contract nonce and invalidates the remaining staged payouts.
-    return Promise.all(payloads.map((payload) => this.relayStage(entry, payload)));
+    // Enqueue the selected batch synchronously. Non-Solana stages retain their
+    // individual milestones; Solana selects one cumulative milestone above.
+    return Promise.all(settlementPayloadsForRelay(entry, payloads).map((payload) => this.relayStage(entry, payload)));
   }
 
   public relayStage(entry: VaultEntry, signed: SignedEnvelope): Promise<RelayReceipt> {
