@@ -15,7 +15,9 @@ const repository = path.resolve(directory, "../..");
 const funderPath = process.env.FUNDER_CREDENTIALS || path.join(repository, "contracts/.credentials/testnet_funder.json");
 const outputPath = process.env.RELAYER_CREDENTIALS || path.join(repository, ".credentials/phase4-relayer.json");
 const contractId = process.env.CONTRACT_ID || "dev-20261103062448-30583839049419.testnet";
-const rpcUrl = process.env.NEAR_NODE_URL || "https://test.rpc.fastnear.com";
+const rpcUrl = process.env.DRPC_NEAR_URL
+  || process.env.NEAR_NODE_URL
+  || "https://rpc.testnet.near.org";
 
 if (fs.existsSync(outputPath)) {
   throw new Error(`Refusing to overwrite existing relayer credential: ${outputPath}`);

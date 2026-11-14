@@ -14,7 +14,9 @@ const directory = path.dirname(fileURLToPath(import.meta.url));
 const repository = path.resolve(directory, "../..");
 const funderPath = process.env.FUNDER_CREDENTIALS || path.join(repository, "contracts/.credentials/testnet_funder.json");
 const relayerPath = process.env.RELAYER_CREDENTIALS || path.join(repository, ".credentials/phase4-relayer.json");
-const rpcUrl = process.env.NEAR_NODE_URL || "https://test.rpc.fastnear.com";
+const rpcUrl = process.env.DRPC_NEAR_URL
+  || process.env.NEAR_NODE_URL
+  || "https://rpc.testnet.near.org";
 const allowance = 1_000_000_000_000_000_000_000_000n;
 
 const funder = JSON.parse(fs.readFileSync(funderPath, "utf8"));

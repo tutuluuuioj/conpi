@@ -38,7 +38,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let keys: DaoKeysFile = serde_json::from_str(&fs::read_to_string(credentials_path)?)?;
     let dao_id: near_sdk::AccountId = keys.dao_account_id.parse()?;
     let escrow_id: near_sdk::AccountId = ESCROW_ID.parse()?;
-    let worker = near_workspaces::testnet().rpc_addr("https://rpc.testnet.fastnear.com").await?;
+    let near_rpc_url = env::var("NEAR_RPC_URL")
+        .or_else(|_| env::var("DRPC_NEAR_URL"))
+        .unwrap_or_else(|_| "https://rpc.testnet.near.org".to_string());
+    let worker = near_workspaces::testnet().rpc_addr(&near_rpc_url).await?;
     let member1 = near_workspaces::Account::from_secret_key(dao_id.clone(), keys.members[0].secret_key.parse::<SecretKey>()?, &worker);
     let member2 = near_workspaces::Account::from_secret_key(dao_id.clone(), keys.members[1].secret_key.parse::<SecretKey>()?, &worker);
 
