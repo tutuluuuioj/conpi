@@ -71,8 +71,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // 2. Connect to Testnet
     println!("\nConnecting to NEAR Testnet...");
+    let near_rpc_url = env::var("NEAR_RPC_URL")
+        .unwrap_or_else(|_| "https://archival-rpc.testnet.near.org".to_string());
+    println!("Using NEAR RPC: {}", near_rpc_url);
     let worker = near_workspaces::testnet()
-        .rpc_addr("https://rpc.testnet.fastnear.com")
+        .rpc_addr(&near_rpc_url)
         .await?;
     let member1_signer = near_workspaces::Account::from_secret_key(dao_id.clone(), member1_sk, &worker);
     let member2_signer = near_workspaces::Account::from_secret_key(dao_id.clone(), member2_sk, &worker);
