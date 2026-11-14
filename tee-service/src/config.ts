@@ -11,6 +11,7 @@ const configuredNearRpcUrls = uniqueRpcUrls([
 ]);
 const nearRpcUrls = uniqueRpcUrls([
   ...configuredNearRpcUrls.filter((url) => !/fastnear\.com/i.test(url)),
+  "https://near-testnet.drpc.org",
   "https://archival-rpc.testnet.near.org",
   "https://rpc.testnet.near.org",
   // Keep the rate-limited unauthenticated FastNear endpoint as a final

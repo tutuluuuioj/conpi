@@ -14,6 +14,7 @@ const configuredPublicNearRpcs = unique([
 
 export const NEAR_RPC_ENDPOINTS = unique([
   ...configuredPublicNearRpcs.filter((url) => !/fastnear\.com/i.test(url)),
+  "https://near-testnet.drpc.org",
   "https://archival-rpc.testnet.near.org",
   "https://rpc.testnet.near.org",
   // FastNear is useful as a last-resort provider, but its unauthenticated

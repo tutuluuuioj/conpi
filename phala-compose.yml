@@ -16,7 +16,9 @@ services:
       - DAO_ID=dev-20261103021740-59711933581376.testnet
       # dRPC is primary when configured. NEAR_NODE_URL / SOLANA_RPC and the
       # built-in public endpoints remain automatic fallbacks.
-      - DRPC_NEAR_URL
+      # Public dRPC is the deterministic primary. A private paid dRPC URL can
+      # still replace this value through sealed environment configuration.
+      - DRPC_NEAR_URL=https://near-testnet.drpc.org
       - DRPC_SOLANA_URL
       - NEAR_NODE_URL
       - RATE_LIMIT_REQUESTS_PER_MINUTE=60
