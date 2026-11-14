@@ -75,6 +75,33 @@ async function runNearRelayerTests() {
   assert(capturedMethod === "clear_expired_solana_payout", "Wrong stale payout cleanup method");
   assert((capturedArgs as Record<string, any>).deal_id === 57, "Stale payout cleanup deal id mismatch");
   console.log("[PASS] Expired Solana payout cleanup is relayed with the locked deal id");
+
+  const originalFetch = globalThis.fetch;
+  try {
+    (relayer as any).rpcUrls = ["https://rate-limited.invalid", "https://healthy.invalid"];
+    const expected = { id: 61, status: "Active" };
+    globalThis.fetch = (async (input: string | URL | Request) => {
+      const url = String(input);
+      if (url.includes("rate-limited")) {
+        return new Response(JSON.stringify({
+          jsonrpc: "2.0",
+          id: "test",
+          error: { code: -429, message: "Rate limits exceeded" },
+        }), { status: 200, headers: { "Content-Type": "application/json" } });
+      }
+      return new Response(JSON.stringify({
+        jsonrpc: "2.0",
+        id: "test",
+        result: { result: Array.from(Buffer.from(JSON.stringify(expected), "utf8")) },
+      }), { status: 200, headers: { "Content-Type": "application/json" } });
+    }) as typeof fetch;
+
+    const view = await relayer.callView("get_deal", { deal_id: 61 });
+    assert(view.id === 61 && view.status === "Active", "View calls must fail over after an RPC 429");
+    console.log("[PASS] RPC 429 automatically fails over to the next NEAR provider");
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
 }
 
 runNearRelayerTests().catch((error) => {

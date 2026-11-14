@@ -1,11 +1,32 @@
 import dotenv from "dotenv";
 dotenv.config();
 
+function uniqueRpcUrls(values: Array<string | undefined>): string[] {
+  return Array.from(new Set(values.map((value) => value?.trim()).filter((value): value is string => Boolean(value))));
+}
+
+const nearRpcUrls = uniqueRpcUrls([
+  process.env.DRPC_NEAR_URL,
+  process.env.NEAR_NODE_URL,
+  "https://archival-rpc.testnet.near.org",
+  "https://rpc.testnet.near.org",
+  // Keep the rate-limited unauthenticated FastNear endpoint as a final
+  // fallback only. A 429 there must never be the first result users see.
+  "https://rpc.testnet.fastnear.com",
+]);
+
+const solanaRpcUrls = uniqueRpcUrls([
+  process.env.DRPC_SOLANA_URL,
+  process.env.SOLANA_RPC,
+  "https://api.devnet.solana.com",
+]);
+
 export const CONFIG = {
   port: parseInt(process.env.PORT || "3000", 10),
   host: process.env.HOST || "0.0.0.0",
   networkId: process.env.NEAR_NETWORK || "testnet",
-  nodeUrl: process.env.NEAR_NODE_URL || "https://rpc.testnet.fastnear.com",
+  nearRpcUrls,
+  nodeUrl: nearRpcUrls[0],
   contractId: process.env.CONTRACT_ID || "dev-20261103062448-30583839049419.testnet",
   daoId: process.env.DAO_ID || "dev-20261103021740-59711933581376.testnet",
   dstackSocketPath: process.env.DSTACK_SOCKET_PATH || "/var/run/tappd.sock",
@@ -27,7 +48,8 @@ export const CONFIG = {
   relayerMaxAttempts: Math.max(1, parseInt(process.env.RELAYER_MAX_ATTEMPTS || "8", 10)),
   relayerRetryBaseMs: Math.max(25, parseInt(process.env.RELAYER_RETRY_BASE_MS || "1000", 10)),
   meteringStateDir: process.env.METERING_STATE_DIR || (process.env.NODE_ENV === "test" ? `/tmp/conpi-metering-${process.pid}` : "/var/lib/conpi"),
-  solanaRpcUrl: process.env.SOLANA_RPC || "https://api.devnet.solana.com",
+  solanaRpcUrls,
+  solanaRpcUrl: solanaRpcUrls[0],
   solanaUsdcMint: process.env.SOLANA_USDC_MINT || "4zMMC9srt5Ri5X14GAgXhaHii3GnPAEERYPJgZJDncDU",
   solanaMpcVault: process.env.SOLANA_MPC_VAULT || "CtHaZkSC8e58VGtUmggu8WiH6fJ7RvUgiZNJtXu6SGp6",
   solanaMpcPath: process.env.SOLANA_MPC_PATH || "conpi-solana-maker-v1",

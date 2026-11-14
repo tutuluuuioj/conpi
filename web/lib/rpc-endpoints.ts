@@ -10,8 +10,12 @@ function unique(values: Array<string | undefined>): string[] {
 export const NEAR_RPC_ENDPOINTS = unique([
   process.env.NEXT_PUBLIC_DRPC_NEAR_URL,
   process.env.NEXT_PUBLIC_NEAR_RPC,
-  "https://test.rpc.fastnear.com",
   "https://archival-rpc.testnet.near.org",
+  "https://rpc.testnet.near.org",
+  // FastNear is useful as a last-resort provider, but its unauthenticated
+  // endpoint throttles frequently. Never bind the wallet or first view read
+  // to it when a healthier endpoint is available.
+  "https://test.rpc.fastnear.com",
 ]);
 
 export const SOLANA_RPC_ENDPOINTS = unique([
@@ -27,8 +31,8 @@ export const PRIMARY_SOLANA_RPC = SOLANA_RPC_ENDPOINTS[0];
 export function serverNearRpcEndpoints(): string[] {
   return unique([
     process.env.DRPC_NEAR_URL,
+    process.env.NEAR_NODE_URL,
     ...NEAR_RPC_ENDPOINTS,
-    "https://rpc.testnet.near.org",
   ]);
 }
 

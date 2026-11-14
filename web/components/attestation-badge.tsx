@@ -30,7 +30,11 @@ export function AttestationBadge({ showLink = true }: { showLink?: boolean }) {
           setResult(res);
           setLoading(false);
           try {
-            sessionStorage.setItem("conpi:attestation_badge", JSON.stringify(res));
+            if (res.verified) {
+              sessionStorage.setItem("conpi:attestation_badge", JSON.stringify(res));
+            } else {
+              sessionStorage.removeItem("conpi:attestation_badge");
+            }
           } catch {}
         }
       })

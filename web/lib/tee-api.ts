@@ -321,6 +321,21 @@ export const teeApi = {
   },
 
   async getNearDeal(dealId: number): Promise<any> {
+    // Keep public RPC credentials on the server and fail over there first.
+    // This path is independent of both the wallet's selected node and the CVM,
+    // so a rate limit on either one cannot block Solana seller acceptance.
+    if (typeof window !== "undefined") {
+      try {
+        const localRes = await fetch(`/api/chain/deal/${dealId}`, { cache: "no-store" });
+        if (localRes.ok) {
+          const local = await localRes.json();
+          if (local?.ok) return local.deal;
+        }
+      } catch {
+        // Continue to the enclave and direct-provider fallbacks below.
+      }
+    }
+
     // Prefer the enclave's chain view. Apart from avoiding a second browser-side
     // RPC dependency, this guarantees the seller signs the same deal state that
     // the enclave will validate and relay.
@@ -368,8 +383,22 @@ export const teeApi = {
   },
 
   async getSolanaVaultConfig(): Promise<any> {
+    if (typeof window !== "undefined") {
+      try {
+        const localRes = await fetch("/api/solana-vault", { cache: "no-store" });
+        if (localRes.ok) {
+          const local = await localRes.json();
+          if (local?.ok && local.vault) return local.vault;
+        }
+      } catch {
+        // The enclave has its own provider list and pinned safe fallback.
+      }
+    }
     const res = await fetch(`${TEE_BASE_URL}/v1/solana/vault`, { cache: "no-store" });
-    if (!res.ok) throw new Error(`Failed to fetch Solana vault configuration: ${res.statusText}`);
+    if (!res.ok) {
+      const body = await res.json().catch(() => ({}));
+      throw new Error(body?.error || `Failed to fetch Solana vault configuration: ${res.statusText}`);
+    }
     return res.json();
   },
 

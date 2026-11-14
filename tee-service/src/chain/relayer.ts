@@ -3,12 +3,12 @@ import { Account, JsonRpcProvider, KeyPairSigner } from "near-api-js";
 import { foreignRelayer } from "./foreign-relayer.js";
 
 export class NearRelayer {
-  private rpcUrl: string;
+  private rpcUrls: string[];
   private relayerAccountId: string | null;
   private relayerPrivateKey: string | null;
 
   constructor() {
-    this.rpcUrl = CONFIG.nodeUrl;
+    this.rpcUrls = CONFIG.nearRpcUrls;
     this.relayerAccountId = process.env.RELAYER_ACCOUNT_ID || null;
     this.relayerPrivateKey = process.env.RELAYER_PRIVATE_KEY || null;
   }
@@ -24,38 +24,47 @@ export class NearRelayer {
 
   public async callView(methodName: string, args: Record<string, any> = {}): Promise<any> {
     const argsBase64 = Buffer.from(JSON.stringify(args)).toString("base64");
-    const response = await fetch(this.rpcUrl, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({
-        jsonrpc: "2.0",
-        id: "conpi-tee-view",
-        method: "query",
-        params: {
-          request_type: "call_function",
-          finality: "final",
-          account_id: CONFIG.contractId,
-          method_name: methodName,
-          args_base64: argsBase64,
-        },
-      }),
-    });
-
-    const data: any = await response.json();
-    if (data.error) {
-      throw new Error(`RPC Error in ${methodName}: ${JSON.stringify(data.error)}`);
-    }
-
-    if (data.result && data.result.result) {
-      const resultStr = Buffer.from(data.result.result).toString("utf8");
-      try {
-        const sanitized = resultStr.replace(/:\s*([0-9]{15,})\b/g, ':"$1"');
-        return JSON.parse(sanitized);
-      } catch {
-        return resultStr;
+    let lastError: Error | null = null;
+    for (let attempt = 0; attempt < 2; attempt += 1) {
+      for (const rpcUrl of this.rpcUrls) {
+        try {
+          const response = await fetch(rpcUrl, {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            signal: AbortSignal.timeout(10_000),
+            body: JSON.stringify({
+              jsonrpc: "2.0",
+              id: `conpi-tee-view-${methodName}-${Date.now()}-${attempt}`,
+              method: "query",
+              params: {
+                request_type: "call_function",
+                finality: "final",
+                account_id: CONFIG.contractId,
+                method_name: methodName,
+                args_base64: argsBase64,
+              },
+            }),
+          });
+          if (!response.ok) throw new Error(`HTTP ${response.status}`);
+          const data: any = await response.json();
+          if (data.error) throw new Error(JSON.stringify(data.error));
+          if (data.result && data.result.result) {
+            const resultStr = Buffer.from(data.result.result).toString("utf8");
+            try {
+              const sanitized = resultStr.replace(/:\s*([0-9]{15,})\b/g, ':"$1"');
+              return JSON.parse(sanitized);
+            } catch {
+              return resultStr;
+            }
+          }
+          return null;
+        } catch (error: any) {
+          lastError = new Error(`NEAR RPC ${rpcUrl} failed in ${methodName}: ${error?.message || error}`);
+        }
       }
+      if (attempt === 0) await new Promise((resolve) => setTimeout(resolve, 250));
     }
-    return null;
+    throw lastError || new Error(`All NEAR RPC endpoints failed in ${methodName}`);
   }
 
   public async submitFunctionCall(
@@ -68,22 +77,29 @@ export class NearRelayer {
       throw new Error("Relayer account credentials not configured (RELAYER_ACCOUNT_ID and RELAYER_PRIVATE_KEY)");
     }
 
-    const provider = new JsonRpcProvider({ url: this.rpcUrl });
     const signer = KeyPairSigner.fromSecretKey(this.relayerPrivateKey as any);
-    const account = new Account(this.relayerAccountId, provider, signer);
-    const result: any = await account.callFunctionRaw({
-      contractId: CONFIG.contractId,
-      methodName,
-      args,
-      gas: BigInt(gasYocto),
-      deposit: BigInt(attachedDeposit),
-    });
-
-    return {
-      transactionHash: result.transaction.hash,
-      status: result.status,
-      receiptsOutcome: result.receipts_outcome,
-    };
+    let lastError: Error | null = null;
+    for (const rpcUrl of this.rpcUrls) {
+      try {
+        const provider = new JsonRpcProvider({ url: rpcUrl });
+        const account = new Account(this.relayerAccountId, provider, signer);
+        const result: any = await account.callFunctionRaw({
+          contractId: CONFIG.contractId,
+          methodName,
+          args,
+          gas: BigInt(gasYocto),
+          deposit: BigInt(attachedDeposit),
+        });
+        return {
+          transactionHash: result.transaction.hash,
+          status: result.status,
+          receiptsOutcome: result.receipts_outcome,
+        };
+      } catch (error: any) {
+        lastError = new Error(`NEAR RPC ${rpcUrl} failed in ${methodName}: ${error?.message || error}`);
+      }
+    }
+    throw lastError || new Error(`All NEAR RPC endpoints failed in ${methodName}`);
   }
 
   private extractForeignTxSignedEvent(receiptsOutcome?: any[]): any {

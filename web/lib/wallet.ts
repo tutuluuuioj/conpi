@@ -9,6 +9,7 @@ import { setupMeteorWallet } from "@near-wallet-selector/meteor-wallet";
 import { setupHereWallet } from "@near-wallet-selector/here-wallet";
 import { transactions } from "near-api-js";
 import { CONTRACT_ID } from "./chain";
+import { PRIMARY_NEAR_RPC } from "./rpc-endpoints";
 
 let selectorPromise: Promise<{ selector: WalletSelector; modal: WalletSelectorModal }> | null = null;
 
@@ -20,7 +21,7 @@ export async function getWalletSelector() {
       const selector = await setupWalletSelector({
         network: {
           networkId: "testnet",
-          nodeUrl: "https://test.rpc.fastnear.com",
+          nodeUrl: PRIMARY_NEAR_RPC,
           helperUrl: "https://helper.testnet.near.org",
           explorerUrl: "https://testnet.nearblocks.io",
           indexerUrl: "https://testnet-api.kitwallet.app",

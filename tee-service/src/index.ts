@@ -609,7 +609,22 @@ export async function buildApp() {
   });
 
   app.get("/v1/solana/vault", async () => {
-    return nearRelayer.callView("get_solana_vault_config", {});
+    try {
+      return await nearRelayer.callView("get_solana_vault_config", {});
+    } catch (error) {
+      // These public values are pinned in the runtime and are also validated
+      // by accept_deal_solana on-chain. Returning them keeps seller acceptance
+      // available during a temporary RPC outage; stale values fail safely at
+      // the contract rather than sending funds to an unchecked destination.
+      app.log.warn({ error }, "NEAR RPC unavailable while reading Solana vault; using pinned runtime values");
+      return {
+        vault_address: CONFIG.solanaMpcVault,
+        token_mint: CONFIG.solanaUsdcMint,
+        mpc_path: CONFIG.solanaMpcPath,
+        mpc_domain_id: CONFIG.solanaMpcDomainId,
+        source: "runtime-fallback",
+      };
+    }
   });
 
   // These are public, already-on-chain deal terms.  The frontend needs the
