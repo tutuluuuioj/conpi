@@ -73,7 +73,7 @@ export function DealView({ id }: { id: string }) {
   const [snippet, setSnippet] = useState<"curl" | "python" | "node">("curl");
   const [report, setReport] = useState("");
   const [keyHidden, setKeyHidden] = useState<boolean>(false);
-  const [proxyKeyInput, setProxyKeyInput] = useState("");
+  const [isClaimingBuyerKey, setIsClaimingBuyerKey] = useState(false);
   const [chatMsg, setChatMsg] = useState("");
   const [sellerEvmAddress, setSellerEvmAddress] = useState("");
   const [foreignInfo, setForeignInfo] = useState<any>(null);
@@ -334,6 +334,22 @@ export function DealView({ id }: { id: string }) {
       (nearAcc && nearAcc.toLowerCase() === canonicalSeller)
     );
   }, [deal?.role, deal?.seller, deal?.sellerCanonical, app.account, app.solanaAccount, app.evmAccount, app.nearAccount, app.walletChain]);
+
+  const isBuyerParty = useMemo(() => {
+    if (!deal) return false;
+    const canonicalBuyer = (deal.buyerCanonical || toNearAccountId(deal.buyer)).toLowerCase();
+    const activeAccount = (
+      app.walletChain === "near" ? app.nearAccount || app.account :
+      app.walletChain === "solana" ? app.solanaAccount || app.account :
+      app.walletChain === "evm" ? app.evmAccount || app.account :
+      app.account
+    )?.trim();
+    if (!activeAccount) return false;
+    return (
+      activeAccount.toLowerCase() === canonicalBuyer ||
+      toNearAccountId(activeAccount).toLowerCase() === canonicalBuyer
+    );
+  }, [deal?.buyer, deal?.buyerCanonical, app.account, app.solanaAccount, app.evmAccount, app.nearAccount, app.walletChain]);
 
   const isBuyerRole = !isSellerParty;
   const isSolanaSellerDeal = Boolean(
@@ -703,9 +719,13 @@ export function DealView({ id }: { id: string }) {
     app.submitSellerKey(deal.id, submittedKey);
   };
 
-  const importProxyKey = async (event: FormEvent) => {
-    event.preventDefault();
-    if (await app.importProxyKey(deal.id, proxyKeyInput)) setProxyKeyInput("");
+  const claimBuyerKey = async () => {
+    setIsClaimingBuyerKey(true);
+    try {
+      await app.claimBuyerProxyKey(deal.id);
+    } finally {
+      setIsClaimingBuyerKey(false);
+    }
   };
 
   const deposit = () => {
@@ -1276,7 +1296,7 @@ export function DealView({ id }: { id: string }) {
                   <div>
                     <div className="flex items-center justify-between">
                       <Overline>API key</Overline>
-                      {deal.proxyKey && keyHidden ? (
+                      {!isSellerParty && isBuyerParty && deal.proxyKey && keyHidden ? (
                         <button
                           type="button"
                           className="text-xs font-semibold text-brand hover:underline"
@@ -1287,7 +1307,17 @@ export function DealView({ id }: { id: string }) {
                       ) : null}
                     </div>
                     <div className="mt-1">
-                      {deal.proxyKey ? (
+                      {isSellerParty ? (
+                        <div className="rounded-md border border-mint/30 bg-mint/10 px-4 py-3">
+                          <div className="flex items-center gap-2 font-semibold text-mint">
+                            <ShieldCheck className="h-4 w-4" />
+                            Provider key verified
+                          </div>
+                          <p className="mt-1 text-sm text-muted">
+                            The TEE activated the deal and delivered no proxy credential to the seller. Only the authenticated buyer wallet can claim it.
+                          </p>
+                        </div>
+                      ) : deal.proxyKey && isBuyerParty ? (
                         keyHidden ? (
                           <div className="flex items-center justify-between gap-2 rounded-md border border-line bg-surface-2 px-3 py-2 text-xs">
                             <div className="flex items-center gap-2 min-w-0">
@@ -1321,31 +1351,34 @@ export function DealView({ id }: { id: string }) {
                             </p>
                           </div>
                         )
+                      ) : isBuyerParty ? (
+                        <div className="space-y-2 rounded-md border border-line bg-surface-2 px-4 py-3">
+                          <p className="text-sm text-muted">
+                            Sign once with the buyer wallet to receive this deal&apos;s TEE-issued proxy key. No transaction or gas is required.
+                          </p>
+                          <Button type="button" onClick={claimBuyerKey} disabled={isClaimingBuyerKey}>
+                            {isClaimingBuyerKey ? <Loader2 className="mr-2 h-4 w-4 animate-spin" /> : <Lock className="mr-2 h-4 w-4" />}
+                            Claim buyer proxy key
+                          </Button>
+                        </div>
                       ) : (
-                        <form className="space-y-2" onSubmit={importProxyKey}>
-                          <p className="text-sm text-muted">Paste this deal&apos;s TEE-issued buyer key to authenticate the private live meter.</p>
-                          <div className="flex flex-col gap-2 sm:flex-row">
-                            <input
-                              className={`${fieldClass} flex-1 font-mono`}
-                              type="password"
-                              autoComplete="off"
-                              placeholder="cpk_live_…"
-                              value={proxyKeyInput}
-                              onChange={(event) => setProxyKeyInput(event.target.value)}
-                            />
-                            <Button type="submit">Connect meter</Button>
-                          </div>
-                        </form>
+                        <div className="rounded-md border border-line bg-surface-2 px-4 py-3 text-sm text-muted">
+                          Connect the buyer wallet <span className="font-mono text-ink">{deal.buyer}</span> to claim the private proxy key.
+                        </div>
                       )}
                     </div>
                   </div>
                 </div>
-                <div className="mt-4 flex gap-2 text-sm">
-                  {(["curl", "python", "node"] as const).map((tab) => (
-                    <button key={tab} type="button" className={`rounded px-2 py-1 font-semibold ${snippet === tab ? "bg-surface-2 text-ink" : "text-muted"}`} onClick={() => setSnippet(tab)}>{tab}</button>
-                  ))}
-                </div>
-                <pre className="mt-2 overflow-auto rounded-md border border-line bg-bg p-3 font-mono text-xs leading-5">{snippets[snippet]}</pre>
+                {!isSellerParty && isBuyerParty && deal.proxyKey ? (
+                  <>
+                    <div className="mt-4 flex gap-2 text-sm">
+                      {(["curl", "python", "node"] as const).map((tab) => (
+                        <button key={tab} type="button" className={`rounded px-2 py-1 font-semibold ${snippet === tab ? "bg-surface-2 text-ink" : "text-muted"}`} onClick={() => setSnippet(tab)}>{tab}</button>
+                      ))}
+                    </div>
+                    <pre className="mt-2 overflow-auto rounded-md border border-line bg-bg p-3 font-mono text-xs leading-5">{snippets[snippet]}</pre>
+                  </>
+                ) : null}
               </Card>
               <Card>
                 <div className="flex items-end justify-between gap-3">

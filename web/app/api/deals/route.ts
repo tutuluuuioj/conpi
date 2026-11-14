@@ -5,11 +5,9 @@ import { NextResponse } from "next/server";
 import fs from "fs";
 import path from "path";
 import { CONTRACT_ID } from "@/lib/chain";
+import { serverNearRpcEndpoints } from "@/lib/rpc-endpoints";
 
-const RPC_ENDPOINTS = [
-  "https://test.rpc.fastnear.com",
-  "https://archival-rpc.testnet.near.org",
-];
+const RPC_ENDPOINTS = serverNearRpcEndpoints();
 
 function annotateWithVaultDeposits(deals: any[]): any[] {
   const possiblePaths = [
@@ -59,10 +57,13 @@ function annotateWithVaultDeposits(deals: any[]): any[] {
   }
 
   return deals.map((deal) => {
+    // A proxy credential is a bearer secret owned by the on-chain buyer. It
+    // must never be serialized by this shared/public deal-list endpoint.
+    const { proxyKey: _privateBuyerCredential, ...publicDeal } = deal;
     const activeInfo = activeDeals[String(deal.id)];
     const dealTxs = usedTxs.filter((tx) => Number(tx.dealId) === Number(deal.id));
     const dealPayouts = dispatchedPayouts.filter((p) => Number(p.dealId) === Number(deal.id) && !p.isRefund);
-    if (!dealTxs.length && !activeInfo && !dealPayouts.length) return deal;
+    if (!dealTxs.length && !activeInfo && !dealPayouts.length) return publicDeal;
 
     const hasNearDeposit = dealTxs.some((tx) => tx.chain === "near");
     const hasSolanaDeposit = dealTxs.some((tx) => tx.chain === "solana");
@@ -83,7 +84,7 @@ function annotateWithVaultDeposits(deals: any[]): any[] {
     const totalReleasedAtomic = dealPayouts.reduce((sum, p) => sum + BigInt(p.amountAtomic || 0), BigInt(0));
 
     return {
-      ...deal,
+      ...publicDeal,
       vault_buyer_deposited: vaultBuyerDeposited,
       vault_seller_deposited: vaultSellerDeposited,
       vault_deposits: dealTxs,
@@ -92,7 +93,6 @@ function annotateWithVaultDeposits(deals: any[]): any[] {
       releasedUsd: totalReleasedUsdc > 0 ? totalReleasedUsdc : deal.releasedUsd,
       stage_reached: Math.max(Number(deal.stage_reached || 0), dealPayouts.length * 25),
       status: resolvedStatus,
-      proxyKey: activeInfo?.proxyKey || deal.proxyKey,
       baseUrl: activeInfo ? "http://localhost:4000/v1" : undefined,
       active_vault_deal: Boolean(activeInfo),
     };

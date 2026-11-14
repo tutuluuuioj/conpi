@@ -1,13 +1,29 @@
 import { CONTRACT_ID } from "./chain";
+import { NEAR_RPC_ENDPOINTS } from "./rpc-endpoints";
 import type { SellerKeyAuthorization } from "./seller-key-auth";
+import type { BuyerKeyAuthorization } from "./buyer-key-auth";
 
 const TEE_BASE_URL =
   process.env.NEXT_PUBLIC_TEE_URL ||
   "https://ce5044ca834d2da5bb1252706bfa3b2c91d7d934-3000.dstack-pha1-prod5.phala.network";
-// The legacy NEAR testnet RPCs have been retired. Keep the browser fallback on
-// the same maintained endpoint used by the enclave so cross-chain acceptance
-// does not fail just because one public RPC hostname disappeared.
-const NEAR_RPC_URL = process.env.NEXT_PUBLIC_NEAR_RPC || "https://test.rpc.fastnear.com";
+
+async function queryNearRpc(body: Record<string, unknown>): Promise<any | null> {
+  for (const rpcUrl of NEAR_RPC_ENDPOINTS) {
+    try {
+      const response = await fetch(rpcUrl, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        cache: "no-store",
+        signal: AbortSignal.timeout(8_000),
+        body: JSON.stringify(body),
+      });
+      if (!response.ok) continue;
+      const data = await response.json();
+      if (!data?.error) return data;
+    } catch {}
+  }
+  return null;
+}
 
 export interface TeeAttestation {
   inEnclave: boolean;
@@ -40,12 +56,18 @@ export interface KeyCheckApiResponse {
   ok: boolean;
   modelAvailable: boolean;
   balanceCoversCredit: boolean;
-  proxyKey?: string;
   activatePayload?: any;
   activateSignatureHex?: string;
   activationRelayed?: boolean;
   activationAlreadyActive?: boolean;
   activationTxHash?: string;
+  error?: string;
+}
+
+export interface BuyerKeyClaimResponse {
+  ok: boolean;
+  proxyKey?: string;
+  baseUrl?: string;
   error?: string;
 }
 
@@ -203,6 +225,17 @@ export const teeApi = {
     return res.json();
   },
 
+  async claimBuyerKey(dealId: number, buyerAuthorization: BuyerKeyAuthorization): Promise<BuyerKeyClaimResponse> {
+    const res = await fetch(`${TEE_BASE_URL}/v1/deals/${dealId}/buyer-key`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ buyerAuthorization }),
+    });
+    const body = await res.json().catch(() => ({ ok: false, error: res.statusText }));
+    if (!res.ok && !body.error) body.error = `Buyer key claim failed with HTTP ${res.status}`;
+    return body;
+  },
+
   async getMeter(dealId: number, proxyKey: string): Promise<MeterResponse> {
     const endpoints = [
       `${TEE_BASE_URL}/v1/deals/${dealId}/meter`,
@@ -265,23 +298,18 @@ export const teeApi = {
 
   async getNearContractConfig(): Promise<any> {
     try {
-      const res = await fetch(NEAR_RPC_URL, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          jsonrpc: "2.0",
-          id: "get_config",
-          method: "query",
-          params: {
-            request_type: "call_function",
-            finality: "final",
-            account_id: CONTRACT_ID,
-            method_name: "get_config",
-            args_base64: "",
-          },
-        }),
+      const data = await queryNearRpc({
+        jsonrpc: "2.0",
+        id: "get_config",
+        method: "query",
+        params: {
+          request_type: "call_function",
+          finality: "final",
+          account_id: CONTRACT_ID,
+          method_name: "get_config",
+          args_base64: "",
+        },
       });
-      const data = await res.json();
       if (data?.result?.result) {
         const text = new TextDecoder().decode(new Uint8Array(data.result.result));
         return JSON.parse(text);
@@ -308,24 +336,19 @@ export const teeApi = {
 
     try {
       const argsBase64 = btoa(JSON.stringify({ deal_id: dealId }));
-      const res = await fetch(NEAR_RPC_URL, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          jsonrpc: "2.0",
-          id: `deal_${dealId}`,
-          method: "query",
-          params: {
-            request_type: "call_function",
-            finality: "final",
-            account_id: CONTRACT_ID,
-            method_name: "get_deal",
-            args_base64: argsBase64,
-          },
-        }),
+      const data = await queryNearRpc({
+        jsonrpc: "2.0",
+        id: `deal_${dealId}`,
+        method: "query",
+        params: {
+          request_type: "call_function",
+          finality: "final",
+          account_id: CONTRACT_ID,
+          method_name: "get_deal",
+          args_base64: argsBase64,
+        },
       });
-      const data = await res.json();
-      if (!res.ok || data?.error) return null;
+      if (!data || data?.error) return null;
       if (data?.result?.result) {
         const text = new TextDecoder().decode(new Uint8Array(data.result.result));
         return JSON.parse(text);

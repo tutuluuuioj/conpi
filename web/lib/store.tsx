@@ -50,6 +50,7 @@ import { connectSolanaWallet, disconnectSolanaWallet, signSolanaDealAcceptance }
 import { toNearAccountId, fromNearAccountId, isValidNearAccountId } from "./near-account";
 import { MAKER_VAULT_CONFIG } from "./maker-vault";
 import { signSellerKeyAuthorization } from "./seller-key-auth";
+import { signBuyerKeyAuthorization } from "./buyer-key-auth";
 import {
   OnChainDeal,
   fetchContractDeals,
@@ -187,6 +188,7 @@ interface Api {
     sellerPayoutAddress?: string
   ) => Promise<SignResult>;
   submitSellerKey: (dealId: string, plainApiKey?: string) => Promise<void>;
+  claimBuyerProxyKey: (dealId: string) => Promise<boolean>;
   releaseStagePayout: (dealId: string) => Promise<SignResult>;
   triggerDefaultSettlement: (dealId: string, reason?: string) => Promise<SignResult>;
   syncMeterState: (dealId: string, silent?: boolean) => Promise<void>;
@@ -784,6 +786,17 @@ export function Providers({ children }: { children: React.ReactNode }) {
           if (raw) Object.assign(storedKeys, JSON.parse(raw));
         } catch {}
       }
+      const activeWalletAccount = (
+        stateRef.current.walletChain === "near" ? stateRef.current.nearAccount || stateRef.current.account :
+        stateRef.current.walletChain === "solana" ? stateRef.current.solanaAccount || stateRef.current.account :
+        stateRef.current.walletChain === "evm" ? stateRef.current.evmAccount || stateRef.current.account :
+        stateRef.current.account
+      )?.trim() || "";
+      const activeWalletCanonical = activeWalletAccount ? toNearAccountId(activeWalletAccount).toLowerCase() : "";
+      const activeWalletIsBuyer = (rawDeal: any) => {
+        const buyerCanonical = String(rawDeal?.buyer || "").trim().toLowerCase();
+        return Boolean(activeWalletCanonical && buyerCanonical && activeWalletCanonical === buyerCanonical);
+      };
       let localListings: Listing[] = [];
       if (typeof window !== "undefined") {
         try {
@@ -800,6 +813,7 @@ export function Providers({ children }: { children: React.ReactNode }) {
       const activeDeals = safeOnChainDeals.filter((d) => d.status === "Active" || d.status === "Funded");
       await Promise.all(
         activeDeals.map(async (d) => {
+          if (!activeWalletIsBuyer(d)) return;
           const proxyKey = storedKeys[String(d.id)] || stateRef.current.deals.find((item) => item.id === String(d.id))?.proxyKey;
           if (!proxyKey) return;
           try {
@@ -855,7 +869,9 @@ export function Providers({ children }: { children: React.ReactNode }) {
           const listing = metadataListings.find((item) => String(item.dealId || "") === String(d.id));
           const foreignDeal = foreignDealsMap.get(Number(d.id));
           const mapped = mapOnChainDeal(d, currentAccount, listing, foreignDeal, existing);
-          const resolvedProxyKey = existing?.proxyKey || storedKeys[String(d.id)] || "";
+          const buyerCanonical = (mapped.buyerCanonical || toNearAccountId(mapped.buyer)).toLowerCase();
+          const isActiveBuyer = Boolean(activeWalletCanonical && activeWalletCanonical === buyerCanonical);
+          const resolvedProxyKey = isActiveBuyer ? (existing?.proxyKey || storedKeys[String(d.id)] || "") : "";
           const liveMeter = meterMap.get(Number(d.id));
 
           const creditUsd = Number(liveMeter?.creditUsd) || existing?.creditUsd || mapped.credit;
@@ -2324,36 +2340,71 @@ export function Providers({ children }: { children: React.ReactNode }) {
             throw new Error("Activation transaction was rejected or failed on-chain");
           }
 
-          if (res.proxyKey) {
-            if (typeof window !== "undefined") {
-              try {
-                const raw = localStorage.getItem("conpi:deal_keys");
-                const parsed = raw ? JSON.parse(raw) : {};
-                parsed[String(dealId)] = res.proxyKey;
-                localStorage.setItem("conpi:deal_keys", JSON.stringify(parsed));
-              } catch {}
-            }
-          }
-
           patchDeal(dealId, (item) => ({
             ...item,
             status: "Active",
             step: "live",
-            proxyKey: res.proxyKey || "",
+            proxyKey: "",
             keyStatus: "verified",
             keyChecks: KEY_CHECKS.map((label) => ({ label, ok: true })),
-            activity: [{ id: crypto.randomUUID(), title: "Deal Activated via TEE", detail: "Hardware proof verified. Proxy key live.", tx: txHash || undefined, time: "Now" }, ...item.activity],
+            activity: [{ id: crypto.randomUUID(), title: "Provider Key Verified", detail: "TEE activated the deal. Only the authenticated buyer can claim the proxy key.", tx: txHash || undefined, time: "Now" }, ...item.activity],
           }));
 
           pushToast({
             kind: "success",
             title: "Deal Activated!",
-            body: res.activationRelayed ? "TEE relayer activated the deal. Proxy key is ready for inference." : "Proxy key is active and ready for inference.",
+            body: "Provider key verified and deal activated. The buyer can now claim the private proxy key with their wallet.",
             href: txHash ? `https://testnet.nearblocks.io/txns/${txHash}` : undefined,
           });
           setTimeout(loadOnChainData, 2000);
         } catch (err: any) {
           pushToast({ kind: "error", title: "Key activation failed", body: err.message });
+        }
+      },
+      claimBuyerProxyKey: async (dealId) => {
+        const deal = stateRef.current.deals.find((item) => item.id === dealId);
+        if (!deal) return false;
+        try {
+          const current = stateRef.current;
+          const activeAccount = (
+            current.walletChain === "near" ? current.nearAccount || current.account :
+            current.walletChain === "solana" ? current.solanaAccount || current.account :
+            current.walletChain === "evm" ? current.evmAccount || current.account :
+            current.account
+          )?.trim();
+          if (!activeAccount) throw new Error("Connect the buyer wallet first");
+          const buyerCanonical = (deal.buyerCanonical || toNearAccountId(deal.buyer)).toLowerCase();
+          if (toNearAccountId(activeAccount).toLowerCase() !== buyerCanonical) {
+            throw new Error(`Connect the buyer wallet (${deal.buyer}) to claim this key`);
+          }
+
+          pushToast({ kind: "pending", title: "Confirm buyer key claim in your wallet" });
+          const buyerAuthorization = await signBuyerKeyAuthorization(current.walletChain, {
+            dealId: Number(dealId),
+            buyer: buyerCanonical,
+          });
+          const result = await teeApi.claimBuyerKey(Number(dealId), buyerAuthorization);
+          if (!result.ok || !result.proxyKey) throw new Error(result.error || "TEE did not return the buyer key");
+          const meterData = await teeApi.getMeter(Number(dealId), result.proxyKey);
+          if (typeof window !== "undefined") {
+            const raw = localStorage.getItem("conpi:deal_keys");
+            const stored = raw ? JSON.parse(raw) : {};
+            stored[String(dealId)] = result.proxyKey;
+            localStorage.setItem("conpi:deal_keys", JSON.stringify(stored));
+          }
+          patchDeal(dealId, (item) => ({
+            ...item,
+            proxyKey: result.proxyKey || "",
+            baseUrl: BASE_URL,
+            heartbeat: "live",
+            usedUsd: Number(meterData.usedUsd ?? item.usedUsd),
+            tokens: Number(meterData.tokensTotal ?? item.tokens),
+          }));
+          pushToast({ kind: "success", title: "Buyer proxy key received", body: "The credential is stored only in this buyer browser." });
+          return true;
+        } catch (err: any) {
+          pushToast({ kind: "error", title: "Buyer key claim failed", body: err?.message || String(err) });
+          return false;
         }
       },
       releaseStagePayout: async (dealId) => {

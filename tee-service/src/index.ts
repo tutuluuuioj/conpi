@@ -34,9 +34,18 @@ import {
   consumeSellerKeyAuthorizationNonce,
   type SellerKeyAuthorization,
 } from "./auth/seller-key.js";
+import {
+  verifyBuyerKeyAuthorization,
+  type BuyerKeyAuthorization,
+} from "./auth/buyer-key.js";
 
 export const app = Fastify({ logger: false });
 const keyInjectionLocks = new Set<number>();
+
+export function sellerSafeKeyResult<T extends Record<string, any>>(result: T): Omit<T, "proxyKey"> {
+  const { proxyKey: _secretBuyerCredential, ...safe } = result;
+  return safe;
+}
 
 let initialized = false;
 export async function buildApp() {
@@ -221,7 +230,6 @@ export async function buildApp() {
               return reply.status(502).send({
                 ok: false,
                 error: `TEE activation relay failed: ${error?.message || String(error)}`,
-                proxyKey: existing.proxyKey,
                 activatePayload: publicActivation.payload,
                 activateSignatureHex: publicActivation.signatureHex,
                 keyAlreadyInjected: true,
@@ -233,7 +241,6 @@ export async function buildApp() {
           ok: true,
           modelAvailable: true,
           balanceCoversCredit: true,
-          proxyKey: existing.proxyKey,
           activatePayload: publicActivation.payload,
           activateSignatureHex: publicActivation.signatureHex,
           activationRelayed,
@@ -273,7 +280,7 @@ export async function buildApp() {
           });
         }
         return {
-          ...result,
+          ...sellerSafeKeyResult(result),
           activationRelayed: true,
           activationAlreadyActive: true,
         };
@@ -292,7 +299,7 @@ export async function buildApp() {
           );
           if (entry) entry.onChainStatus = "Active";
           return {
-            ...result,
+            ...sellerSafeKeyResult(result),
             activationRelayed: true,
             activationTxHash: activation.transactionHash,
           };
@@ -304,26 +311,65 @@ export async function buildApp() {
           if (String(refreshed?.status || "").toLowerCase() === "active") {
             if (entry) entry.onChainStatus = "Active";
             return {
-              ...result,
+              ...sellerSafeKeyResult(result),
               activationRelayed: true,
               activationAlreadyActive: true,
             };
           }
           return reply.status(502).send({
-            ...result,
+            ...sellerSafeKeyResult(result),
             ok: false,
             error: `TEE activation relay failed: ${error?.message || String(error)}`,
           });
         }
       }
 
-      return result;
+      return sellerSafeKeyResult(result);
     } catch (err: any) {
       const message = err?.message || String(err);
       const authFailure = /seller|signature|authorization|wallet|nonce|public key/i.test(message);
       return reply.status(authFailure ? 401 : 500).send({ ok: false, error: message });
     } finally {
       if (injectionLocked) keyInjectionLocks.delete(dealId);
+    }
+  });
+
+  // The provider-key endpoint above is seller-only and never returns the proxy
+  // credential. The exact on-chain buyer must separately prove wallet control
+  // to claim it, preventing the seller (or any observer) from consuming the
+  // buyer's purchased credit.
+  app.post("/v1/deals/:id/buyer-key", async (req, reply) => {
+    const { id } = req.params as { id: string };
+    const dealId = parseInt(id, 10);
+    const { buyerAuthorization } = req.body as { buyerAuthorization?: BuyerKeyAuthorization };
+    try {
+      if (!Number.isSafeInteger(dealId) || dealId <= 0) {
+        return reply.status(400).send({ ok: false, error: "Invalid deal id" });
+      }
+      const onChainDeal = await nearRelayer.getDeal(dealId);
+      if (!onChainDeal?.buyer) {
+        return reply.status(404).send({ ok: false, error: `Deal #${dealId} was not found on-chain` });
+      }
+      const entry = keyVault.getByDealId(dealId);
+      const chainStatus = String(onChainDeal.status || "").toLowerCase();
+      const localStatus = String(entry?.onChainStatus || "").toLowerCase();
+      if (!entry || (chainStatus !== "active" && localStatus !== "active")) {
+        return reply.status(409).send({ ok: false, error: `Deal #${dealId} is not active` });
+      }
+      await verifyBuyerKeyAuthorization({
+        dealId,
+        buyer: String(onChainDeal.buyer),
+        authorization: buyerAuthorization as BuyerKeyAuthorization,
+      });
+      return {
+        ok: true,
+        proxyKey: entry.proxyKey,
+        baseUrl: "/v1",
+      };
+    } catch (err: any) {
+      const message = err?.message || String(err);
+      const authFailure = /buyer|signature|authorization|wallet|nonce|public key/i.test(message);
+      return reply.status(authFailure ? 401 : 500).send({ ok: false, error: message });
     }
   });
 
