@@ -1,6 +1,6 @@
 services:
   conpi-tee:
-    image: ghcr.io/tutuluuuioj/conpi-tee@sha256:cd44838529b51c330386c59e5359fa49b4bd03c7c451420b8f1e6da8676d59a8
+    image: ghcr.io/tutuluuuioj/conpi-tee@sha256:8aa4da3a522da26c0cf293fe844da806aac79452f6888b43f69599f61565019c
     container_name: conpi-tee
     restart: unless-stopped
     ports:
@@ -14,9 +14,11 @@ services:
       - NODE_ENV=production
       - CONTRACT_ID=dev-20261103062448-30583839049419.testnet
       - DAO_ID=dev-20261103021740-59711933581376.testnet
-      # FastNear's maintained testnet RPC. The legacy near.org testnet URL
-      # rejects production traffic, so never use it for relaying settlements.
-      - NEAR_NODE_URL=https://rpc.testnet.fastnear.com
+      # dRPC is primary when configured. NEAR_NODE_URL / SOLANA_RPC and the
+      # built-in public endpoints remain automatic fallbacks.
+      - DRPC_NEAR_URL
+      - DRPC_SOLANA_URL
+      - NEAR_NODE_URL
       - RATE_LIMIT_REQUESTS_PER_MINUTE=60
       - TRANSIENT_RATE_LIMIT_RETRIES=2
       - TRANSIENT_RATE_LIMIT_BACKOFF_MS=250
