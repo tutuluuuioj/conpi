@@ -80,7 +80,10 @@ export async function verifyBuyerKeyAuthorization(
     const verifyNear = dependencies.verifyNear || verifyNearMessage;
     let verified = false;
     let lastError: unknown = null;
-    for (const rpcUrl of CONFIG.nearRpcUrls) {
+    const rpcUrls = Array.isArray((CONFIG as any).nearRpcUrls) && (CONFIG as any).nearRpcUrls.length
+      ? (CONFIG as any).nearRpcUrls as string[]
+      : [CONFIG.nodeUrl];
+    for (const rpcUrl of rpcUrls) {
       try {
         await verifyNear({
           signerAccountId: auth.address,
