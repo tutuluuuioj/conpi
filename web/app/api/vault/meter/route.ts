@@ -20,8 +20,8 @@ export async function GET(req: NextRequest) {
   if (!dealId || !/^\d+$/.test(dealId)) {
     return NextResponse.json({ error: { message: "Valid dealId is required", code: "invalid_deal_id" } }, { status: 400 });
   }
-  if (!authorization.toLowerCase().startsWith("bearer cpk_live_")) {
-    return NextResponse.json({ error: { message: "TEE proxy key is required", code: "unauthorized" } }, { status: 401 });
+  if (!/^bearer (?:cpk|cpm)_live_/i.test(authorization)) {
+    return NextResponse.json({ error: { message: "Private TEE meter credential is required", code: "unauthorized" } }, { status: 401 });
   }
 
   try {

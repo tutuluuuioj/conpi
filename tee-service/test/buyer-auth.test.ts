@@ -100,9 +100,11 @@ async function run() {
   const sellerResponse = sellerSafeKeyResult({
     ok: true,
     proxyKey: "cpk_live_must_never_reach_seller",
+    sellerMeterToken: "cpm_live_read_only_meter",
     activateSignatureHex: "ab",
   });
   assert(!("proxyKey" in sellerResponse), "Seller activation response leaked the buyer proxy key");
+  assert(sellerResponse.sellerMeterToken === "cpm_live_read_only_meter", "Seller meter credential was removed with the buyer proxy key");
 
   console.log("Buyer-key authorization tests passed (wallet ownership, replay, tamper, expiry, seller redaction)");
 }

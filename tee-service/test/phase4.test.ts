@@ -5,7 +5,7 @@ import { nearRelayer } from "../src/chain/relayer.js";
 import { enclaveKeys } from "../src/crypto/keys.js";
 import { DefaultReason, PayloadKind, serializeSignedPayload } from "../src/crypto/borsh.js";
 import { meterEngine } from "../src/proxy/meter.js";
-import { settlementEngine } from "../src/settlement/engine.js";
+import { settlementEngine, solanaPendingRecoveryPlan } from "../src/settlement/engine.js";
 import { publicKeyFromSolanaAddress, sameSolanaAddress } from "../src/chain/solana-client.js";
 import type { VaultEntry } from "../src/vault/preflight.js";
 
@@ -193,6 +193,21 @@ async function runPhase4Tests() {
       "A pending base58 payout was not matched to the seller's locked hex address"
     );
 
+    console.log("[P4-6b] Stale and higher-stage Solana payouts cannot deadlock recovery...");
+    const nowMs = 1_800_000_000_000;
+    const staleDifferentStage = solanaPendingRecoveryPlan({
+      stage: 50,
+      requested_at: String(BigInt(nowMs - 121_000) * 1_000_000n),
+      last_valid_block_height: 99,
+    }, 25, 100, nowMs);
+    assert(staleDifferentStage.action === "clear" && staleDifferentStage.stage === 25, "A stale stage-50 payout still blocked stage-25 recovery");
+    const liveDifferentStage = solanaPendingRecoveryPlan({
+      stage: 50,
+      requested_at: String(BigInt(nowMs - 10_000) * 1_000_000n),
+      last_valid_block_height: 200,
+    }, 25, 100, nowMs);
+    assert(liveDifferentStage.action === "resume" && liveDifferentStage.stage === 50, "A live signed stage-50 payout was not resumed cumulatively");
+
     console.log("[P4-7] Failed stages are re-signed with fresh nonces and recovered in order...");
     settlementEngine.resetForTests();
     meterEngine.reset(4007);
@@ -217,7 +232,7 @@ async function runPhase4Tests() {
     assert(recoveryEntry.active === false, "Completed recovery left the proxy entry active");
 
     console.log("=======================================================");
-    console.log("  ALL PHASE 4 ACCEPTANCE TESTS PASSED (7/7)           ");
+    console.log("  ALL PHASE 4 ACCEPTANCE TESTS PASSED (8/8)           ");
     console.log("=======================================================");
   } finally {
     (nearRelayer as any).getDeal = originalGetDeal;

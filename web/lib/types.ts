@@ -162,6 +162,8 @@ export interface Deal {
   keyStatus: "idle" | "checking" | "verified";
   keyChecks: { label: string; ok: boolean }[];
   proxyKey: string;
+  /** Read-only TEE credential for the seller's live meter. Never valid on proxy endpoints. */
+  sellerMeterToken?: string;
   proxyRevoked: boolean;
   baseUrl: string;
   usedUsd: number;

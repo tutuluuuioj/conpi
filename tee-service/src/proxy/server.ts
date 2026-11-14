@@ -18,6 +18,7 @@ import {
   extractText,
 } from "./tokenizer.js";
 import { meteringStateStore, UsageCostSource, usageReceiptHash } from "../state/metering-store.js";
+import { isSellerMeterTokenForEntry } from "../auth/meter-token.js";
 
 type ProviderKind = "openai" | "openrouter" | "redpill" | "anthropic";
 export type ProviderErrorKind = "transient_rate_limit" | "insufficient_quota" | "invalid_key" | "provider_ban" | "upstream";
@@ -483,6 +484,24 @@ export function authenticateDealRequest(req: FastifyRequest, reply: FastifyReply
   const entry = keyVault.getByProxyKey(proxyKey);
   if (!entry || entry.dealId !== dealId) {
     reply.status(403).send({ error: { message: "Proxy key is not authorized for this deal", code: "deal_forbidden" } });
+    return null;
+  }
+  return entry;
+}
+
+/** Meter-only authentication. A seller observer token is deliberately never
+ * accepted by the proxy request handlers, which continue to use authenticate(). */
+export function authenticateMeterRequest(req: FastifyRequest, reply: FastifyReply, dealId: number): VaultEntry | null {
+  const token = getProxyKey(req);
+  if (!token) {
+    reply.status(401).send({ error: { message: "Missing private meter credential", code: "unauthorized" } });
+    return null;
+  }
+  const buyerEntry = keyVault.getByProxyKey(token);
+  if (buyerEntry?.dealId === dealId) return buyerEntry;
+  const entry = keyVault.getByDealId(dealId);
+  if (!entry || !isSellerMeterTokenForEntry(token, entry)) {
+    reply.status(403).send({ error: { message: "Credential is not authorized for this deal meter", code: "deal_forbidden" } });
     return null;
   }
   return entry;

@@ -8,6 +8,7 @@ import { meterEngine } from "../proxy/meter.js";
 import { negotiationService } from "../negotiation/matcher.js";
 import type { TermSheet } from "../negotiation/matcher.js";
 import { meteringStateStore, PendingUsage, UsageReceipt } from "../state/metering-store.js";
+import { sellerMeterToken } from "../auth/meter-token.js";
 
 export function parseBalance(val: any): bigint {
   if (typeof val === "bigint") return val;
@@ -39,6 +40,7 @@ export interface KeyCheckResult {
   balanceCoversCredit: boolean;
   error?: string;
   proxyKey?: string;
+  sellerMeterToken?: string;
   activatePayload?: {
     domain: string;
     contractId: string;
@@ -492,6 +494,7 @@ class KeyVault {
       modelAvailable: true,
       balanceCoversCredit: true,
       proxyKey,
+      sellerMeterToken: sellerMeterToken(dealId, resolvedTermsHashHex),
       activatePayload: {
         domain: activatePayload.domain,
         contractId: activatePayload.contractId,

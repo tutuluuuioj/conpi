@@ -5,13 +5,17 @@ function uniqueRpcUrls(values: Array<string | undefined>): string[] {
   return Array.from(new Set(values.map((value) => value?.trim()).filter((value): value is string => Boolean(value))));
 }
 
-const nearRpcUrls = uniqueRpcUrls([
+const configuredNearRpcUrls = uniqueRpcUrls([
   process.env.DRPC_NEAR_URL,
   process.env.NEAR_NODE_URL,
+]);
+const nearRpcUrls = uniqueRpcUrls([
+  ...configuredNearRpcUrls.filter((url) => !/fastnear\.com/i.test(url)),
   "https://archival-rpc.testnet.near.org",
   "https://rpc.testnet.near.org",
   // Keep the rate-limited unauthenticated FastNear endpoint as a final
   // fallback only. A 429 there must never be the first result users see.
+  ...configuredNearRpcUrls.filter((url) => /fastnear\.com/i.test(url)),
   "https://rpc.testnet.fastnear.com",
 ]);
 

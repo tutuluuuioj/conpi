@@ -26,6 +26,7 @@ import { privateKeyToAccount } from "viem/accounts";
 import { buildSellerKeyAuthorizationMessage, canonicalSellerAccount } from "../src/auth/seller-key.js";
 import { meteringStateStore } from "../src/state/metering-store.js";
 import { CONFIG } from "../src/config.js";
+import { sellerMeterToken } from "../src/auth/meter-token.js";
 
 function assert(condition: unknown, message: string): asserts condition {
   if (!condition) throw new Error(message);
@@ -36,6 +37,8 @@ async function runPhase3Tests() {
   assert(CONFIG.upstreamFetchTimeoutMs === 300_000, `Expected 300000ms upstream timeout, got ${CONFIG.upstreamFetchTimeoutMs}`);
   assert(CONFIG.websocketAuthTimeoutMs === 10_000, `Expected 10000ms websocket timeout, got ${CONFIG.websocketAuthTimeoutMs}`);
   assert(CONFIG.checkpointIntervalMs === 300_000, `Expected 300000ms checkpoint interval, got ${CONFIG.checkpointIntervalMs}`);
+  assert(!/fastnear\.com/i.test(CONFIG.nearRpcUrls[0]), "FastNear remained the primary TEE RPC");
+  assert(/fastnear\.com/i.test(CONFIG.nearRpcUrls.at(-1) || ""), "FastNear is not isolated as the final fallback");
   assert(shouldKeepVaultEntryActive("Active"), "A consumed Active deal was removed from payout recovery");
   assert(!shouldKeepVaultEntryActive("Completed"), "A completed deal remained active in the key vault");
 
@@ -63,6 +66,8 @@ async function runPhase3Tests() {
   const entry = keyVault.getByProxyKey(proxyKey)!;
   const app = await buildApp();
   const auth = { authorization: `Bearer ${proxyKey}` };
+  const sellerMeterCredential = sellerMeterToken(entry.dealId, entry.termsHashHex);
+  const sellerMeterAuth = { authorization: `Bearer ${sellerMeterCredential}` };
 
   console.log("[P3-1] Per-deal locked pricing...");
   assert(Object.isFrozen(entry.lockedPricing), "Locked pricing table must be immutable");
@@ -154,6 +159,17 @@ async function runPhase3Tests() {
   const authorizedMeter = await app.inject({ method: "GET", url: "/v1/deals/3001/meter", headers: auth });
   assert(authorizedMeter.statusCode === 200, `Authenticated meter endpoint failed: ${authorizedMeter.body}`);
   assert(JSON.parse(authorizedMeter.body).pricingSnapshotHash === entry.pricingSnapshotHash, "Meter omitted the locked pricing commitment");
+  const sellerMeter = await app.inject({ method: "GET", url: "/v1/deals/3001/meter", headers: sellerMeterAuth });
+  assert(sellerMeter.statusCode === 200, `Seller read-only meter endpoint failed: ${sellerMeter.body}`);
+  const sellerReceipts = await app.inject({ method: "GET", url: "/v1/deals/3001/usage-receipts", headers: sellerMeterAuth });
+  assert(sellerReceipts.statusCode === 200, "Seller read-only credential could not inspect usage receipts");
+  const sellerProxyAttempt = await app.inject({
+    method: "POST",
+    url: "/v1/chat/completions",
+    headers: sellerMeterAuth,
+    payload: { model: "gpt-4o", max_tokens: 1, messages: [{ role: "user", content: "must be rejected" }] },
+  });
+  assert(sellerProxyAttempt.statusCode === 403, "Seller meter credential was accepted by the billable proxy");
 
   console.log("[P3-4] Hard budget cap before provider execution...");
   const savedUsed = entry.usedUsd;
@@ -452,7 +468,7 @@ async function runPhase3Tests() {
   await new Promise<void>((resolve, reject) => {
     const socket = new WebSocket(`ws://127.0.0.1:${address.port}/v1/deals/3001/ws`);
     const timer = setTimeout(() => reject(new Error("WebSocket meter feed timed out")), 5_000);
-    socket.on("open", () => socket.send(JSON.stringify({ proxyKey })));
+    socket.on("open", () => socket.send(JSON.stringify({ credential: sellerMeterCredential })));
     socket.on("message", (raw) => {
       websocketMessages.push(JSON.parse(raw.toString()));
       if (websocketMessages.some((message) => message.type === "meter.update" && message.reason === "usage")) {

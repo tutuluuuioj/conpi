@@ -32,6 +32,22 @@ function byte32Hex(value: unknown, field: string): string {
   throw new Error(`${field} must be a 32-byte hex value`);
 }
 
+export function solanaPendingRecoveryPlan(
+  pending: any,
+  queuedStage: number,
+  currentBlockHeight: number,
+  nowMs = Date.now(),
+): { action: "none" | "clear" | "resume"; stage: number } {
+  if (!pending) return { action: "none", stage: queuedStage };
+  const requestedAtNs = BigInt(String(pending.requested_at || 0));
+  const staleByTime = requestedAtNs > 0n
+    && BigInt(nowMs) * 1_000_000n >= requestedAtNs + 120_000_000_000n;
+  const staleByBlock = currentBlockHeight > 0
+    && currentBlockHeight > Number(pending.last_valid_block_height);
+  if (staleByTime || staleByBlock) return { action: "clear", stage: queuedStage };
+  return { action: "resume", stage: Number(pending.stage) };
+}
+
 /**
  * Serializes every settlement transaction per deal, retries transient RPC
  * failures, and checks chain state before resubmission. This makes relaying
@@ -184,24 +200,33 @@ export class SettlementEngine {
     if (currentStage >= stage) {
       return { transactionHash: "", status: "already_applied" };
     }
-    const price = BigInt(deal.price || 0);
-    const sellerCollateral = BigInt(deal.seller_collateral || 0);
-    const cumulativeAt = (BigInt(stage) * price) / 100n;
-    const cumulativeBefore = (BigInt(currentStage) * price) / 100n;
-    const amountAtomic = cumulativeAt - cumulativeBefore + (stage === 100 ? sellerCollateral : 0n);
-    if (amountAtomic <= 0n) throw new Error("Solana payout amount is zero");
-
     let pending = await nearRelayer.getSolanaPendingPayout(entry.dealId).catch(() => null);
-    if (pending && Number(pending.stage) !== stage) {
-      throw new Error("A different Solana payout is still pending");
-    }
     if (pending) {
-      const currentBlockHeight = await lockedSolanaClient.currentBlockHeight();
-      if (currentBlockHeight > Number(pending.last_valid_block_height)) {
+      const currentBlockHeight = await lockedSolanaClient.currentBlockHeight().catch(() => 0);
+      const recovery = solanaPendingRecoveryPlan(pending, stage, currentBlockHeight);
+      // Expiry must be evaluated before comparing stages. Previously a stale
+      // stage-50 request permanently blocked recovery, because stage-25 was
+      // rejected before the enclave ever reached this cleanup branch.
+      if (recovery.action === "clear") {
         await nearRelayer.submitClearExpiredSolanaPayout(entry.dealId);
         pending = null;
       }
     }
+
+    // A still-valid signed request is authoritative. Resume and confirm it
+    // even when the recovery queue is currently visiting an earlier stage;
+    // confirming the higher cumulative stage safely covers the earlier one.
+    const payoutStage = pending ? Number(pending.stage) : stage;
+    if (payoutStage <= currentStage) {
+      return { transactionHash: "", status: "already_applied" };
+    }
+    const price = BigInt(deal.price || 0);
+    const sellerCollateral = BigInt(deal.seller_collateral || 0);
+    const cumulativeAt = (BigInt(payoutStage) * price) / 100n;
+    const cumulativeBefore = (BigInt(currentStage) * price) / 100n;
+    const amountAtomic = cumulativeAt - cumulativeBefore + (payoutStage === 100 ? sellerCollateral : 0n);
+    if (amountAtomic <= 0n) throw new Error("Solana payout amount is zero");
+
     const prepared = pending
       ? {
           messageHex: String(pending.message_hex),
@@ -218,16 +243,21 @@ export class SettlementEngine {
       throw new Error("The pending Solana payout does not match the escrow terms");
     }
     const payload = signed.payload as SignedPayloadDto;
-    payload.foreignTxSighash = Buffer.from(prepared.messageHashHex, "hex");
-    signed.signatureHex = Buffer.from(enclaveKeys.sign(serializeSignedPayload(payload))).toString("hex");
-    const cached = entry.signedPayloads.find((item) => String(item.payload.nonce) === String(payload.nonce));
-    if (cached) cached.signatureHex = signed.signatureHex;
+    if (!pending) {
+      payload.foreignTxSighash = Buffer.from(prepared.messageHashHex, "hex");
+      signed.signatureHex = Buffer.from(enclaveKeys.sign(serializeSignedPayload(payload))).toString("hex");
+      const cached = entry.signedPayloads.find((item) => String(item.payload.nonce) === String(payload.nonce));
+      if (cached) cached.signatureHex = signed.signatureHex;
+    }
 
-    const requested: any = pending?.signature_hex
+    if (pending && !pending.signature_hex) {
+      throw new Error(`Solana stage ${payoutStage} signature is still pending`);
+    }
+    const requested: any = pending
       ? {
           solanaTxSigned: {
             deal_id: entry.dealId,
-            stage,
+            stage: payoutStage,
             recipient: pending.recipient,
             amount: pending.amount,
             message_hex: pending.message_hex,
@@ -238,7 +268,7 @@ export class SettlementEngine {
         }
       : await nearRelayer.submitRequestSolanaStagePayout(
           entry.dealId,
-          stage,
+          payoutStage,
           payload,
           signed.signatureHex,
           prepared,
@@ -248,7 +278,7 @@ export class SettlementEngine {
       byte32Hex(remote.message_hash_hex, "NEAR Solana message hash") !== prepared.messageHashHex
       || !sameSolanaAddress(String(remote.recipient), prepared.recipient)
       || BigInt(remote.amount) !== amountAtomic
-      || Number(remote.stage) !== stage
+      || Number(remote.stage) !== payoutStage
     ) {
       throw new Error("NEAR returned a Solana signature for different payout terms");
     }
@@ -272,7 +302,7 @@ export class SettlementEngine {
       dealId: payload.dealId,
       termsHash: payload.termsHash,
       kind: PayloadKind.ForeignPayout,
-      stage,
+      stage: payoutStage,
       meteredValueYocto: payload.meteredValueYocto,
       reason: null,
       nonce: meterEngine.getNextNonce(entry.dealId),

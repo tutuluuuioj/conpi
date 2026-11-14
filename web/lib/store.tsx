@@ -780,10 +780,15 @@ export function Providers({ children }: { children: React.ReactNode }) {
 
       // Proxy credentials remain in this browser only; never expose them from a shared server route.
       const storedKeys: Record<string, string> = {};
+      const storedSellerMeterTokens: Record<string, string> = {};
       if (typeof window !== "undefined") {
         try {
           const raw = localStorage.getItem("conpi:deal_keys");
           if (raw) Object.assign(storedKeys, JSON.parse(raw));
+        } catch {}
+        try {
+          const raw = localStorage.getItem("conpi:seller_meter_tokens");
+          if (raw) Object.assign(storedSellerMeterTokens, JSON.parse(raw));
         } catch {}
       }
       const activeWalletAccount = (
@@ -796,6 +801,10 @@ export function Providers({ children }: { children: React.ReactNode }) {
       const activeWalletIsBuyer = (rawDeal: any) => {
         const buyerCanonical = String(rawDeal?.buyer || "").trim().toLowerCase();
         return Boolean(activeWalletCanonical && buyerCanonical && activeWalletCanonical === buyerCanonical);
+      };
+      const activeWalletIsSeller = (rawDeal: any) => {
+        const sellerCanonical = String(rawDeal?.seller || "").trim().toLowerCase();
+        return Boolean(activeWalletCanonical && sellerCanonical && activeWalletCanonical === sellerCanonical);
       };
       let localListings: Listing[] = [];
       if (typeof window !== "undefined") {
@@ -813,9 +822,14 @@ export function Providers({ children }: { children: React.ReactNode }) {
       const activeDeals = safeOnChainDeals.filter((d) => d.status === "Active" || d.status === "Funded");
       await Promise.all(
         activeDeals.map(async (d) => {
-          if (!activeWalletIsBuyer(d)) return;
-          const proxyKey = storedKeys[String(d.id)] || stateRef.current.deals.find((item) => item.id === String(d.id))?.proxyKey;
-          if (!proxyKey) return;
+          const isBuyer = activeWalletIsBuyer(d);
+          const isSeller = activeWalletIsSeller(d);
+          if (!isBuyer && !isSeller) return;
+          const existing = stateRef.current.deals.find((item) => item.id === String(d.id));
+          const meterCredential = isBuyer
+            ? storedKeys[String(d.id)] || existing?.proxyKey
+            : storedSellerMeterTokens[String(d.id)] || existing?.sellerMeterToken;
+          if (!meterCredential) return;
           try {
             const endpoints = [
               `/api/vault/meter?dealId=${d.id}`,
@@ -825,7 +839,7 @@ export function Providers({ children }: { children: React.ReactNode }) {
             for (const url of endpoints) {
               try {
                 const res = await fetch(url, {
-                  headers: { Authorization: `Bearer ${proxyKey}` },
+                  headers: { Authorization: `Bearer ${meterCredential}` },
                   cache: "no-store",
                   signal: AbortSignal.timeout(3000),
                 });
@@ -870,8 +884,13 @@ export function Providers({ children }: { children: React.ReactNode }) {
           const foreignDeal = foreignDealsMap.get(Number(d.id));
           const mapped = mapOnChainDeal(d, currentAccount, listing, foreignDeal, existing);
           const buyerCanonical = (mapped.buyerCanonical || toNearAccountId(mapped.buyer)).toLowerCase();
+          const sellerCanonical = (mapped.sellerCanonical || toNearAccountId(mapped.seller)).toLowerCase();
           const isActiveBuyer = Boolean(activeWalletCanonical && activeWalletCanonical === buyerCanonical);
+          const isActiveSeller = Boolean(activeWalletCanonical && activeWalletCanonical === sellerCanonical);
           const resolvedProxyKey = isActiveBuyer ? (existing?.proxyKey || storedKeys[String(d.id)] || "") : "";
+          const resolvedSellerMeterToken = isActiveSeller
+            ? (existing?.sellerMeterToken || storedSellerMeterTokens[String(d.id)] || "")
+            : "";
           const liveMeter = meterMap.get(Number(d.id));
 
           const creditUsd = Number(liveMeter?.creditUsd) || existing?.creditUsd || mapped.credit;
@@ -952,6 +971,7 @@ export function Providers({ children }: { children: React.ReactNode }) {
             model,
             models,
             proxyKey: resolvedProxyKey,
+            sellerMeterToken: resolvedSellerMeterToken,
             usedUsd,
             tokens,
             creditUsd,
@@ -2345,10 +2365,18 @@ export function Providers({ children }: { children: React.ReactNode }) {
             status: "Active",
             step: "live",
             proxyKey: "",
+            sellerMeterToken: res.sellerMeterToken || item.sellerMeterToken,
             keyStatus: "verified",
             keyChecks: KEY_CHECKS.map((label) => ({ label, ok: true })),
             activity: [{ id: crypto.randomUUID(), title: "Provider Key Verified", detail: "TEE activated the deal. Only the authenticated buyer can claim the proxy key.", tx: txHash || undefined, time: "Now" }, ...item.activity],
           }));
+
+          if (typeof window !== "undefined" && res.sellerMeterToken) {
+            const raw = localStorage.getItem("conpi:seller_meter_tokens");
+            const stored = raw ? JSON.parse(raw) : {};
+            stored[String(dealId)] = res.sellerMeterToken;
+            localStorage.setItem("conpi:seller_meter_tokens", JSON.stringify(stored));
+          }
 
           pushToast({
             kind: "success",
@@ -2665,9 +2693,10 @@ export function Providers({ children }: { children: React.ReactNode }) {
       },
       syncMeterState: async (dealId, silent = false) => {
         const deal = stateRef.current.deals.find((item) => item.id === dealId);
-        if (!deal?.proxyKey) {
+        const meterCredential = deal?.proxyKey || deal?.sellerMeterToken;
+        if (!deal || !meterCredential) {
           if (!silent) {
-            pushToast({ kind: "error", title: "Proxy key required", body: "Import or copy this deal's cpk_live_ key to view its private meter." });
+            pushToast({ kind: "error", title: "Private meter access required", body: "Connect the buyer or seller wallet that owns this deal." });
           }
           return;
         }
@@ -2690,7 +2719,7 @@ export function Providers({ children }: { children: React.ReactNode }) {
         for (const url of endpoints) {
           try {
             const res = await fetch(url, {
-              headers: { Authorization: `Bearer ${deal.proxyKey}` },
+              headers: { Authorization: `Bearer ${meterCredential}` },
               cache: "no-store",
             });
             if (res.ok) {

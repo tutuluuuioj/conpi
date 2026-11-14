@@ -12,6 +12,7 @@ import { negotiationService } from "./negotiation/matcher.js";
 import { keyVault } from "./vault/preflight.js";
 import {
   authenticateDealRequest,
+  authenticateMeterRequest,
   emitDefaultOnce,
   handleAnthropicMessages,
   handleChatCompletions,
@@ -38,6 +39,7 @@ import {
   verifyBuyerKeyAuthorization,
   type BuyerKeyAuthorization,
 } from "./auth/buyer-key.js";
+import { isSellerMeterTokenForEntry, sellerMeterToken } from "./auth/meter-token.js";
 
 export const app = Fastify({ logger: false });
 const keyInjectionLocks = new Set<number>();
@@ -247,6 +249,7 @@ export async function buildApp() {
           activationAlreadyActive: authoritativeStatus === "active",
           activationTxHash,
           keyAlreadyInjected: true,
+          sellerMeterToken: sellerMeterToken(existing.dealId, existing.termsHashHex),
         };
       }
 
@@ -397,10 +400,16 @@ export async function buildApp() {
         socket.close(1008, "Invalid authentication message");
         return;
       }
-      const proxyKey = typeof message?.proxyKey === "string" ? message.proxyKey : "";
-      const entry = keyVault.getByProxyKey(proxyKey);
-      if (!entry || entry.dealId !== dealId) {
-        socket.close(1008, "Invalid proxy key for deal");
+      const credential = typeof message?.credential === "string"
+        ? message.credential
+        : typeof message?.proxyKey === "string" ? message.proxyKey : "";
+      const buyerEntry = keyVault.getByProxyKey(credential);
+      const sellerEntry = keyVault.getByDealId(dealId);
+      const entry = buyerEntry?.dealId === dealId
+        ? buyerEntry
+        : sellerEntry && isSellerMeterTokenForEntry(credential, sellerEntry) ? sellerEntry : undefined;
+      if (!entry) {
+        socket.close(1008, "Invalid private meter credential for deal");
         return;
       }
       authenticated = true;
@@ -422,7 +431,7 @@ export async function buildApp() {
   app.get("/v1/deals/:id/meter", async (req, reply) => {
     const { id } = req.params as { id: string };
     const dealId = parseInt(id, 10);
-    const entry = authenticateDealRequest(req, reply, dealId);
+    const entry = authenticateMeterRequest(req, reply, dealId);
     if (!entry) return;
     return {
       dealId,
@@ -456,7 +465,7 @@ export async function buildApp() {
   app.get("/v1/deals/:id/usage-receipts", async (req, reply) => {
     const { id } = req.params as { id: string };
     const dealId = parseInt(id, 10);
-    const entry = authenticateDealRequest(req, reply, dealId);
+    const entry = authenticateMeterRequest(req, reply, dealId);
     if (!entry) return;
     return {
       dealId,

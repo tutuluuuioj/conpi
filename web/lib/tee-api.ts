@@ -61,6 +61,7 @@ export interface KeyCheckApiResponse {
   activationRelayed?: boolean;
   activationAlreadyActive?: boolean;
   activationTxHash?: string;
+  sellerMeterToken?: string;
   error?: string;
 }
 
@@ -122,7 +123,7 @@ export interface MeterStreamEvent extends MeterResponse {
 export const teeApi = {
   openMeterStream(
     dealId: number,
-    proxyKey: string,
+    credential: string,
     onUpdate: (event: MeterStreamEvent) => void,
     onStatus?: (status: "connected" | "disconnected") => void
   ): () => void {
@@ -134,7 +135,7 @@ export const teeApi = {
     const connect = () => {
       if (stopped) return;
       socket = new WebSocket(`${wsBase}/v1/deals/${dealId}/ws`);
-      socket.onopen = () => socket?.send(JSON.stringify({ proxyKey }));
+      socket.onopen = () => socket?.send(JSON.stringify({ credential }));
       socket.onmessage = (message) => {
         try {
           const event = JSON.parse(String(message.data));

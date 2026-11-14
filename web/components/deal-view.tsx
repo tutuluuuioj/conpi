@@ -654,23 +654,24 @@ export function DealView({ id }: { id: string }) {
   }, [deal?.pulseStage, deal?.id, app]);
 
   useEffect(() => {
-    if (!deal || deal.status !== "Active" || !deal.proxyKey) return;
+    const meterCredential = deal?.proxyKey || deal?.sellerMeterToken;
+    if (!deal || deal.status !== "Active" || !meterCredential) return;
     return teeApi.openMeterStream(
       Number(deal.id),
-      deal.proxyKey,
+      meterCredential,
       (event) => app.applyMeterEvent(deal.id, event),
       (status) => app.setHeartbeat(deal.id, status === "connected" ? "live" : "stale")
     );
-  }, [deal?.id, deal?.status, deal?.proxyKey, app.applyMeterEvent, app.setHeartbeat]);
+  }, [deal?.id, deal?.status, deal?.proxyKey, deal?.sellerMeterToken, app.applyMeterEvent, app.setHeartbeat]);
 
   useEffect(() => {
-    if (!deal || deal.status !== "Active" || !deal.proxyKey) return;
+    if (!deal || deal.status !== "Active" || !(deal.proxyKey || deal.sellerMeterToken)) return;
     app.syncMeterState(deal.id, true);
     const interval = setInterval(() => {
       app.syncMeterState(deal.id, true);
     }, 5000);
     return () => clearInterval(interval);
-  }, [deal?.id, deal?.status, deal?.proxyKey]);
+  }, [deal?.id, deal?.status, deal?.proxyKey, deal?.sellerMeterToken]);
 
   if (!deal) {
     return <EmptyState icon={<ArrowLeftRight className="h-6 w-6" />} title="Deal not found." body="Check the id, or switch back to testnet." action={<Button href="/deals">All deals</Button>} />;
